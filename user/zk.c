@@ -1,4 +1,3 @@
-#include "lcd_init.h"
 #include "lcd.h"
 
 static uint8_t FontBuf[130]; // 字库缓冲
