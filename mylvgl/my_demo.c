@@ -2,80 +2,82 @@
 #include "lvgl.h"
 #include "lcd.h"
 
-static void btn_event_cb(lv_event_t *e)
+static lv_obj_t *selected_label;
+static lv_obj_t *list;
+static lv_group_t *group;
+
+static void list_event_cb(lv_event_t *e)
 {
-    static int count = 0;
-    lv_obj_t *label = lv_event_get_user_data(e);
-    count++;
-    lv_label_set_text_fmt(label, "Clicked: %d", count);
+    lv_obj_t *btn = lv_event_get_target(e);
+    lv_obj_t *label = lv_obj_get_child(btn, 0);
+    const char *txt = lv_label_get_text(label);
+    lv_label_set_text_fmt(selected_label, "Selected: %s", txt);
 }
 
 void my_demo(void)
 {
-    // 背景色
+    // 背景
     lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(0x1a1a2e), 0);
 
     // 标题
     lv_obj_t *title = lv_label_create(lv_screen_active());
-    lv_label_set_text(title, "ESP32-S3 LVGL Demo");
+    lv_label_set_text(title, "ESP32-S3 Menu");
     lv_obj_set_style_text_color(title, lv_color_hex(0xe94560), 0);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
     // 分割线
     lv_obj_t *line = lv_obj_create(lv_screen_active());
-    lv_obj_set_size(line, LCD_W - 20, 2);
+    lv_obj_set_size(line, LCD_W - 10, 2);
     lv_obj_set_style_bg_color(line, lv_color_hex(0xe94560), 0);
     lv_obj_set_style_border_width(line, 0, 0);
     lv_obj_set_style_radius(line, 0, 0);
-    lv_obj_align(line, LV_ALIGN_TOP_MID, 0, 35);
+    lv_obj_set_style_pad_all(line, 0, 0);
+    lv_obj_align(line, LV_ALIGN_TOP_MID, 0, 30);
 
-    // 进度条
-    lv_obj_t *bar = lv_bar_create(lv_screen_active());
-    lv_obj_set_size(bar, LCD_W - 40, 20);
-    lv_obj_align(bar, LV_ALIGN_TOP_MID, 0, 50);
-    lv_bar_set_value(bar, 75, LV_ANIM_ON);
-    lv_obj_set_style_bg_color(bar, lv_color_hex(0x16213e), 0);
-    lv_obj_set_style_bg_color(bar, lv_color_hex(0xe94560), LV_PART_INDICATOR);
+    // 列表
+    list = lv_list_create(lv_screen_active());
+    lv_obj_set_size(list, LCD_W - 10, LCD_H - 80);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_style_bg_color(list, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_radius(list, 4, 0);
 
-    // 进度条标签
-    lv_obj_t *bar_label = lv_label_create(lv_screen_active());
-    lv_label_set_text(bar_label, "CPU Load: 75%");
-    lv_obj_set_style_text_color(bar_label, lv_color_hex(0xffffff), 0);
-    lv_obj_align_to(bar_label, bar, LV_ALIGN_OUT_BOTTOM_MID, 0, 5);
+    // 列表项
+    const char *items[] = {
+        LV_SYMBOL_WIFI    " WiFi Settings",
+        LV_SYMBOL_BELL    " Notifications",
+        LV_SYMBOL_BATTERY_FULL " Battery",
+        LV_SYMBOL_SETTINGS " System Settings",
+        LV_SYMBOL_LOOP    " Update Firmware",
+        LV_SYMBOL_POWER   " Restart",
+    };
 
-    // 圆弧
-    lv_obj_t *arc = lv_arc_create(lv_screen_active());
-    lv_obj_set_size(arc, 100, 100);
-    lv_arc_set_value(arc, 60);
-    lv_obj_align(arc, LV_ALIGN_LEFT_MID, 10, 20);
-    lv_obj_set_style_arc_color(arc, lv_color_hex(0xe94560), LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(arc, lv_color_hex(0x16213e), LV_PART_MAIN);
+    group = lv_group_create();
 
-    // 圆弧标签
-    lv_obj_t *arc_label = lv_label_create(lv_screen_active());
-    lv_label_set_text(arc_label, "60%");
-    lv_obj_set_style_text_color(arc_label, lv_color_hex(0xffffff), 0);
-    lv_obj_align_to(arc_label, arc, LV_ALIGN_CENTER, 0, 0);
+    for (int i = 0; i < 6; i++) {
+        lv_obj_t *btn = lv_list_add_button(list, NULL, items[i]);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x16213e), 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0xe94560), LV_STATE_FOCUSED);
+        lv_obj_set_style_text_color(btn, lv_color_hex(0xffffff), 0);
+        lv_obj_add_event_cb(btn, list_event_cb, LV_EVENT_CLICKED, NULL);
+        lv_group_add_obj(group, btn);
+    }
 
-    // 按钮
-    lv_obj_t *click_label = lv_label_create(lv_screen_active());
-    lv_label_set_text(click_label, "Clicked: 0");
-    lv_obj_set_style_text_color(click_label, lv_color_hex(0xffffff), 0);
-    lv_obj_align(click_label, LV_ALIGN_RIGHT_MID, -10, 20);
+    // 底部提示
+    lv_obj_t *hint = lv_label_create(lv_screen_active());
+    lv_label_set_text(hint, LV_SYMBOL_UP"/"LV_SYMBOL_DOWN" Scroll  "LV_SYMBOL_OK" Select");
+    lv_obj_set_style_text_color(hint, lv_color_hex(0x888888), 0);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -20);
 
-    lv_obj_t *btn = lv_button_create(lv_screen_active());
-    lv_obj_set_size(btn, 100, 40);
-    lv_obj_align_to(btn, click_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 10);
-    lv_obj_set_style_bg_color(btn, lv_color_hex(0xe94560), 0);
-    lv_obj_add_event_cb(btn, btn_event_cb, LV_EVENT_CLICKED, click_label);
-    lv_obj_t *btn_label = lv_label_create(btn);
-    lv_label_set_text(btn_label, "Click Me");
-    lv_obj_center(btn_label);
+    // 选中状态显示
+    selected_label = lv_label_create(lv_screen_active());
+    lv_label_set_text(selected_label, "Selected: none");
+    lv_obj_set_style_text_color(selected_label, lv_color_hex(0xe94560), 0);
+    lv_obj_align(selected_label, LV_ALIGN_BOTTOM_MID, 0, -5);
+}
 
-    // 底部状态栏
-    lv_obj_t *status = lv_label_create(lv_screen_active());
-    lv_label_set_text(status, "ILI9341 240x320 | LVGL v9");
-    lv_obj_set_style_text_color(status, lv_color_hex(0x888888), 0);
-    lv_obj_align(status, LV_ALIGN_BOTTOM_MID, 0, -5);
+lv_group_t *my_demo_get_group(void)
+{
+    return group;
 }

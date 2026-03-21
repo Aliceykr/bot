@@ -22,7 +22,7 @@ void LCD_GPIO_Init(void)
     gpio_config(&io_conf);
     gpio_set_level(LCD_RES_PIN, 1);
     gpio_set_level(LCD_DC_PIN,  1);
-    gpio_set_level(LCD_BLK_PIN, 1);
+    gpio_set_level(LCD_BLK_PIN, 0);  // 背光初始关闭
 
     // 初始化 SPI2 总线（无 CS，无 MISO）
     spi_bus_config_t buscfg = {
@@ -130,6 +130,7 @@ void LCD_Init(void)
     LCD_WR_DATA8(0x4B); LCD_WR_DATA8(0x0A); LCD_WR_DATA8(0x13); LCD_WR_DATA8(0x06);
     LCD_WR_DATA8(0x30); LCD_WR_DATA8(0x38); LCD_WR_DATA8(0x0F);
     LCD_WR_REG(0x29);
+    LCD_Backlight(1);  // 初始化完成后开背光
 }
 
 // ================================================================

@@ -8,8 +8,6 @@ static lv_display_t *disp;
 static lv_color_t *buf1;
 static lv_color_t *buf2;
 
-static bool s_first_flush = true;
-
 static void disp_flush(lv_display_t *disp_drv, const lv_area_t *area, uint8_t *px_map)
 {
     uint32_t w = area->x2 - area->x1 + 1;
@@ -18,13 +16,6 @@ static void disp_flush(lv_display_t *disp_drv, const lv_area_t *area, uint8_t *p
 
     LCD_Address_Set(area->x1, area->y1, area->x2, area->y2);
     LCD_Send_Buf(px_map, size);
-
-    // 第一帧渲染完成后才开背光，避免白屏
-    if (s_first_flush && lv_display_flush_is_last(disp_drv)) {
-        s_first_flush = false;
-        LCD_Backlight(1);
-    }
-
     lv_display_flush_ready(disp_drv);
 }
 
@@ -34,6 +25,7 @@ void lv_port_disp_init(void)
     buf2 = heap_caps_malloc(LCD_W * DISP_BUF_LINES * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
 
     disp = lv_display_create(LCD_W, LCD_H);
+    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565_SWAPPED);
     lv_display_set_flush_cb(disp, disp_flush);
     lv_display_set_buffers(disp, buf1, buf2,
                            LCD_W * DISP_BUF_LINES * sizeof(lv_color_t),
