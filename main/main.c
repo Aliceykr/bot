@@ -1,19 +1,26 @@
 #include <stdio.h>
 #include "lcd.h"
-
-// 显示中文字符串的辅助宏
-#define SHOW_CN(x, y, size, str, fc, bc) do { \
-    uint8_t _buf[64]; \
-    utf8_to_gb2312(str, _buf, sizeof(_buf)); \
-    Display_GB2312_String(x, y, size, _buf, fc, bc); \
-} while(0)
+#include "wifi.h"
 
 void app_main(void)
 {
     LCD_Init();
     LCD_Fill(0, 0, LCD_W, LCD_H, BLACK);
     vTaskDelay(pdMS_TO_TICKS(500));
+    LCD_Fill(0, 0, LCD_W, LCD_H, WHITE);
 
+    // 连接 WiFi
+    LCD_ShowString(4, 4, (uint8_t *)"Connecting WiFi...", BLACK, WHITE, 16, 0);
+    if (wifi_connect()) {
+        LCD_Fill(0, 0, LCD_W, 24, WHITE);
+        LCD_ShowString(4, 4, (uint8_t *)"WiFi OK", GREEN, WHITE, 16, 0);
+        LCD_ShowString(4, 24, (uint8_t *)wifi_get_ip(), BLUE, WHITE, 16, 0);
+    } else {
+        LCD_Fill(0, 0, LCD_W, 24, WHITE);
+        LCD_ShowString(4, 4, (uint8_t *)"WiFi FAIL", RED, WHITE, 16, 0);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(2000));
     LCD_Fill(0, 0, LCD_W, LCD_H, WHITE);
 
     // 李白《静夜思》
