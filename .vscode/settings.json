@@ -1,0 +1,18 @@
+{
+  "idf.currentSetup": "d:\\ESP-IDF\\v5.1.2\\esp-idf",
+  "clangd.path": "d:\\ESP-IDF\\Tool\\tools\\esp-clang\\15.0.0-23786128ae\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=c:\\Users\\Aliceykr\\Desktop\\bot\\build"
+  ],
+  "idf.openOcdConfigs": [
+    "interface/ftdi/esp32_devkitj_v1.cfg",
+    "target/esp32s3.cfg"
+  ],
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3"
+  },
+  "idf.flashType": "UART",
+  "idf.portWin": "COM9"
+}

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"with open\\(''C:/Users/Aliceykr/Desktop/bot/user/lcdfont.h'', ''rb''\\) as f: d=f.read\\(\\); print\\(len\\(d\\), d[16000:16100]\\)\")",
+      "Bash(where python:*)",
+      "Bash(python -c \"with open\\(''C:/Users/Aliceykr/Desktop/bot/user/lcdfont.h'', ''rb''\\) as f: d=f.read\\(\\); print\\(len\\(d\\)\\)\")",
+      "Bash(python C:/Users/Aliceykr/Desktop/bot/gen_gb2312.py)",
+      "Bash(python C:/Users/Aliceykr/Desktop/bot/gen_main.py)"
+    ]
+  }
+}
