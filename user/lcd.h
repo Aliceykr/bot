@@ -8,38 +8,34 @@
 #include "freertos/task.h"
 
 // ---------- 方向配置 ----------
-#define USE_HORIZONTAL 1  // 0,1为竖屏 2,3为横屏
+#define USE_HORIZONTAL 0  // 0:竖屏 1:竖屏180 2:横屏 3:横屏180
 
 #if USE_HORIZONTAL == 0 || USE_HORIZONTAL == 1
-#define LCD_W 128
-#define LCD_H 160
+#define LCD_W 240
+#define LCD_H 320
 #else
-#define LCD_W 160
-#define LCD_H 128
+#define LCD_W 320
+#define LCD_H 240
 #endif
 
-// ---------- 引脚定义，按需修改 ----------
+// ---------- 引脚定义 ----------
 #define LCD_MOSI_PIN   GPIO_NUM_11
 #define LCD_SCLK_PIN   GPIO_NUM_12
-#define LCD_CS_PIN     GPIO_NUM_10
-#define LCD_DC_PIN     GPIO_NUM_9
-#define LCD_BLK_PIN    GPIO_NUM_46
-#define LCD_MISO_PIN   GPIO_NUM_13
-// ----------------------------------------
+#define LCD_RES_PIN    GPIO_NUM_10   // 复位
+#define LCD_DC_PIN     GPIO_NUM_9    // 数据/命令
+#define LCD_BLK_PIN    GPIO_NUM_46   // 背光
+// ----------------------------
 
-#define LCD_MOSI_Clr()  gpio_set_level(LCD_MOSI_PIN, 0)
 #define LCD_MOSI_Set()  gpio_set_level(LCD_MOSI_PIN, 1)
-#define LCD_SCLK_Clr()  gpio_set_level(LCD_SCLK_PIN, 0)
+#define LCD_MOSI_Clr()  gpio_set_level(LCD_MOSI_PIN, 0)
 #define LCD_SCLK_Set()  gpio_set_level(LCD_SCLK_PIN, 1)
-#define LCD_CS_Clr()    gpio_set_level(LCD_CS_PIN, 0)
-#define LCD_CS_Set()    gpio_set_level(LCD_CS_PIN, 1)
-#define LCD_DC_Clr()    gpio_set_level(LCD_DC_PIN, 0)
-#define LCD_DC_Set()    gpio_set_level(LCD_DC_PIN, 1)
-#define LCD_BLK_Clr()   gpio_set_level(LCD_BLK_PIN, 0)
-#define LCD_BLK_Set()   gpio_set_level(LCD_BLK_PIN, 1)
-#define ZK_MISO         gpio_get_level(LCD_MISO_PIN)
-#define ZK_CS_Set()     gpio_set_level(LCD_CS_PIN, 0)
-#define ZK_CS_Clr()     gpio_set_level(LCD_CS_PIN, 1)
+#define LCD_SCLK_Clr()  gpio_set_level(LCD_SCLK_PIN, 0)
+#define LCD_RES_Set()   gpio_set_level(LCD_RES_PIN,  1)
+#define LCD_RES_Clr()   gpio_set_level(LCD_RES_PIN,  0)
+#define LCD_DC_Set()    gpio_set_level(LCD_DC_PIN,   1)
+#define LCD_DC_Clr()    gpio_set_level(LCD_DC_PIN,   0)
+#define LCD_BLK_Set()   gpio_set_level(LCD_BLK_PIN,  1)
+#define LCD_BLK_Clr()   gpio_set_level(LCD_BLK_PIN,  0)
 
 // ---------- 颜色定义 ----------
 #define WHITE         0xFFFF
@@ -63,8 +59,10 @@
 #define LGRAY         0xC618
 #define LGRAYBLUE     0xA651
 #define LBBLUE        0x2B12
+#define DARKBLUE2     0x0030
+#define ORANGE        0xFD20
 
-// ---------- LCD 底层 ----------
+// ---------- 底层函数 ----------
 void LCD_GPIO_Init(void);
 void LCD_Writ_Bus(uint8_t dat);
 void LCD_WR_DATA8(uint8_t dat);
@@ -81,38 +79,11 @@ void LCD_DrawRectangle(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint1
 void Draw_Circle(uint16_t x0, uint16_t y0, uint8_t r, uint16_t color);
 
 // ---------- 字符显示 ----------
-void LCD_ShowChinese(uint16_t x, uint16_t y, uint8_t *s, uint16_t fc, uint16_t bc, uint8_t sizey, uint8_t mode);
-void LCD_ShowChinese12x12(uint16_t x, uint16_t y, uint8_t *s, uint16_t fc, uint16_t bc, uint8_t sizey, uint8_t mode);
-void LCD_ShowChinese16x16(uint16_t x, uint16_t y, uint8_t *s, uint16_t fc, uint16_t bc, uint8_t sizey, uint8_t mode);
-void LCD_ShowChinese24x24(uint16_t x, uint16_t y, uint8_t *s, uint16_t fc, uint16_t bc, uint8_t sizey, uint8_t mode);
-void LCD_ShowChinese32x32(uint16_t x, uint16_t y, uint8_t *s, uint16_t fc, uint16_t bc, uint8_t sizey, uint8_t mode);
 void LCD_ShowChar(uint16_t x, uint16_t y, uint8_t num, uint16_t fc, uint16_t bc, uint8_t sizey, uint8_t mode);
 void LCD_ShowString(uint16_t x, uint16_t y, const uint8_t *p, uint16_t fc, uint16_t bc, uint8_t sizey, uint8_t mode);
 uint32_t mypow(uint8_t m, uint8_t n);
 void LCD_ShowIntNum(uint16_t x, uint16_t y, uint16_t num, uint8_t len, uint16_t fc, uint16_t bc, uint8_t sizey);
 void LCD_ShowFloatNum1(uint16_t x, uint16_t y, float num, uint8_t len, uint16_t fc, uint16_t bc, uint8_t sizey);
 void LCD_ShowPicture(uint16_t x, uint16_t y, uint16_t length, uint16_t width, const uint8_t pic[]);
-
-// ---------- 字库芯片函数 ----------
-void ZK_command(uint8_t dat);
-uint8_t get_data_from_ROM(void);
-void get_n_bytes_data_from_ROM(uint8_t AddrHigh, uint8_t AddrMid, uint8_t AddrLow, uint8_t *pBuff, uint8_t DataLen);
-void Display_GB2312(uint16_t x, uint16_t y, uint8_t zk_num, uint16_t fc, uint16_t bc);
-void Display_GB2312_String(uint16_t x, uint16_t y, uint8_t zk_num, uint8_t text[], uint16_t fc, uint16_t bc);
-void Display_Asc(uint16_t x, uint16_t y, uint8_t zk_num, uint16_t fc, uint16_t bc);
-void Display_Asc_String(uint16_t x, uint16_t y, uint16_t zk_num, uint8_t text[], uint16_t fc, uint16_t bc);
-void Display_Arial_TimesNewRoman(uint16_t x, uint16_t y, uint8_t zk_num, uint16_t fc, uint16_t bc);
-void Display_Arial_String(uint16_t x, uint16_t y, uint16_t zk_num, uint8_t text[], uint16_t fc, uint16_t bc);
-void Display_TimesNewRoman_String(uint16_t x, uint16_t y, uint16_t zk_num, uint8_t text[], uint16_t fc, uint16_t bc);
-
-// ---------- UTF-8 转 GB2312 ----------
-int utf8_to_gb2312(const char *utf8, uint8_t *buf, int buf_size);
-
-// 源码直接写汉字显示宏
-#define SHOW_CN(x, y, size, str, fc, bc) do { \
-    uint8_t _buf[64]; \
-    utf8_to_gb2312(str, _buf, sizeof(_buf)); \
-    Display_GB2312_String(x, y, size, _buf, fc, bc); \
-} while(0)
 
 #endif
