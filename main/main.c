@@ -1,9 +1,5 @@
 #include <stdio.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "lcd_init.h"
 #include "lcd.h"
-#include "gb2312.h"
 
 // 显示中文字符串的辅助宏
 #define SHOW_CN(x, y, size, str, fc, bc) do { \
