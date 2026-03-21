@@ -106,7 +106,7 @@ bool weather_fetch(weather_data_t *out)
         item = cJSON_GetObjectItem(data, "weather");       if(item && item->valuestring) strncpy(out->weather,       item->valuestring, sizeof(out->weather)-1);
         // temperature 是数字类型
         item = cJSON_GetObjectItem(data, "temperature");
-        if(item) snprintf(out->temperature, sizeof(out->temperature), "%d°C", item->valueint);
+        if(item) snprintf(out->temperature, sizeof(out->temperature), "%d摄氏度", item->valueint);
         item = cJSON_GetObjectItem(data, "humidity");
         if(item) snprintf(out->humidity, sizeof(out->humidity), "%d", item->valueint);
         item = cJSON_GetObjectItem(data, "wind_direction"); if(item && item->valuestring) strncpy(out->wind_direction, item->valuestring, sizeof(out->wind_direction)-1);
@@ -114,9 +114,11 @@ bool weather_fetch(weather_data_t *out)
         item = cJSON_GetObjectItem(data, "report_time");
         if (item && item->valuestring) {
             // report_time 格式: "2026-03-21 19:26:37"
-            strncpy(out->date,     item->valuestring, 10);  // 取前10字符作日期
+            strncpy(out->date,     item->valuestring, 10);
             out->date[10] = '\0';
-            strncpy(out->time_str, item->valuestring + 11, sizeof(out->time_str)-1);  // 取11位后作时间
+            strncpy(out->time_str, item->valuestring + 11, sizeof(out->time_str)-1);
+            // 解析时分秒
+            sscanf(item->valuestring + 11, "%d:%d:%d", &out->hour, &out->minute, &out->second);
         }
     }
     cJSON_Delete(root);

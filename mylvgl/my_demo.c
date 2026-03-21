@@ -8,6 +8,8 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 
+LV_FONT_DECLARE(lv_font_simhei_16);
+
 static lv_obj_t *selected_label;
 static lv_obj_t *list;
 static lv_group_t *group;
@@ -35,12 +37,31 @@ static bool wifi_connecting = false;
 // ================================================================
 // 天气显示界面
 // ================================================================
+// 实时时钟结构
+typedef struct {
+    int h, m, s;
+    lv_obj_t *lbl;
+} clock_ctx_t;
+
+static clock_ctx_t s_clock_ctx;
+
+static void clock_timer_cb(lv_timer_t *t)
+{
+    clock_ctx_t *c = (clock_ctx_t *)lv_timer_get_user_data(t);
+    c->s++;
+    if (c->s >= 60) { c->s = 0; c->m++; }
+    if (c->m >= 60) { c->m = 0; c->h++; }
+    if (c->h >= 24)   c->h = 0;
+    if (lv_obj_is_valid(c->lbl))
+        lv_label_set_text_fmt(c->lbl, "%02d:%02d", c->h, c->m);
+    else
+        lv_timer_delete(t);
+}
+
 static void back_btn_cb(lv_event_t *e)
 {
-    lv_obj_t *screen = lv_event_get_user_data(e);
-    // 切回主屏幕
-    lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
-    lv_obj_delete(screen);
+    // auto_del=true 让动画结束后自动删除天气屏幕
+    lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
     lv_indev_t *indev = lv_indev_get_next(NULL);
     while (indev) {
         if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) { lv_indev_set_group(indev, group); break; }
@@ -58,7 +79,7 @@ static void show_weather_screen(const weather_data_t *d)
     lv_obj_t *title = lv_label_create(scr);
     lv_label_set_text_fmt(title, "%s, %s", d->city, d->province);
     lv_obj_set_style_text_color(title, lv_color_hex(0xe94560), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(title, &lv_font_simhei_16, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
     lv_obj_t *line = lv_obj_create(scr);
@@ -81,21 +102,21 @@ static void show_weather_screen(const weather_data_t *d)
     lv_obj_t *icon_lbl = lv_label_create(scr);
     lv_label_set_text(icon_lbl, icon);
     lv_obj_set_style_text_color(icon_lbl, lv_color_hex(0xffd700), 0);
-    lv_obj_set_style_text_font(icon_lbl, &lv_font_montserrat_14, 0);
+    // 图标用默认字体（符号字体），不用 simhei
     lv_obj_align(icon_lbl, LV_ALIGN_TOP_LEFT, 15, 40);
 
     // 天气描述
     lv_obj_t *weather_lbl = lv_label_create(scr);
     lv_label_set_text(weather_lbl, d->weather);
     lv_obj_set_style_text_color(weather_lbl, lv_color_hex(0xffd700), 0);
-    lv_obj_set_style_text_font(weather_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(weather_lbl, &lv_font_simhei_16, 0);
     lv_obj_align_to(weather_lbl, icon_lbl, LV_ALIGN_OUT_RIGHT_MID, 8, 0);
 
     // 温度
     lv_obj_t *temp_lbl = lv_label_create(scr);
     lv_label_set_text_fmt(temp_lbl, "%s", d->temperature);
     lv_obj_set_style_text_color(temp_lbl, lv_color_hex(0xffffff), 0);
-    lv_obj_set_style_text_font(temp_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(temp_lbl, &lv_font_simhei_16, 0);
     lv_obj_align(temp_lbl, LV_ALIGN_TOP_RIGHT, -15, 40);
 
     // 分割
@@ -107,16 +128,26 @@ static void show_weather_screen(const weather_data_t *d)
     lv_obj_align(line2, LV_ALIGN_TOP_MID, 0, 65);
 
     // 湿度
+    lv_obj_t *hum_icon = lv_label_create(scr);
+    lv_label_set_text(hum_icon, LV_SYMBOL_DOWNLOAD);
+    lv_obj_set_style_text_color(hum_icon, lv_color_hex(0x00cfff), 0);
+    lv_obj_align(hum_icon, LV_ALIGN_TOP_LEFT, 15, 75);
     lv_obj_t *hum_lbl = lv_label_create(scr);
-    lv_label_set_text_fmt(hum_lbl, LV_SYMBOL_DOWNLOAD" Humidity: %s%%", d->humidity);
+    lv_label_set_text_fmt(hum_lbl, " 湿度: %s%%", d->humidity);
     lv_obj_set_style_text_color(hum_lbl, lv_color_hex(0x00cfff), 0);
-    lv_obj_align(hum_lbl, LV_ALIGN_TOP_LEFT, 15, 75);
+    lv_obj_set_style_text_font(hum_lbl, &lv_font_simhei_16, 0);
+    lv_obj_align_to(hum_lbl, hum_icon, LV_ALIGN_OUT_RIGHT_MID, 0, 0);
 
     // 风
+    lv_obj_t *wind_icon = lv_label_create(scr);
+    lv_label_set_text(wind_icon, LV_SYMBOL_LOOP);
+    lv_obj_set_style_text_color(wind_icon, lv_color_hex(0xaaaaaa), 0);
+    lv_obj_align(wind_icon, LV_ALIGN_TOP_LEFT, 15, 100);
     lv_obj_t *wind_lbl = lv_label_create(scr);
-    lv_label_set_text_fmt(wind_lbl, LV_SYMBOL_LOOP" Wind: %s %s", d->wind_direction, d->wind_power);
+    lv_label_set_text_fmt(wind_lbl, " %s %s", d->wind_direction, d->wind_power);
     lv_obj_set_style_text_color(wind_lbl, lv_color_hex(0xaaaaaa), 0);
-    lv_obj_align(wind_lbl, LV_ALIGN_TOP_LEFT, 15, 100);
+    lv_obj_set_style_text_font(wind_lbl, &lv_font_simhei_16, 0);
+    lv_obj_align_to(wind_lbl, wind_icon, LV_ALIGN_OUT_RIGHT_MID, 0, 0);
 
     // 分割
     lv_obj_t *line3 = lv_obj_create(scr);
@@ -126,16 +157,25 @@ static void show_weather_screen(const weather_data_t *d)
     lv_obj_set_style_pad_all(line3, 0, 0);
     lv_obj_align(line3, LV_ALIGN_TOP_MID, 0, 125);
 
-    // 日期时间
+    // 日期
     lv_obj_t *date_lbl = lv_label_create(scr);
-    lv_label_set_text_fmt(date_lbl, LV_SYMBOL_CALL " %s", d->date);
+    lv_label_set_text_fmt(date_lbl, "%s", d->date);
     lv_obj_set_style_text_color(date_lbl, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_font(date_lbl, &lv_font_simhei_16, 0);
     lv_obj_align(date_lbl, LV_ALIGN_TOP_LEFT, 15, 135);
 
+    // 实时时间（每秒更新）
     lv_obj_t *time_lbl = lv_label_create(scr);
-    lv_label_set_text_fmt(time_lbl, LV_SYMBOL_PLAY" %s", d->time_str);
+    lv_label_set_text_fmt(time_lbl, "%02d:%02d", d->hour, d->minute);
     lv_obj_set_style_text_color(time_lbl, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(time_lbl, &lv_font_simhei_16, 0);
     lv_obj_align(time_lbl, LV_ALIGN_TOP_LEFT, 15, 160);
+
+    s_clock_ctx.h = d->hour;
+    s_clock_ctx.m = d->minute;
+    s_clock_ctx.s = d->second;
+    s_clock_ctx.lbl = time_lbl;
+    lv_timer_create(clock_timer_cb, 1000, &s_clock_ctx);
 
     // 返回按钮
     lv_obj_t *back_btn = lv_button_create(scr);
@@ -337,7 +377,7 @@ static void list_event_cb(lv_event_t *e)
     lv_obj_t *label = lv_obj_get_child(btn, 0);
     const char *txt = lv_label_get_text(label);
 
-    if (strstr(txt, "WiFi Connect")) {
+    if (strstr(txt, "WiFi")) {
         if (wifi_connecting) return;
         wifi_connecting = true;
 
@@ -382,7 +422,7 @@ static void list_event_cb(lv_event_t *e)
         lv_group_focus_obj(cancel_btn);
 
         xTaskCreate(wifi_connect_task, "wifi_task", 4096, NULL, 3, &wifi_task_handle);
-    } else if (strstr(txt, "Weather")) {
+    } else if (strstr(txt, "天气")) {
         if (weather_fetching) return;
         weather_fetching = true;
 
@@ -437,9 +477,9 @@ void my_demo(void)
     lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(0x1a1a2e), 0);
 
     lv_obj_t *title = lv_label_create(lv_screen_active());
-    lv_label_set_text(title, "ESP32-S3 Menu");
+    lv_label_set_text(title, "ESP32-S3 菜单");
     lv_obj_set_style_text_color(title, lv_color_hex(0xe94560), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(title, &lv_font_simhei_16, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
     lv_obj_t *line = lv_obj_create(lv_screen_active());
@@ -458,12 +498,12 @@ void my_demo(void)
     lv_obj_set_style_radius(list, 4, 0);
 
     const char *items[] = {
-        LV_SYMBOL_WIFI     " WiFi Connect",
-        LV_SYMBOL_EYE_OPEN " Weather & Date",
-        LV_SYMBOL_BATTERY_FULL " Battery",
-        LV_SYMBOL_SETTINGS " System Settings",
-        LV_SYMBOL_LOOP     " Update Firmware",
-        LV_SYMBOL_POWER    " Restart",
+        LV_SYMBOL_WIFI     " WiFi 连接",
+        LV_SYMBOL_EYE_OPEN " 天气与日期",
+        LV_SYMBOL_BATTERY_FULL " 电池",
+        LV_SYMBOL_SETTINGS " 系统设置",
+        LV_SYMBOL_LOOP     " 固件更新",
+        LV_SYMBOL_POWER    " 重启",
     };
 
     group = lv_group_create();
@@ -473,6 +513,7 @@ void my_demo(void)
         lv_obj_set_style_bg_color(btn, lv_color_hex(0x16213e), 0);
         lv_obj_set_style_bg_color(btn, lv_color_hex(0xe94560), LV_STATE_FOCUSED);
         lv_obj_set_style_text_color(btn, lv_color_hex(0xffffff), 0);
+        lv_obj_set_style_text_font(btn, &lv_font_simhei_16, 0);
         lv_obj_add_event_cb(btn, list_event_cb, LV_EVENT_CLICKED, NULL);
         lv_group_add_obj(group, btn);
     }

@@ -13,7 +13,10 @@ typedef struct {
     char wind_direction[32];
     char wind_power[16];
     char date[32];
-    char time_str[32];
+    char time_str[32];  // 初始时间字符串 HH:MM:SS
+    int  hour;          // 解析后的时分秒，用于本地计时
+    int  minute;
+    int  second;
     char weekday[16];
     int  error_code;
     char error_msg[32];

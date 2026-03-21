@@ -5,8 +5,11 @@ idf_component_register(SRCS "main.c"
                           "../user/lcd.c"
                           "../user/wifi.c"
                           "../user/weather.c"
+                          "../user/lv_font_simhei_16.c"
                     INCLUDE_DIRS "."
                                  "../user"
                                  ".."
                                  "../mylvgl"
                     REQUIRES lvgl driver esp_wifi nvs_flash esp_http_client json mbedtls)
+
+target_compile_definitions(__idf_main PRIVATE LV_LVGL_H_INCLUDE_SIMPLE=1 LV_CONF_INCLUDE_SIMPLE=1)
