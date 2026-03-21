@@ -3,8 +3,9 @@ idf_component_register(SRCS "main.c"
                           "../mylvgl/lv_port_indev.c"
                           "../mylvgl/my_demo.c"
                           "../user/lcd.c"
+                          "../user/wifi.c"
                     INCLUDE_DIRS "."
                                  "../user"
                                  ".."
                                  "../mylvgl"
-                    REQUIRES lvgl driver)
+                    REQUIRES lvgl driver esp_wifi nvs_flash)
