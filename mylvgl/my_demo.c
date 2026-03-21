@@ -2,6 +2,7 @@
 #include "lvgl.h"
 #include "lcd.h"
 #include "wifi.h"
+#include "weather.h"
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -13,6 +14,15 @@ static lv_group_t *group;
 static lv_obj_t *spinner_cont = NULL;
 static TaskHandle_t wifi_task_handle = NULL;
 
+// 天气查询队列
+typedef struct {
+    bool success;
+    weather_data_t data;
+} weather_result_t;
+
+static QueueHandle_t weather_result_queue = NULL;
+static bool weather_fetching = false;
+
 typedef struct {
     bool success;
     bool cancelled;
@@ -21,6 +31,151 @@ typedef struct {
 
 static QueueHandle_t wifi_result_queue = NULL;
 static bool wifi_connecting = false;
+
+// ================================================================
+// 天气显示界面
+// ================================================================
+static void back_btn_cb(lv_event_t *e)
+{
+    lv_obj_t *screen = lv_event_get_user_data(e);
+    // 切回主屏幕
+    lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, false);
+    lv_obj_delete(screen);
+    lv_indev_t *indev = lv_indev_get_next(NULL);
+    while (indev) {
+        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) { lv_indev_set_group(indev, group); break; }
+        indev = lv_indev_get_next(indev);
+    }
+}
+
+static void show_weather_screen(const weather_data_t *d)
+{
+    lv_obj_t *scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x0f3460), 0);
+    lv_obj_set_style_pad_all(scr, 0, 0);
+
+    // 顶部标题栏
+    lv_obj_t *title = lv_label_create(scr);
+    lv_label_set_text_fmt(title, "%s, %s", d->city, d->province);
+    lv_obj_set_style_text_color(title, lv_color_hex(0xe94560), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    lv_obj_t *line = lv_obj_create(scr);
+    lv_obj_set_size(line, LCD_W - 10, 2);
+    lv_obj_set_style_bg_color(line, lv_color_hex(0xe94560), 0);
+    lv_obj_set_style_border_width(line, 0, 0);
+    lv_obj_set_style_radius(line, 0, 0);
+    lv_obj_set_style_pad_all(line, 0, 0);
+    lv_obj_align(line, LV_ALIGN_TOP_MID, 0, 28);
+
+    // 天气图标（用 LVGL 符号近似表示）
+    const char *icon = LV_SYMBOL_EYE_OPEN;  // 默认
+    if (strstr(d->weather, "晴"))       icon = LV_SYMBOL_CHARGE;
+    else if (strstr(d->weather, "云"))  icon = LV_SYMBOL_LOOP;
+    else if (strstr(d->weather, "雨"))  icon = LV_SYMBOL_DOWNLOAD;
+    else if (strstr(d->weather, "雪"))  icon = LV_SYMBOL_REFRESH;
+    else if (strstr(d->weather, "雾"))  icon = LV_SYMBOL_EYE_CLOSE;
+    else if (strstr(d->weather, "风"))  icon = LV_SYMBOL_LOOP;
+
+    lv_obj_t *icon_lbl = lv_label_create(scr);
+    lv_label_set_text(icon_lbl, icon);
+    lv_obj_set_style_text_color(icon_lbl, lv_color_hex(0xffd700), 0);
+    lv_obj_set_style_text_font(icon_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(icon_lbl, LV_ALIGN_TOP_LEFT, 15, 40);
+
+    // 天气描述
+    lv_obj_t *weather_lbl = lv_label_create(scr);
+    lv_label_set_text(weather_lbl, d->weather);
+    lv_obj_set_style_text_color(weather_lbl, lv_color_hex(0xffd700), 0);
+    lv_obj_set_style_text_font(weather_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align_to(weather_lbl, icon_lbl, LV_ALIGN_OUT_RIGHT_MID, 8, 0);
+
+    // 温度
+    lv_obj_t *temp_lbl = lv_label_create(scr);
+    lv_label_set_text_fmt(temp_lbl, "%s", d->temperature);
+    lv_obj_set_style_text_color(temp_lbl, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(temp_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(temp_lbl, LV_ALIGN_TOP_RIGHT, -15, 40);
+
+    // 分割
+    lv_obj_t *line2 = lv_obj_create(scr);
+    lv_obj_set_size(line2, LCD_W - 20, 1);
+    lv_obj_set_style_bg_color(line2, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_border_width(line2, 0, 0);
+    lv_obj_set_style_pad_all(line2, 0, 0);
+    lv_obj_align(line2, LV_ALIGN_TOP_MID, 0, 65);
+
+    // 湿度
+    lv_obj_t *hum_lbl = lv_label_create(scr);
+    lv_label_set_text_fmt(hum_lbl, LV_SYMBOL_DOWNLOAD" Humidity: %s%%", d->humidity);
+    lv_obj_set_style_text_color(hum_lbl, lv_color_hex(0x00cfff), 0);
+    lv_obj_align(hum_lbl, LV_ALIGN_TOP_LEFT, 15, 75);
+
+    // 风
+    lv_obj_t *wind_lbl = lv_label_create(scr);
+    lv_label_set_text_fmt(wind_lbl, LV_SYMBOL_LOOP" Wind: %s %s", d->wind_direction, d->wind_power);
+    lv_obj_set_style_text_color(wind_lbl, lv_color_hex(0xaaaaaa), 0);
+    lv_obj_align(wind_lbl, LV_ALIGN_TOP_LEFT, 15, 100);
+
+    // 分割
+    lv_obj_t *line3 = lv_obj_create(scr);
+    lv_obj_set_size(line3, LCD_W - 20, 1);
+    lv_obj_set_style_bg_color(line3, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_border_width(line3, 0, 0);
+    lv_obj_set_style_pad_all(line3, 0, 0);
+    lv_obj_align(line3, LV_ALIGN_TOP_MID, 0, 125);
+
+    // 日期时间
+    lv_obj_t *date_lbl = lv_label_create(scr);
+    lv_label_set_text_fmt(date_lbl, LV_SYMBOL_CALL " %s", d->date);
+    lv_obj_set_style_text_color(date_lbl, lv_color_hex(0x888888), 0);
+    lv_obj_align(date_lbl, LV_ALIGN_TOP_LEFT, 15, 135);
+
+    lv_obj_t *time_lbl = lv_label_create(scr);
+    lv_label_set_text_fmt(time_lbl, LV_SYMBOL_PLAY" %s", d->time_str);
+    lv_obj_set_style_text_color(time_lbl, lv_color_hex(0xffffff), 0);
+    lv_obj_align(time_lbl, LV_ALIGN_TOP_LEFT, 15, 160);
+
+    // 返回按钮
+    lv_obj_t *back_btn = lv_button_create(scr);
+    lv_obj_set_size(back_btn, 100, 36);
+    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0xe94560), 0);
+    lv_obj_add_event_cb(back_btn, back_btn_cb, LV_EVENT_CLICKED, scr);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT" Back");
+    lv_obj_center(back_lbl);
+
+    lv_group_t *wg = lv_group_create();
+    lv_group_add_obj(wg, back_btn);
+    lv_indev_t *indev = lv_indev_get_next(NULL);
+    while (indev) {
+        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) { lv_indev_set_group(indev, wg); break; }
+        indev = lv_indev_get_next(indev);
+    }
+    lv_group_focus_obj(back_btn);
+    lv_screen_load_anim(scr, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+}
+
+static void weather_cancel_btn_cb(lv_event_t *e)
+{
+    weather_fetching = false;
+    if (spinner_cont) { lv_obj_delete(spinner_cont); spinner_cont = NULL; }
+    lv_indev_t *indev = lv_indev_get_next(NULL);
+    while (indev) {
+        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) { lv_indev_set_group(indev, group); break; }
+        indev = lv_indev_get_next(indev);
+    }
+}
+
+static void weather_fetch_task(void *arg)
+{
+    weather_result_t res;
+    res.success = weather_fetch(&res.data);
+    xQueueSend(weather_result_queue, &res, 0);
+    vTaskDelete(NULL);
+}
 
 // 取消按钮事件：断开WiFi，发送cancelled结果
 static void cancel_btn_cb(lv_event_t *e)
@@ -130,6 +285,50 @@ static void wifi_status_timer_cb(lv_timer_t *timer)
     if (xQueueReceive(wifi_result_queue, &result, 0) == pdTRUE) {
         show_result_box(result.success, result.cancelled, result.ip);
     }
+
+    // 检查天气查询结果
+    weather_result_t wresp;
+    if (xQueueReceive(weather_result_queue, &wresp, 0) == pdTRUE) {
+        weather_fetching = false;
+        if (spinner_cont) {
+            lv_obj_delete(spinner_cont);
+            spinner_cont = NULL;
+        }
+        if (wresp.success) {
+            show_weather_screen(&wresp.data);
+        } else {
+            // 显示错误弹窗
+            lv_obj_t *mbox = lv_obj_create(lv_screen_active());
+            lv_obj_set_size(mbox, 200, 120);
+            lv_obj_center(mbox);
+            lv_obj_set_style_bg_color(mbox, lv_color_hex(0x16213e), 0);
+            lv_obj_set_style_border_color(mbox, lv_color_hex(0xe94560), 0);
+            lv_obj_set_style_border_width(mbox, 2, 0);
+            lv_obj_set_style_pad_all(mbox, 8, 0);
+            lv_obj_set_layout(mbox, LV_LAYOUT_FLEX);
+            lv_obj_set_flex_flow(mbox, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_flex_align(mbox, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_t *err_lbl = lv_label_create(mbox);
+            lv_label_set_text_fmt(err_lbl, LV_SYMBOL_CLOSE " %s", wresp.data.error_msg);
+            lv_obj_set_style_text_color(err_lbl, lv_color_hex(0xff0000), 0);
+            lv_obj_set_style_text_align(err_lbl, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_t *ok_btn = lv_button_create(mbox);
+            lv_obj_set_size(ok_btn, 80, 32);
+            lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0xe94560), 0);
+            lv_obj_add_event_cb(ok_btn, close_btn_cb, LV_EVENT_CLICKED, mbox);
+            lv_obj_t *ok_lbl = lv_label_create(ok_btn);
+            lv_label_set_text(ok_lbl, "OK");
+            lv_obj_center(ok_lbl);
+            lv_group_t *eg = lv_group_create();
+            lv_group_add_obj(eg, ok_btn);
+            lv_indev_t *indev = lv_indev_get_next(NULL);
+            while (indev) {
+                if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) { lv_indev_set_group(indev, eg); break; }
+                indev = lv_indev_get_next(indev);
+            }
+            lv_group_focus_obj(ok_btn);
+        }
+    }
 }
 
 static void list_event_cb(lv_event_t *e)
@@ -183,6 +382,48 @@ static void list_event_cb(lv_event_t *e)
         lv_group_focus_obj(cancel_btn);
 
         xTaskCreate(wifi_connect_task, "wifi_task", 4096, NULL, 3, &wifi_task_handle);
+    } else if (strstr(txt, "Weather")) {
+        if (weather_fetching) return;
+        weather_fetching = true;
+
+        spinner_cont = lv_obj_create(lv_screen_active());
+        lv_obj_set_size(spinner_cont, 200, 150);
+        lv_obj_center(spinner_cont);
+        lv_obj_set_style_bg_color(spinner_cont, lv_color_hex(0x16213e), 0);
+        lv_obj_set_style_border_color(spinner_cont, lv_color_hex(0xe94560), 0);
+        lv_obj_set_style_border_width(spinner_cont, 2, 0);
+        lv_obj_set_style_pad_all(spinner_cont, 8, 0);
+        lv_obj_set_layout(spinner_cont, LV_LAYOUT_FLEX);
+        lv_obj_set_flex_flow(spinner_cont, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(spinner_cont, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+        lv_obj_t *spinner = lv_spinner_create(spinner_cont);
+        lv_obj_set_size(spinner, 50, 50);
+
+        lv_obj_t *lbl = lv_label_create(spinner_cont);
+        lv_label_set_text(lbl, "Fetching Weather...");
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0xffffff), 0);
+
+        lv_obj_t *cancel_btn = lv_button_create(spinner_cont);
+        lv_obj_set_size(cancel_btn, 80, 32);
+        lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x555555), 0);
+        lv_obj_add_event_cb(cancel_btn, weather_cancel_btn_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+        lv_label_set_text(cancel_lbl, "Cancel");
+        lv_obj_center(cancel_lbl);
+
+        lv_group_t *loading_group = lv_group_create();
+        lv_group_add_obj(loading_group, cancel_btn);
+        lv_indev_t *indev = lv_indev_get_next(NULL);
+        while (indev) {
+            if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) {
+                lv_indev_set_group(indev, loading_group);
+                break;
+            }
+            indev = lv_indev_get_next(indev);
+        }
+        lv_group_focus_obj(cancel_btn);
+        xTaskCreate(weather_fetch_task, "weather_task", 16384, NULL, 3, NULL);
     } else {
         lv_label_set_text_fmt(selected_label, "Selected: %s", txt);
     }
@@ -191,6 +432,7 @@ static void list_event_cb(lv_event_t *e)
 void my_demo(void)
 {
     wifi_result_queue = xQueueCreate(2, sizeof(wifi_result_t));
+    weather_result_queue = xQueueCreate(2, sizeof(weather_result_t));
 
     lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(0x1a1a2e), 0);
 
@@ -217,7 +459,7 @@ void my_demo(void)
 
     const char *items[] = {
         LV_SYMBOL_WIFI     " WiFi Connect",
-        LV_SYMBOL_BELL     " Notifications",
+        LV_SYMBOL_EYE_OPEN " Weather & Date",
         LV_SYMBOL_BATTERY_FULL " Battery",
         LV_SYMBOL_SETTINGS " System Settings",
         LV_SYMBOL_LOOP     " Update Firmware",

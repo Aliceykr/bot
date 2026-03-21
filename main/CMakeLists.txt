@@ -4,8 +4,9 @@ idf_component_register(SRCS "main.c"
                           "../mylvgl/my_demo.c"
                           "../user/lcd.c"
                           "../user/wifi.c"
+                          "../user/weather.c"
                     INCLUDE_DIRS "."
                                  "../user"
                                  ".."
                                  "../mylvgl"
-                    REQUIRES lvgl driver esp_wifi nvs_flash)
+                    REQUIRES lvgl driver esp_wifi nvs_flash esp_http_client json mbedtls)
