@@ -1,5 +1,9 @@
 idf_component_register(SRCS "main.c"
+                          "../mylvgl/lv_port_disp.c"
+                          "../mylvgl/my_demo.c"
                           "../user/lcd.c"
-                          "../user/wifi.c"
                     INCLUDE_DIRS "."
-                                 "../user")
+                                 "../user"
+                                 ".."
+                                 "../mylvgl"
+                    REQUIRES lvgl driver)

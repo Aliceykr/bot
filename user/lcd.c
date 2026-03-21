@@ -58,6 +58,20 @@ void LCD_WR_REG(uint8_t dat)
     gpio_set_level(LCD_DC_PIN, 1);
 }
 
+void LCD_Send_Buf(const uint8_t *buf, uint32_t len)
+{
+    gpio_set_level(LCD_DC_PIN, 1);
+    uint32_t remain = len;
+    const uint8_t *p = buf;
+    while (remain > 0) {
+        uint32_t send = (remain > 32768) ? 32768 : remain;
+        spi_transaction_t t = { .length = send * 8, .tx_buffer = p };
+        spi_device_polling_transmit(s_spi, &t);
+        p += send;
+        remain -= send;
+    }
+}
+
 void LCD_Address_Set(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2)
 {
     LCD_WR_REG(0x2a);
@@ -67,12 +81,17 @@ void LCD_Address_Set(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2)
     LCD_WR_REG(0x2c);
 }
 
+void LCD_Backlight(uint8_t on)
+{
+    gpio_set_level(LCD_BLK_PIN, on ? 1 : 0);
+}
+
 void LCD_Init(void)
 {
     LCD_GPIO_Init();
     LCD_RES_Clr(); lcd_delay_ms(100);
     LCD_RES_Set(); lcd_delay_ms(100);
-    LCD_BLK_Set(); lcd_delay_ms(100);
+    // 背光由外部控制，初始化完成后再开
 
     LCD_WR_REG(0x11); lcd_delay_ms(120);
     LCD_WR_REG(0xCF);
@@ -111,8 +130,6 @@ void LCD_Init(void)
     LCD_WR_DATA8(0x4B); LCD_WR_DATA8(0x0A); LCD_WR_DATA8(0x13); LCD_WR_DATA8(0x06);
     LCD_WR_DATA8(0x30); LCD_WR_DATA8(0x38); LCD_WR_DATA8(0x0F);
     LCD_WR_REG(0x29);
-
-    LCD_Fill(0, 0, LCD_W, LCD_H, RED);
 }
 
 // ================================================================

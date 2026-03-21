@@ -1,34 +1,36 @@
 #include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "lcd.h"
-#include "wifi.h"
+#include "lvgl.h"
+#include "lv_port_disp.h"
+#include "my_demo.h"
+
+static void lvgl_tick_task(void *arg)
+{
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+        lv_tick_inc(5);
+    }
+}
+
+static void lvgl_task(void *arg)
+{
+    my_demo();
+
+    while (1) {
+        lv_timer_handler();
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
 
 void app_main(void)
 {
     LCD_Init();
 
-    // 连接 WiFi
-    LCD_ShowString(10, 10, (uint8_t *)"Connecting WiFi...", BLACK, WHITE, 16, 0);
-    if (wifi_connect()) {
-        LCD_Fill(0, 0, LCD_W, 40, WHITE);
-        LCD_ShowString(10, 10, (uint8_t *)"WiFi OK", GREEN, WHITE, 16, 0);
-        LCD_ShowString(10, 30, (uint8_t *)wifi_get_ip(), BLUE, WHITE, 16, 0);
-    } else {
-        LCD_Fill(0, 0, LCD_W, 30, WHITE);
-        LCD_ShowString(10, 10, (uint8_t *)"WiFi FAIL", RED, WHITE, 16, 0);
-    }
+    lv_init();
+    lv_port_disp_init();
 
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    LCD_Fill(0, 0, LCD_W, LCD_H, WHITE);
-
-    // 测试显示
-    LCD_ShowString(10,  10, (uint8_t *)"ST7789 240x320", RED,   WHITE, 16, 0);
-    LCD_ShowString(10,  30, (uint8_t *)"ESP32-S3",       BLUE,  WHITE, 16, 0);
-    LCD_ShowString(10,  50, (uint8_t *)"Hello World!",   GREEN, WHITE, 16, 0);
-    LCD_DrawLine(0, 80, LCD_W, 80, DARKBLUE);
-    LCD_DrawRectangle(10, 100, 230, 200, RED);
-    Draw_Circle(120, 260, 50, BLUE);
-
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
+    xTaskCreate(lvgl_tick_task, "lv_tick", 2048,  NULL, 5, NULL);
+    xTaskCreate(lvgl_task,      "lv_task", 32768, NULL, 4, NULL);
 }

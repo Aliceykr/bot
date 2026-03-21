@@ -71,6 +71,8 @@ void LCD_WR_DATA(uint16_t dat);
 void LCD_WR_REG(uint8_t dat);
 void LCD_Address_Set(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2);
 void LCD_Init(void);
+void LCD_Send_Buf(const uint8_t *buf, uint32_t len);
+void LCD_Backlight(uint8_t on);  // 背光控制
 
 // ---------- 绘图函数 ----------
 void LCD_Fill(uint16_t xsta, uint16_t ysta, uint16_t xend, uint16_t yend, uint16_t color);

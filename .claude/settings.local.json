@@ -5,7 +5,8 @@
       "Bash(where python:*)",
       "Bash(python -c \"with open\\(''C:/Users/Aliceykr/Desktop/bot/user/lcdfont.h'', ''rb''\\) as f: d=f.read\\(\\); print\\(len\\(d\\)\\)\")",
       "Bash(python C:/Users/Aliceykr/Desktop/bot/gen_gb2312.py)",
-      "Bash(python C:/Users/Aliceykr/Desktop/bot/gen_main.py)"
+      "Bash(python C:/Users/Aliceykr/Desktop/bot/gen_main.py)",
+      "Bash(idf.py build:*)"
     ]
   }
 }
