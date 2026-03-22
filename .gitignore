@@ -79,3 +79,4 @@ Desktop.ini
 
 # Private API keys - do not commit
 user/model_config.h
+user/asr_config.h

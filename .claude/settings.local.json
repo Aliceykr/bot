@@ -17,7 +17,12 @@
       "Bash(lv_font_conv --font 'C:/Windows/Fonts/simhei.ttf' -r 0x20-0x7F -r 0x4E00-0x9FFF -r 0x3000-0x303F -r 0xFF00-0xFFEF --size 20 --format lvgl --bpp 4 -o user/lv_font_simhei_20.c --no-compress)",
       "Bash(lv_font_conv --help)",
       "Bash(lv_font_conv --font 'C:/Windows/Fonts/simhei.ttf' -r 0x20-0x7F -r 0x4E00-0x9FFF -r 0x3000-0x303F -r 0xFF00-0xFFEF --size 16 --format lvgl --bpp 4 -o user/lv_font_simhei_16.c --no-compress --lv-include 'lvgl/lvgl.h')",
-      "WebFetch(domain:docs.siliconflow.cn)"
+      "WebFetch(domain:docs.siliconflow.cn)",
+      "WebFetch(domain:cloud.baidu.com)",
+      "WebFetch(domain:blog.csdn.net)",
+      "WebFetch(domain:lingshunlab.com)",
+      "WebFetch(domain:gitee.com)",
+      "WebFetch(domain:developer.baidu.com)"
     ]
   }
 }

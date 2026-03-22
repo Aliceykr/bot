@@ -1,0 +1,20 @@
+#ifndef __ASR_CONFIG_H
+#define __ASR_CONFIG_H
+
+// 百度语音识别 API 配置
+// 复制此文件为 asr_config.h 并填入你的密钥
+#define BAIDU_API_KEY       "your-api-key"
+#define BAIDU_SECRET_KEY    "your-secret-key"
+
+#define BAIDU_TOKEN_URL     "https://aip.baidubce.com/oauth/2.0/token"
+#define BAIDU_ASR_URL       "https://vop.baidu.com/pro_api"
+
+#define MIC_SCK_PIN   38
+#define MIC_WS_PIN    39
+#define MIC_SD_PIN    40
+
+#define MIC_SAMPLE_RATE   16000
+#define MIC_MAX_SECONDS   10
+#define MIC_BUF_SIZE      (MIC_SAMPLE_RATE * 2 * MIC_MAX_SECONDS)
+
+#endif

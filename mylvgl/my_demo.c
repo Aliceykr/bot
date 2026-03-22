@@ -5,6 +5,7 @@
 #include "weather.h"
 #include "sntp_time.h"
 #include "model.h"
+#include "asr.h"
 #include <string.h>
 #include <time.h>
 #include "freertos/FreeRTOS.h"
@@ -329,6 +330,178 @@ static void chat_result_check_cb(lv_timer_t *t)
     lv_label_set_text(chat_log_label, chat_log);
     // 滚动到底部
     lv_obj_scroll_to_y(lv_obj_get_parent(chat_log_label), LV_COORD_MAX, LV_ANIM_ON);
+}
+
+// ================================================================
+// 语音助手界面
+// ================================================================
+static lv_obj_t *asr_result_label = NULL;
+static lv_obj_t *asr_status_label = NULL;
+static lv_obj_t *asr_btn = NULL;
+static lv_obj_t *asr_scr = NULL;
+static bool asr_recording = false;
+static bool asr_processing = false;
+static uint32_t asr_audio_len = 0;
+
+typedef struct {
+    bool success;
+    asr_result_t data;
+} asr_task_result_t;
+
+static QueueHandle_t asr_result_queue = NULL;
+
+static void asr_recognize_task(void *arg)
+{
+    uint32_t audio_len = *(uint32_t *)arg;
+    free(arg);
+    asr_task_result_t res;
+    res.success = asr_recognize(audio_len, &res.data);
+    xQueueSend(asr_result_queue, &res, 0);
+    vTaskDelete(NULL);
+}
+
+static void asr_btn_cb(lv_event_t *e)
+{
+    if (asr_processing) return;
+    if (!asr_recording) {
+        asr_recording = true;
+        asr_record_start();
+        lv_label_set_text(asr_status_label, "录音中...");
+        lv_obj_set_style_bg_color(asr_btn, lv_color_hex(0xe94560), 0);
+        lv_obj_t *lbl = lv_obj_get_child(asr_btn, 0);
+        if (lbl) lv_label_set_text(lbl, LV_SYMBOL_STOP " 停止录音");
+    } else {
+        asr_recording = false;
+        asr_audio_len = asr_record_stop();
+        lv_obj_t *lbl = lv_obj_get_child(asr_btn, 0);
+        if (lbl) lv_label_set_text(lbl, LV_SYMBOL_AUDIO " 开始录音");
+        if (asr_audio_len == 0) {
+            lv_label_set_text(asr_status_label, "录音太短，请重试");
+            lv_obj_set_style_bg_color(asr_btn, lv_color_hex(0x16213e), 0);
+            return;
+        }
+        asr_processing = true;
+        lv_label_set_text(asr_status_label, "识别中...");
+        lv_obj_set_style_bg_color(asr_btn, lv_color_hex(0x555555), 0);
+        uint32_t *len_arg = malloc(sizeof(uint32_t));
+        *len_arg = asr_audio_len;
+        StaticTask_t *task_buf = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
+        StackType_t  *task_stack = heap_caps_malloc(32768, MALLOC_CAP_SPIRAM);
+        if (!task_buf || !task_stack) {
+            lv_label_set_text(asr_status_label, "内存不足");
+            asr_processing = false;
+            free(len_arg);
+            if (task_buf) heap_caps_free(task_buf);
+            if (task_stack) heap_caps_free(task_stack);
+        } else {
+            xTaskCreateStatic(asr_recognize_task, "asr_task", 32768, len_arg, 3, task_stack, task_buf);
+        }
+    }
+}
+
+static void asr_timer_cb(lv_timer_t *t)
+{
+    if (!asr_scr || !lv_obj_is_valid(asr_scr)) { lv_timer_delete(t); return; }
+    if (asr_recording) asr_record_read();
+    if (!asr_result_queue) return;
+    asr_task_result_t res;
+    if (xQueueReceive(asr_result_queue, &res, 0) != pdTRUE) return;
+    asr_processing = false;
+    lv_obj_set_style_bg_color(asr_btn, lv_color_hex(0x16213e), 0);
+    if (res.success && strlen(res.data.result) > 0) {
+        lv_label_set_text(asr_result_label, res.data.result);
+        lv_label_set_text(asr_status_label, "识别完成");
+    } else {
+        lv_label_set_text(asr_result_label, "识别失败");
+        lv_label_set_text(asr_status_label, res.data.error_msg);
+    }
+}
+
+static void asr_back_cb(lv_event_t *e)
+{
+    if (asr_recording) asr_record_stop();
+    asr_recording = false;
+    asr_processing = false;
+    asr_scr = NULL;
+    asr_result_label = NULL;
+    asr_status_label = NULL;
+    asr_btn = NULL;
+    lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
+    lv_indev_t *indev = lv_indev_get_next(NULL);
+    while (indev) {
+        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) { lv_indev_set_group(indev, group); break; }
+        indev = lv_indev_get_next(indev);
+    }
+}
+
+static void show_asr_screen(void)
+{
+    if (!asr_result_queue)
+        asr_result_queue = xQueueCreate(2, sizeof(asr_task_result_t));
+
+    asr_scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(asr_scr, lv_color_hex(0x0f3460), 0);
+    lv_obj_set_style_pad_all(asr_scr, 0, 0);
+
+    lv_obj_t *title = lv_label_create(asr_scr);
+    lv_label_set_text(title, "语音助手");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xe94560), 0);
+    lv_obj_set_style_text_font(title, &lv_font_simhei_16, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    lv_obj_t *back_btn = lv_button_create(asr_scr);
+    lv_obj_set_size(back_btn, 40, 24);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 4, 4);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0xe94560), 0);
+    lv_obj_add_event_cb(back_btn, asr_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT);
+    lv_obj_center(back_lbl);
+
+    lv_obj_t *result_cont = lv_obj_create(asr_scr);
+    lv_obj_set_size(result_cont, LCD_W - 10, 180);
+    lv_obj_align(result_cont, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_color(result_cont, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_border_width(result_cont, 0, 0);
+    lv_obj_set_style_pad_all(result_cont, 6, 0);
+    lv_obj_set_scroll_dir(result_cont, LV_DIR_VER);
+
+    asr_result_label = lv_label_create(result_cont);
+    lv_label_set_text(asr_result_label, "点击下方按钮开始录音");
+    lv_obj_set_style_text_color(asr_result_label, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(asr_result_label, &lv_font_simhei_16, 0);
+    lv_label_set_long_mode(asr_result_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(asr_result_label, LCD_W - 22);
+
+    asr_status_label = lv_label_create(asr_scr);
+    lv_label_set_text(asr_status_label, "就绪");
+    lv_obj_set_style_text_color(asr_status_label, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_font(asr_status_label, &lv_font_simhei_16, 0);
+    lv_obj_align(asr_status_label, LV_ALIGN_BOTTOM_MID, 0, -50);
+
+    asr_btn = lv_button_create(asr_scr);
+    lv_obj_set_size(asr_btn, 120, 40);
+    lv_obj_align(asr_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_color(asr_btn, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_border_color(asr_btn, lv_color_hex(0xe94560), 0);
+    lv_obj_set_style_border_width(asr_btn, 2, 0);
+    lv_obj_add_event_cb(asr_btn, asr_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *btn_lbl = lv_label_create(asr_btn);
+    lv_label_set_text(btn_lbl, LV_SYMBOL_AUDIO " 开始录音");
+    lv_obj_set_style_text_color(btn_lbl, lv_color_hex(0xffffff), 0);
+    lv_obj_center(btn_lbl);
+
+    lv_group_t *ag = lv_group_create();
+    lv_group_add_obj(ag, asr_btn);
+    lv_group_add_obj(ag, back_btn);
+    lv_indev_t *indev = lv_indev_get_next(NULL);
+    while (indev) {
+        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) { lv_indev_set_group(indev, ag); break; }
+        indev = lv_indev_get_next(indev);
+    }
+    lv_group_focus_obj(asr_btn);
+    lv_timer_create(asr_timer_cb, 20, NULL);
+    lv_screen_load_anim(asr_scr, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
 }
 
 static void show_chat_screen(void)
@@ -662,6 +835,8 @@ static void list_event_cb(lv_event_t *e)
         xTaskCreate(weather_fetch_task, "weather_task", 16384, NULL, 3, NULL);
     } else if (strstr(txt, "聊天")) {
         show_chat_screen();
+    } else if (strstr(txt, "语音")) {
+        show_asr_screen();
     } else {
         lv_label_set_text_fmt(selected_label, "Selected: %s", txt);
     }
@@ -671,6 +846,7 @@ void my_demo(void)
 {
     wifi_result_queue = xQueueCreate(2, sizeof(wifi_result_t));
     weather_result_queue = xQueueCreate(2, sizeof(weather_result_t));
+    asr_mic_init();
 
     lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(0x1a1a2e), 0);
 
@@ -700,7 +876,7 @@ void my_demo(void)
         LV_SYMBOL_EYE_OPEN,
         LV_SYMBOL_BATTERY_FULL,
         LV_SYMBOL_CALL,
-        LV_SYMBOL_LOOP,
+        LV_SYMBOL_AUDIO,
         LV_SYMBOL_POWER,
     };
     static const char *labels[] = {
@@ -708,7 +884,7 @@ void my_demo(void)
         "天气与日期",
         "电池",
         "聊天助手",
-        "固件更新",
+        "语音助手",
         "重启",
     };
 
