@@ -3,7 +3,9 @@
 #include "lcd.h"
 #include "wifi.h"
 #include "weather.h"
+#include "sntp_time.h"
 #include <string.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -37,25 +39,18 @@ static bool wifi_connecting = false;
 // ================================================================
 // 天气显示界面
 // ================================================================
-// 实时时钟结构
-typedef struct {
-    int h, m, s;
-    lv_obj_t *lbl;
-} clock_ctx_t;
 
-static clock_ctx_t s_clock_ctx;
-
+// NTP 实时时钟 timer 回调
 static void clock_timer_cb(lv_timer_t *t)
 {
-    clock_ctx_t *c = (clock_ctx_t *)lv_timer_get_user_data(t);
-    c->s++;
-    if (c->s >= 60) { c->s = 0; c->m++; }
-    if (c->m >= 60) { c->m = 0; c->h++; }
-    if (c->h >= 24)   c->h = 0;
-    if (lv_obj_is_valid(c->lbl))
-        lv_label_set_text_fmt(c->lbl, "%02d:%02d", c->h, c->m);
-    else
+    lv_obj_t *lbl = (lv_obj_t *)lv_timer_get_user_data(t);
+    if (!lv_obj_is_valid(lbl)) {
         lv_timer_delete(t);
+        return;
+    }
+    struct tm now;
+    sntp_time_get(&now);
+    lv_label_set_text_fmt(lbl, "%02d:%02d:%02d", now.tm_hour, now.tm_min, now.tm_sec);
 }
 
 static void back_btn_cb(lv_event_t *e)
@@ -149,6 +144,16 @@ static void show_weather_screen(const weather_data_t *d)
     lv_obj_set_style_text_font(date_lbl, &lv_font_simhei_16, 0);
     lv_obj_align(date_lbl, LV_ALIGN_TOP_LEFT, 15, 135);
 
+    // 实时时钟（NTP，每秒更新）
+    lv_obj_t *time_lbl = lv_label_create(scr);
+    struct tm now;
+    sntp_time_get(&now);
+    lv_label_set_text_fmt(time_lbl, "%02d:%02d:%02d", now.tm_hour, now.tm_min, now.tm_sec);
+    lv_obj_set_style_text_color(time_lbl, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(time_lbl, &lv_font_simhei_16, 0);
+    lv_obj_align(time_lbl, LV_ALIGN_TOP_LEFT, 15, 160);
+    lv_timer_create(clock_timer_cb, 1000, time_lbl);
+
     // 返回按钮
     lv_obj_t *back_btn = lv_button_create(scr);
     lv_obj_set_size(back_btn, 100, 36);
@@ -200,7 +205,10 @@ static void cancel_btn_cb(lv_event_t *e)
 static void wifi_connect_task(void *arg)
 {
     bool ok = wifi_connect();
-    // 如果已被取消，不发送结果
+    if (ok) {
+        // WiFi 连接成功后同步 NTP，超时 10 秒
+        sntp_time_sync(10000);
+    }
     wifi_result_t result;
     result.success = ok;
     result.cancelled = false;
