@@ -10,6 +10,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "esp_log.h"
+#include "esp_system.h"
+#include "esp_heap_caps.h"
 
 LV_FONT_DECLARE(lv_font_simhei_16);
 
@@ -211,11 +214,13 @@ static lv_obj_t *chat_log_label = NULL;   // 对话记录
 static lv_obj_t *chat_input = NULL;        // 输入框
 static lv_obj_t *chat_keyboard = NULL;     // 键盘
 static lv_obj_t *chat_spinner = NULL;      // 加载动画
+static lv_obj_t *chat_scr = NULL;          // 聊天屏幕
 static char chat_log[1024] = "";           // 累积对话文本
 
 static void chat_fetch_task(void *arg)
 {
     char *msg = (char *)arg;
+    ESP_LOGI("CHAT", "chat_task 启动, 剩余堆: %lu", esp_get_free_heap_size());
     chat_result_t res;
     res.success = model_chat(msg, &res.data);
     free(msg);
@@ -243,12 +248,24 @@ static void chat_send_cb(lv_event_t *e)
 
     // 显示加载动画
     chat_fetching = true;
-    if (chat_spinner) lv_obj_delete(chat_spinner);
-    chat_spinner = lv_spinner_create(lv_obj_get_parent(chat_log_label));
+    if (chat_spinner && lv_obj_is_valid(chat_spinner)) lv_obj_delete(chat_spinner);
+    chat_spinner = lv_spinner_create(chat_scr);
     lv_obj_set_size(chat_spinner, 30, 30);
     lv_obj_align(chat_spinner, LV_ALIGN_TOP_RIGHT, -5, 5);
 
-    xTaskCreate(chat_fetch_task, "chat_task", 16384, msg, 3, NULL);
+    // 从 PSRAM 分配栈，避免内部堆耗尽
+    StaticTask_t *task_buf = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
+    StackType_t *task_stack = heap_caps_malloc(32768, MALLOC_CAP_SPIRAM);
+    if (!task_buf || !task_stack) {
+        ESP_LOGE("CHAT", "chat_task 栈分配失败");
+        chat_fetching = false;
+        if (chat_spinner && lv_obj_is_valid(chat_spinner)) { lv_obj_delete(chat_spinner); chat_spinner = NULL; }
+        free(msg);
+        if (task_buf) heap_caps_free(task_buf);
+        if (task_stack) heap_caps_free(task_stack);
+    } else {
+        xTaskCreateStatic(chat_fetch_task, "chat_task", 32768, msg, 3, task_stack, task_buf);
+    }
 }
 
 static void chat_kb_event_cb(lv_event_t *e)
@@ -272,6 +289,7 @@ static void chat_back_btn_cb(lv_event_t *e)
     chat_input = NULL;
     chat_keyboard = NULL;
     chat_spinner = NULL;
+    chat_scr = NULL;
     lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
     lv_indev_t *indev = lv_indev_get_next(NULL);
     while (indev) {
@@ -319,6 +337,7 @@ static void show_chat_screen(void)
         chat_result_queue = xQueueCreate(2, sizeof(chat_result_t));
 
     lv_obj_t *scr = lv_obj_create(NULL);
+    chat_scr = scr;
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x0f3460), 0);
     lv_obj_set_style_pad_all(scr, 0, 0);
 
