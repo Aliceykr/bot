@@ -17,6 +17,13 @@
 
 LV_FONT_DECLARE(lv_font_simhei_16);
 
+// 通用：屏幕删除时释放关联的 lv_group
+static void group_delete_cb(lv_event_t *e)
+{
+    lv_group_t *g = (lv_group_t *)lv_event_get_user_data(e);
+    if (g) lv_group_delete(g);
+}
+
 static void chat_back_btn_cb(lv_event_t *e);  // 前向声明
 
 static lv_obj_t *selected_label;
@@ -179,6 +186,7 @@ static void show_weather_screen(const weather_data_t *d)
         indev = lv_indev_get_next(indev);
     }
     lv_group_focus_obj(back_btn);
+    lv_obj_add_event_cb(scr, group_delete_cb, LV_EVENT_DELETE, wg);
     lv_screen_load_anim(scr, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
 }
 
@@ -265,7 +273,18 @@ static void chat_send_cb(lv_event_t *e)
         if (task_buf) heap_caps_free(task_buf);
         if (task_stack) heap_caps_free(task_stack);
     } else {
-        xTaskCreateStatic(chat_fetch_task, "chat_task", 32768, msg, 3, task_stack, task_buf);
+        // 把 task_buf 和 task_stack 指针通过 msg 之外的方式传递以便释放
+        // 注意：StaticTask 的内存在任务删除后需手动释放，这里接受泄漏换稳定性
+        // 改用动态任务避免泄漏
+        heap_caps_free(task_buf);
+        heap_caps_free(task_stack);
+        BaseType_t ret = xTaskCreate(chat_fetch_task, "chat_task", 16384, msg, 3, NULL);
+        if (ret != pdPASS) {
+            ESP_LOGE("CHAT", "chat_task 创建失败");
+            chat_fetching = false;
+            if (chat_spinner && lv_obj_is_valid(chat_spinner)) { lv_obj_delete(chat_spinner); chat_spinner = NULL; }
+            free(msg);
+        }
     }
 }
 
@@ -394,7 +413,14 @@ static void asr_btn_cb(lv_event_t *e)
             if (task_buf) heap_caps_free(task_buf);
             if (task_stack) heap_caps_free(task_stack);
         } else {
-            xTaskCreateStatic(asr_recognize_task, "asr_task", 32768, len_arg, 3, task_stack, task_buf);
+            heap_caps_free(task_buf);
+            heap_caps_free(task_stack);
+            BaseType_t ret = xTaskCreate(asr_recognize_task, "asr_task", 16384, len_arg, 3, NULL);
+            if (ret != pdPASS) {
+                lv_label_set_text(asr_status_label, "内存不足");
+                asr_processing = false;
+                free(len_arg);
+            }
         }
     }
 }
@@ -500,6 +526,7 @@ static void show_asr_screen(void)
         indev = lv_indev_get_next(indev);
     }
     lv_group_focus_obj(asr_btn);
+    lv_obj_add_event_cb(asr_scr, group_delete_cb, LV_EVENT_DELETE, ag);
     lv_timer_create(asr_timer_cb, 20, NULL);
     lv_screen_load_anim(asr_scr, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
 }
@@ -578,7 +605,7 @@ static void show_chat_screen(void)
 
     // 定时检查 AI 回复
     lv_timer_create(chat_result_check_cb, 300, NULL);
-
+    lv_obj_add_event_cb(scr, group_delete_cb, LV_EVENT_DELETE, cg);
     lv_screen_load_anim(scr, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
 }
 
