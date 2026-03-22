@@ -354,7 +354,8 @@ static void wifi_status_timer_cb(lv_timer_t *timer)
 static void list_event_cb(lv_event_t *e)
 {
     lv_obj_t *btn = lv_event_get_target(e);
-    lv_obj_t *label = lv_obj_get_child(btn, 0);
+    // child(0) 是图标，child(1) 是文字
+    lv_obj_t *label = lv_obj_get_child(btn, 1);
     const char *txt = lv_label_get_text(label);
 
     if (strstr(txt, "WiFi")) {
@@ -477,23 +478,33 @@ void my_demo(void)
     lv_obj_set_style_border_width(list, 0, 0);
     lv_obj_set_style_radius(list, 4, 0);
 
-    const char *items[] = {
-        LV_SYMBOL_WIFI     " WiFi 连接",
-        LV_SYMBOL_EYE_OPEN " 天气与日期",
-        LV_SYMBOL_BATTERY_FULL " 电池",
-        LV_SYMBOL_SETTINGS " 系统设置",
-        LV_SYMBOL_LOOP     " 固件更新",
-        LV_SYMBOL_POWER    " 重启",
+    static const char *icons[] = {
+        LV_SYMBOL_WIFI,
+        LV_SYMBOL_EYE_OPEN,
+        LV_SYMBOL_BATTERY_FULL,
+        LV_SYMBOL_SETTINGS,
+        LV_SYMBOL_LOOP,
+        LV_SYMBOL_POWER,
+    };
+    static const char *labels[] = {
+        "WiFi 连接",
+        "天气与日期",
+        "电池",
+        "系统设置",
+        "固件更新",
+        "重启",
     };
 
     group = lv_group_create();
 
     for (int i = 0; i < 6; i++) {
-        lv_obj_t *btn = lv_list_add_button(list, NULL, items[i]);
+        lv_obj_t *btn = lv_list_add_button(list, icons[i], labels[i]);
         lv_obj_set_style_bg_color(btn, lv_color_hex(0x16213e), 0);
         lv_obj_set_style_bg_color(btn, lv_color_hex(0xe94560), LV_STATE_FOCUSED);
         lv_obj_set_style_text_color(btn, lv_color_hex(0xffffff), 0);
-        lv_obj_set_style_text_font(btn, &lv_font_simhei_16, 0);
+        // 只对文字子标签设置 simhei 字体，图标子标签保持默认符号字体
+        lv_obj_t *txt_lbl = lv_obj_get_child(btn, 1);
+        if (txt_lbl) lv_obj_set_style_text_font(txt_lbl, &lv_font_simhei_16, 0);
         lv_obj_add_event_cb(btn, list_event_cb, LV_EVENT_CLICKED, NULL);
         lv_group_add_obj(group, btn);
     }
