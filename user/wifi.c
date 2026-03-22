@@ -19,6 +19,7 @@ static wifi_status_t s_status = WIFI_STATUS_DISCONNECTED;
 static char s_ip_str[16] = "0.0.0.0";
 static int s_retry_count = 0;
 static bool s_give_up = false;  // 超过最大重试次数后置true，停止重连
+static bool s_initialized = false;  // 一次性初始化标志
 
 static void event_handler(void *arg, esp_event_base_t event_base,
                           int32_t event_id, void *event_data)
@@ -47,7 +48,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
             s_give_up = true;
             s_status = WIFI_STATUS_FAILED;
             ESP_LOGE(TAG, "WiFi 连接错误：已重试 %d 次，停止连接", WIFI_MAX_RETRY);
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            if (s_wifi_event_group) xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
 
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
@@ -57,7 +58,7 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         s_give_up = false;
         s_status = WIFI_STATUS_CONNECTED;
         ESP_LOGI(TAG, "WiFi 已连接，IP: %s", s_ip_str);
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        if (s_wifi_event_group) xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
@@ -70,31 +71,41 @@ bool wifi_connect(void)
         nvs_flash_init();
     }
 
+    if (!s_initialized) {
+        ESP_ERROR_CHECK(esp_netif_init());
+        ESP_ERROR_CHECK(esp_event_loop_create_default());
+        esp_netif_create_default_wifi_sta();
+
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+        esp_event_handler_instance_t instance_any_id;
+        esp_event_handler_instance_t instance_got_ip;
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                            &event_handler, NULL, &instance_any_id));
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                            &event_handler, NULL, &instance_got_ip));
+
+        wifi_config_t wifi_config = {
+            .sta = {
+                .ssid     = WIFI_SSID,
+                .password = WIFI_PASSWORD,
+                .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            },
+        };
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+        s_initialized = true;
+    }
+
+    s_give_up = false;
+    s_retry_count = 0;
+    s_status = WIFI_STATUS_DISCONNECTED;
     s_wifi_event_group = xEventGroupCreate();
 
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                                        &event_handler, NULL, &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                                        &event_handler, NULL, &instance_got_ip));
-
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid     = WIFI_SSID,
-            .password = WIFI_PASSWORD,
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-        },
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    // 如果已经 started，先 stop 再 start，确保 STA_START 事件重新触发
+    esp_wifi_disconnect();
+    esp_wifi_stop();
     ESP_ERROR_CHECK(esp_wifi_start());
 
     // 等待连接结果（最多等待60秒，含所有重试时间）
@@ -103,8 +114,6 @@ bool wifi_connect(void)
                                            pdFALSE, pdFALSE,
                                            pdMS_TO_TICKS(60000));
 
-    // 注意：事件处理器保留注册，用于后续断后重连
-    // 只删除 event group（已用完）
     vEventGroupDelete(s_wifi_event_group);
     s_wifi_event_group = NULL;
 
