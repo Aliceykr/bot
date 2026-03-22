@@ -13,6 +13,8 @@
 
 LV_FONT_DECLARE(lv_font_simhei_16);
 
+static void chat_back_btn_cb(lv_event_t *e);  // 前向声明
+
 static lv_obj_t *selected_label;
 static lv_obj_t *list;
 static lv_group_t *group;
@@ -255,6 +257,9 @@ static void chat_kb_event_cb(lv_event_t *e)
     if (code == LV_EVENT_READY) {
         // 按下 Enter/OK 发送
         chat_send_cb(e);
+    } else if (code == LV_EVENT_CANCEL) {
+        // 按下键盘 × 键，触发返回
+        chat_back_btn_cb(e);
     }
 }
 
@@ -319,7 +324,7 @@ static void show_chat_screen(void)
 
     // 顶部标题
     lv_obj_t *title = lv_label_create(scr);
-    lv_label_set_text(title, LV_SYMBOL_CALL " 聊天助手");
+    lv_label_set_text(title, "聊天助手");
     lv_obj_set_style_text_color(title, lv_color_hex(0xe94560), 0);
     lv_obj_set_style_text_font(title, &lv_font_simhei_16, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 5);
@@ -354,7 +359,7 @@ static void show_chat_screen(void)
     chat_input = lv_textarea_create(scr);
     lv_obj_set_size(chat_input, LCD_W - 8, 40);
     lv_obj_align(chat_input, LV_ALIGN_TOP_MID, 0, 162);
-    lv_textarea_set_placeholder_text(chat_input, "输入消息...");
+    lv_textarea_set_placeholder_text(chat_input, "Ask me...");
     lv_textarea_set_one_line(chat_input, true);
     lv_obj_set_style_bg_color(chat_input, lv_color_hex(0x16213e), 0);
     lv_obj_set_style_text_color(chat_input, lv_color_hex(0xffffff), 0);
@@ -366,6 +371,7 @@ static void show_chat_screen(void)
     lv_obj_align(chat_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_keyboard_set_textarea(chat_keyboard, chat_input);
     lv_obj_add_event_cb(chat_keyboard, chat_kb_event_cb, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(chat_keyboard, chat_kb_event_cb, LV_EVENT_CANCEL, NULL);
 
     // 编码器 group：键盘优先
     lv_group_t *cg = lv_group_create();
