@@ -149,19 +149,6 @@ static void show_weather_screen(const weather_data_t *d)
     lv_obj_set_style_text_font(date_lbl, &lv_font_simhei_16, 0);
     lv_obj_align(date_lbl, LV_ALIGN_TOP_LEFT, 15, 135);
 
-    // 实时时间（每秒更新）
-    lv_obj_t *time_lbl = lv_label_create(scr);
-    lv_label_set_text_fmt(time_lbl, "%02d:%02d", d->hour, d->minute);
-    lv_obj_set_style_text_color(time_lbl, lv_color_hex(0xffffff), 0);
-    lv_obj_set_style_text_font(time_lbl, &lv_font_simhei_16, 0);
-    lv_obj_align(time_lbl, LV_ALIGN_TOP_LEFT, 15, 160);
-
-    s_clock_ctx.h = d->hour;
-    s_clock_ctx.m = d->minute;
-    s_clock_ctx.s = d->second;
-    s_clock_ctx.lbl = time_lbl;
-    lv_timer_create(clock_timer_cb, 1000, &s_clock_ctx);
-
     // 返回按钮
     lv_obj_t *back_btn = lv_button_create(scr);
     lv_obj_set_size(back_btn, 100, 36);
