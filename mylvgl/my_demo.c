@@ -4,6 +4,7 @@
 #include "wifi.h"
 #include "weather.h"
 #include "sntp_time.h"
+#include "model.h"
 #include <string.h>
 #include <time.h>
 #include "freertos/FreeRTOS.h"
@@ -192,6 +193,195 @@ static void weather_fetch_task(void *arg)
     res.success = weather_fetch(&res.data);
     xQueueSend(weather_result_queue, &res, 0);
     vTaskDelete(NULL);
+}
+
+// ================================================================
+// 聊天助手界面
+// ================================================================
+typedef struct {
+    bool success;
+    model_result_t data;
+} chat_result_t;
+
+static QueueHandle_t chat_result_queue = NULL;
+static bool chat_fetching = false;
+static lv_obj_t *chat_log_label = NULL;   // 对话记录
+static lv_obj_t *chat_input = NULL;        // 输入框
+static lv_obj_t *chat_keyboard = NULL;     // 键盘
+static lv_obj_t *chat_spinner = NULL;      // 加载动画
+static char chat_log[1024] = "";           // 累积对话文本
+
+static void chat_fetch_task(void *arg)
+{
+    char *msg = (char *)arg;
+    chat_result_t res;
+    res.success = model_chat(msg, &res.data);
+    free(msg);
+    xQueueSend(chat_result_queue, &res, 0);
+    vTaskDelete(NULL);
+}
+
+static void chat_send_cb(lv_event_t *e)
+{
+    if (chat_fetching) return;
+    const char *txt = lv_textarea_get_text(chat_input);
+    if (!txt || strlen(txt) == 0) return;
+
+    // 追加用户消息到日志
+    char user_line[MODEL_MAX_INPUT + 8];
+    snprintf(user_line, sizeof(user_line), "You: %s\n", txt);
+    strncat(chat_log, user_line, sizeof(chat_log) - strlen(chat_log) - 1);
+    lv_label_set_text(chat_log_label, chat_log);
+
+    // 复制输入内容给任务
+    char *msg = malloc(MODEL_MAX_INPUT);
+    if (!msg) return;
+    strncpy(msg, txt, MODEL_MAX_INPUT - 1);
+    lv_textarea_set_text(chat_input, "");
+
+    // 显示加载动画
+    chat_fetching = true;
+    if (chat_spinner) lv_obj_delete(chat_spinner);
+    chat_spinner = lv_spinner_create(lv_obj_get_parent(chat_log_label));
+    lv_obj_set_size(chat_spinner, 30, 30);
+    lv_obj_align(chat_spinner, LV_ALIGN_TOP_RIGHT, -5, 5);
+
+    xTaskCreate(chat_fetch_task, "chat_task", 16384, msg, 3, NULL);
+}
+
+static void chat_kb_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_READY) {
+        // 按下 Enter/OK 发送
+        chat_send_cb(e);
+    }
+}
+
+static void chat_back_btn_cb(lv_event_t *e)
+{
+    // 清空对话记录
+    memset(chat_log, 0, sizeof(chat_log));
+    chat_fetching = false;
+    chat_log_label = NULL;
+    chat_input = NULL;
+    chat_keyboard = NULL;
+    chat_spinner = NULL;
+    lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
+    lv_indev_t *indev = lv_indev_get_next(NULL);
+    while (indev) {
+        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) { lv_indev_set_group(indev, group); break; }
+        indev = lv_indev_get_next(indev);
+    }
+}
+
+static void chat_result_check_cb(lv_timer_t *t)
+{
+    // 聊天界面已关闭，删除 timer
+    if (!chat_log_label || !lv_obj_is_valid(chat_log_label)) {
+        lv_timer_delete(t);
+        return;
+    }
+
+    chat_result_t res;
+    if (xQueueReceive(chat_result_queue, &res, 0) != pdTRUE) return;
+
+    chat_fetching = false;
+    if (chat_spinner && lv_obj_is_valid(chat_spinner)) {
+        lv_obj_delete(chat_spinner);
+        chat_spinner = NULL;
+    }
+
+    if (!chat_log_label || !lv_obj_is_valid(chat_log_label)) return;
+
+    if (res.success) {
+        char ai_line[MODEL_MAX_OUTPUT + 8];
+        snprintf(ai_line, sizeof(ai_line), "AI: %s\n", res.data.output);
+        strncat(chat_log, ai_line, sizeof(chat_log) - strlen(chat_log) - 1);
+    } else {
+        char err_line[80];
+        snprintf(err_line, sizeof(err_line), "Error: %s\n", res.data.error_msg);
+        strncat(chat_log, err_line, sizeof(chat_log) - strlen(chat_log) - 1);
+    }
+    lv_label_set_text(chat_log_label, chat_log);
+    // 滚动到底部
+    lv_obj_scroll_to_y(lv_obj_get_parent(chat_log_label), LV_COORD_MAX, LV_ANIM_ON);
+}
+
+static void show_chat_screen(void)
+{
+    if (!chat_result_queue)
+        chat_result_queue = xQueueCreate(2, sizeof(chat_result_t));
+
+    lv_obj_t *scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x0f3460), 0);
+    lv_obj_set_style_pad_all(scr, 0, 0);
+
+    // 顶部标题
+    lv_obj_t *title = lv_label_create(scr);
+    lv_label_set_text(title, LV_SYMBOL_CALL " 聊天助手");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xe94560), 0);
+    lv_obj_set_style_text_font(title, &lv_font_simhei_16, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 5);
+
+    // 返回按钮
+    lv_obj_t *back_btn = lv_button_create(scr);
+    lv_obj_set_size(back_btn, 40, 24);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 4, 4);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0xe94560), 0);
+    lv_obj_add_event_cb(back_btn, chat_back_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT);
+    lv_obj_center(back_lbl);
+
+    // 对话记录滚动区域
+    lv_obj_t *log_cont = lv_obj_create(scr);
+    lv_obj_set_size(log_cont, LCD_W, 130);
+    lv_obj_align(log_cont, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_style_bg_color(log_cont, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_border_width(log_cont, 0, 0);
+    lv_obj_set_style_pad_all(log_cont, 4, 0);
+    lv_obj_set_scroll_dir(log_cont, LV_DIR_VER);
+
+    chat_log_label = lv_label_create(log_cont);
+    lv_label_set_text(chat_log_label, chat_log[0] ? chat_log : "开始对话...");
+    lv_obj_set_style_text_color(chat_log_label, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(chat_log_label, &lv_font_simhei_16, 0);
+    lv_label_set_long_mode(chat_log_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(chat_log_label, LCD_W - 12);
+
+    // 输入框
+    chat_input = lv_textarea_create(scr);
+    lv_obj_set_size(chat_input, LCD_W - 8, 40);
+    lv_obj_align(chat_input, LV_ALIGN_TOP_MID, 0, 162);
+    lv_textarea_set_placeholder_text(chat_input, "输入消息...");
+    lv_textarea_set_one_line(chat_input, true);
+    lv_obj_set_style_bg_color(chat_input, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_text_color(chat_input, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_border_color(chat_input, lv_color_hex(0xe94560), 0);
+
+    // 键盘
+    chat_keyboard = lv_keyboard_create(scr);
+    lv_obj_set_size(chat_keyboard, LCD_W, 118);
+    lv_obj_align(chat_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_textarea(chat_keyboard, chat_input);
+    lv_obj_add_event_cb(chat_keyboard, chat_kb_event_cb, LV_EVENT_READY, NULL);
+
+    // 编码器 group：键盘优先
+    lv_group_t *cg = lv_group_create();
+    lv_group_add_obj(cg, chat_keyboard);
+    lv_group_add_obj(cg, back_btn);
+    lv_indev_t *indev = lv_indev_get_next(NULL);
+    while (indev) {
+        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) { lv_indev_set_group(indev, cg); break; }
+        indev = lv_indev_get_next(indev);
+    }
+    lv_group_focus_obj(chat_keyboard);
+
+    // 定时检查 AI 回复
+    lv_timer_create(chat_result_check_cb, 300, NULL);
+
+    lv_screen_load_anim(scr, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
 }
 
 // 取消按钮事件：断开WiFi，发送cancelled结果
@@ -445,6 +635,8 @@ static void list_event_cb(lv_event_t *e)
         }
         lv_group_focus_obj(cancel_btn);
         xTaskCreate(weather_fetch_task, "weather_task", 16384, NULL, 3, NULL);
+    } else if (strstr(txt, "聊天")) {
+        show_chat_screen();
     } else {
         lv_label_set_text_fmt(selected_label, "Selected: %s", txt);
     }
@@ -482,7 +674,7 @@ void my_demo(void)
         LV_SYMBOL_WIFI,
         LV_SYMBOL_EYE_OPEN,
         LV_SYMBOL_BATTERY_FULL,
-        LV_SYMBOL_SETTINGS,
+        LV_SYMBOL_CALL,
         LV_SYMBOL_LOOP,
         LV_SYMBOL_POWER,
     };
@@ -490,7 +682,7 @@ void my_demo(void)
         "WiFi 连接",
         "天气与日期",
         "电池",
-        "系统设置",
+        "聊天助手",
         "固件更新",
         "重启",
     };
