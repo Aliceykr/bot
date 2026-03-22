@@ -90,27 +90,12 @@ static void show_weather_screen(const weather_data_t *d)
     lv_obj_set_style_pad_all(line, 0, 0);
     lv_obj_align(line, LV_ALIGN_TOP_MID, 0, 28);
 
-    // 天气图标（用 LVGL 符号近似表示）
-    const char *icon = LV_SYMBOL_EYE_OPEN;  // 默认
-    if (strstr(d->weather, "晴"))       icon = LV_SYMBOL_CHARGE;
-    else if (strstr(d->weather, "云"))  icon = LV_SYMBOL_LOOP;
-    else if (strstr(d->weather, "雨"))  icon = LV_SYMBOL_DOWNLOAD;
-    else if (strstr(d->weather, "雪"))  icon = LV_SYMBOL_REFRESH;
-    else if (strstr(d->weather, "雾"))  icon = LV_SYMBOL_EYE_CLOSE;
-    else if (strstr(d->weather, "风"))  icon = LV_SYMBOL_LOOP;
-
-    lv_obj_t *icon_lbl = lv_label_create(scr);
-    lv_label_set_text(icon_lbl, icon);
-    lv_obj_set_style_text_color(icon_lbl, lv_color_hex(0xffd700), 0);
-    // 图标用默认字体（符号字体），不用 simhei
-    lv_obj_align(icon_lbl, LV_ALIGN_TOP_LEFT, 15, 40);
-
-    // 天气描述
+    // 天气描述（直接用中文，不用符号图标）
     lv_obj_t *weather_lbl = lv_label_create(scr);
     lv_label_set_text(weather_lbl, d->weather);
     lv_obj_set_style_text_color(weather_lbl, lv_color_hex(0xffd700), 0);
     lv_obj_set_style_text_font(weather_lbl, &lv_font_simhei_16, 0);
-    lv_obj_align_to(weather_lbl, icon_lbl, LV_ALIGN_OUT_RIGHT_MID, 8, 0);
+    lv_obj_align(weather_lbl, LV_ALIGN_TOP_LEFT, 15, 40);
 
     // 温度
     lv_obj_t *temp_lbl = lv_label_create(scr);
