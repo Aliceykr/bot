@@ -369,6 +369,7 @@ typedef struct {
 
 static QueueHandle_t asr_result_queue = NULL;
 
+/* asr_recognize_task 暂时停用，音频通过 USB CDC 发送
 static void asr_recognize_task(void *arg)
 {
     uint32_t audio_len = *(uint32_t *)arg;
@@ -378,6 +379,7 @@ static void asr_recognize_task(void *arg)
     xQueueSend(asr_result_queue, &res, 0);
     vTaskDelete(NULL);
 }
+*/
 
 static void asr_btn_cb(lv_event_t *e)
 {
@@ -399,6 +401,9 @@ static void asr_btn_cb(lv_event_t *e)
             lv_obj_set_style_bg_color(asr_btn, lv_color_hex(0x16213e), 0);
             return;
         }
+        lv_label_set_text(asr_status_label, "已发送至电脑");
+        lv_obj_set_style_bg_color(asr_btn, lv_color_hex(0x16213e), 0);
+        /* 识别功能暂时关闭，音频已通过 USB CDC 实时发送
         asr_processing = true;
         lv_label_set_text(asr_status_label, "识别中...");
         lv_obj_set_style_bg_color(asr_btn, lv_color_hex(0x555555), 0);
@@ -422,6 +427,7 @@ static void asr_btn_cb(lv_event_t *e)
                 free(len_arg);
             }
         }
+        */
     }
 }
 

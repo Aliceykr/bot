@@ -1,5 +1,6 @@
 #include "asr.h"
 #include "asr_config.h"
+#include "usb_audio.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -108,7 +109,7 @@ void asr_mic_init(void)
     i2s_new_channel(&chan_cfg, NULL, &s_rx_chan);
     i2s_std_config_t std_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(MIC_SAMPLE_RATE),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = MIC_SCK_PIN,
@@ -159,20 +160,30 @@ void asr_record_read(void)
     if (!s_recording || !s_rx_chan) return;
     uint32_t max_samples = MIC_BUF_SIZE / sizeof(int16_t);
     if (s_rec_pos >= max_samples) { asr_record_stop(); return; }
-    static int16_t tmp[512];
+    static int32_t tmp[1024];  // STEREO: 512对样本
     size_t bytes_read = 0;
     i2s_channel_read(s_rx_chan, tmp, sizeof(tmp), &bytes_read, pdMS_TO_TICKS(10));
-    int samples = bytes_read / sizeof(int16_t);
-    // 每500次打印一次原始值用于调试
+    int stereo_samples = bytes_read / sizeof(int32_t);
+    // 每50次打印一次原始值用于调试
     static int dbg_cnt = 0;
     if (++dbg_cnt >= 50) {
         dbg_cnt = 0;
-        ESP_LOGI(TAG, "raw16[0]=%d raw16[1]=%d raw16[2]=%d raw16[3]=%d",
-                 tmp[0], tmp[1], tmp[2], tmp[3]);
+        ESP_LOGI(TAG, "raw32 L=%ld R=%ld", (long)tmp[0], (long)tmp[1]);
     }
-    for (int i = 0; i < samples && s_rec_pos < max_samples; i++) {
-        s_rec_buf[s_rec_pos++] = tmp[i];
+    // STEREO模式：偶数=左声道(INMP441 L/R=GND)，右移8位取24bit有效位的高16bit
+    static int16_t tmp16[512];
+    int out_samples = 0;
+    for (int i = 0; i < stereo_samples - 1 && s_rec_pos < max_samples; i += 2) {
+        int32_t raw = tmp[i];  // 左声道
+        // INMP441: 数据在高24位，右移16位取高16bit，再放大2倍
+        int32_t val = (raw >> 16) * 3;
+        if (val >  32767) val =  32767;
+        if (val < -32768) val = -32768;
+        tmp16[out_samples++] = (int16_t)val;
+        s_rec_buf[s_rec_pos++] = (int16_t)val;
     }
+    // 发送 16bit PCM 到电脑
+    if (out_samples > 0) usb_audio_send(tmp16, out_samples * sizeof(int16_t));
 }
 
 // ================================================================

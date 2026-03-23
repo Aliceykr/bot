@@ -8,11 +8,13 @@ idf_component_register(SRCS "main.c"
                           "../user/sntp_time.c"
                           "../user/model.c"
                           "../user/asr.c"
+                          "../user/usb_audio.c"
                           "../user/lv_font_simhei_16.c"
                     INCLUDE_DIRS "."
                                  "../user"
                                  ".."
                                  "../mylvgl"
-                    REQUIRES lvgl driver esp_wifi nvs_flash esp_http_client json mbedtls esp_netif)
+                    REQUIRES lvgl driver esp_wifi nvs_flash esp_http_client json mbedtls esp_netif
+                             tinyusb)
 
 target_compile_definitions(__idf_main PRIVATE LV_LVGL_H_INCLUDE_SIMPLE=1 LV_CONF_INCLUDE_SIMPLE=1)
