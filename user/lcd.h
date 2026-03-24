@@ -74,6 +74,11 @@ void LCD_Init(void);
 void LCD_Send_Buf(const uint8_t *buf, uint32_t len);
 void LCD_Backlight(uint8_t on);  // 背光控制
 
+/* 异步 DMA 发送：提交事务到 SPI 队列后立即返回，CPU 不等待传输完成 */
+void LCD_Send_Buf_Async(const uint8_t *buf, uint32_t len);
+/* 等待上次异步 DMA 传输完成（须在下次 LCD_Send_Buf_Async 前调用）*/
+void LCD_Send_Buf_Wait(void);
+
 // ---------- 绘图函数 ----------
 void LCD_Fill(uint16_t xsta, uint16_t ysta, uint16_t xend, uint16_t yend, uint16_t color);
 void LCD_DrawPoint(uint16_t x, uint16_t y, uint16_t color);
