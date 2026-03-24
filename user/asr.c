@@ -214,10 +214,10 @@ bool asr_recognize(uint32_t audio_len_bytes, asr_result_t *out)
     esp_http_client_config_t cfg = {
         .url = asr_url,
         .event_handler = http_event_cb,
-        .timeout_ms = 15000,
+        .timeout_ms = 30000,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .skip_cert_common_name_check = true,
-        .buffer_size_tx = 4096,
+        .buffer_size_tx = 8192,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     esp_http_client_set_method(client, HTTP_METHOD_POST);
