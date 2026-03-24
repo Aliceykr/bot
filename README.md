@@ -363,3 +363,40 @@ python speaker_audio.py --port COM3 --file audio.wav
 - **LCD SPI 时钟**：40 MHz，全帧（240×320）DMA 异步刷新，CPU 无需等待传输完成。
 - **WiFi + mbedTLS 内存**：运行时需额外约 100 KB 内部堆，必须在 menuconfig 中预留足够内部内存（`Reserve internal memory ≥ 65536`）。
 - **编码器导航**：旋转 = 上下移动焦点，按键 = 确认。弹窗弹出时焦点自动切换到弹窗 group，关闭后恢复主菜单 group。
+
+---
+
+## 内存使用估算（ESP32-S3 N16R8）
+
+### Flash（16 MB）
+
+| 内容 | 估算大小 |
+|------|----------|
+| ESP-IDF + LVGL + 应用固件 | ~3 MB |
+| 中文字体（lv_font_simhei_16.c）| ~150 KB |
+| 剩余可用（OTA/文件系统）| ~12 MB |
+
+### PSRAM（8 MB Octal）
+
+| 用途 | 大小 |
+|------|------|
+| LVGL 帧缓冲 buf1（240×320×2）| 150 KB |
+| LVGL 帧缓冲 buf2（240×320×2）| 150 KB |
+| ASR 录音缓冲区（16kHz×2B×10s）| 312 KB |
+| **小计** | **~612 KB / 8192 KB（7.5%）**|
+
+PSRAM 剩余约 7.4 MB，空间非常充裕。
+
+### 内部 SRAM（约 512 KB 可用）
+
+| 用途 | 大小 |
+|------|------|
+| speaker RingBuffer | 64 KB |
+| USB audio RingBuffer | 128 KB |
+| WiFi / LwIP / mbedTLS 运行时堆 | ~100 KB |
+| FreeRTOS 任务栈合计（lv_task 32K + asr_llm 16K + weather/chat 16K×2 + 其余各 2K）| ~80 KB |
+| tts.c static 缓冲（encoded+body+url+token_buf+err_buf）| ~12 KB |
+| ASR / model HTTP 响应缓冲 | ~6 KB |
+| **小计** | **~390 KB / 512 KB（76%）**|
+
+> 内部 SRAM 是最紧张的资源。WiFi + mbedTLS 峰值可达 400 KB，因此帧缓冲和录音缓冲必须放 PSRAM，menuconfig 中须预留 `Reserve internal memory ≥ 65536`。
