@@ -149,7 +149,7 @@ static bool tts_get_token(void)
 {
     if (strlen(s_tts_token) > 0) return true;
 
-    char url[320];
+    static char url[320];
     snprintf(url, sizeof(url),
         "%s?grant_type=client_credentials&client_id=%s&client_secret=%s",
         BAIDU_TOKEN_URL, BAIDU_API_KEY, BAIDU_SECRET_KEY);
@@ -206,12 +206,13 @@ bool tts_speak(const char *text)
 
     if (!tts_get_token()) return false;
 
-    /* percent-encode 文本（中文每字3字节，编码后9字节，512字节文本最坏约4608字节） */
-    char encoded[4096];
+    /* percent-encode 文本（中文每字3字节，编码后9字节，512字节文本最坏约4608字节）
+     * 使用 static 避免在任务栈上分配大数组（tts_speak 由单一任务顺序调用）*/
+    static char encoded[4096];
     tts_url_encode(text, encoded, sizeof(encoded));
 
     /* 构建 POST body */
-    char body[5120];
+    static char body[5120];
     int body_len = snprintf(body, sizeof(body),
         "tex=%s&tok=%s&cuid=esp32s3_bot&ctp=1&lan=zh&spd=5&pit=5&vol=9&per=0&aue=6",
         encoded, s_tts_token);

@@ -23,7 +23,6 @@ static void chat_back_btn_cb(lv_event_t *e);
 static void close_btn_cb(lv_event_t *e);
 
 /* 全局 UI 对象 */
-static lv_obj_t *selected_label;
 static lv_obj_t *list;
 static lv_group_t *group;
 static lv_obj_t *wifi_spinner_cont    = NULL;  /* WiFi 加载弹窗容器 */
@@ -829,8 +828,6 @@ static void list_event_cb(lv_event_t *e)
         show_chat_screen();
     } else if (strstr(txt, "语音")) {
         show_asr_screen();
-    } else {
-        lv_label_set_text_fmt(selected_label, "Selected: %s", txt);
     }
 }
 
@@ -899,10 +896,6 @@ void my_demo(void)
     lv_obj_set_style_text_color(hint, lv_color_hex(0x888888), 0);
     lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -20);
 
-    selected_label = lv_label_create(lv_screen_active());
-    lv_label_set_text(selected_label, "Selected: none");
-    lv_obj_set_style_text_color(selected_label, lv_color_hex(0xe94560), 0);
-    lv_obj_align(selected_label, LV_ALIGN_BOTTOM_MID, 0, -5);
 
     lv_timer_create(wifi_status_timer_cb, 500, NULL);
 }
