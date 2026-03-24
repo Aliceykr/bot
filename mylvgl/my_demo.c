@@ -6,6 +6,7 @@
 #include "sntp_time.h"
 #include "model.h"
 #include "asr.h"
+#include "tts.h"
 #include <string.h>
 #include <time.h>
 #include "freertos/FreeRTOS.h"
@@ -474,6 +475,10 @@ static void asr_llm_task(void *arg)
     chat_result_t res;  /* 复用 chat_result_t */
     res.success = model_chat(asr_text, &res.data);
     free(asr_text);
+    /* LLM 回复成功后，调用百度 TTS 合成语音并播放 */
+    if (res.success && strlen(res.data.output) > 0) {
+        tts_speak(res.data.output);
+    }
     xQueueSend(asr_llm_result_queue, &res, 0);
     vTaskDelete(NULL);
 }

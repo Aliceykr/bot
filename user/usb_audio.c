@@ -11,21 +11,9 @@
 #define RINGBUF_SIZE    (128 * 1024)  // 128 KB ≈ 4 秒缓冲
 #define TX_CHUNK        512           // 每次发送块大小
 #define TX_TASK_STACK   2048
-#define TX_TASK_PRIO    3             // 低于 I2S 采集任务，避免抢占
+#define TX_TASK_PRIO    3
 
 static RingbufHandle_t s_ringbuf = NULL;
-static bool s_usb_ready = false;
-
-static void usb_line_state_cb(int itf, cdcacm_event_t *event)
-{
-    if (event->line_state_changed_data.dtr) {
-        s_usb_ready = true;
-        ESP_LOGI(TAG, "PC 已连接，开始接收音频");
-    } else {
-        s_usb_ready = false;
-        ESP_LOGI(TAG, "PC 已断开");
-    }
-}
 
 // ================================================================
 // 发送任务：从 RingBuffer 读取并通过 CDC 发送
@@ -40,19 +28,17 @@ static void usb_tx_task(void *arg)
             taskYIELD();
             continue;
         }
-        if (s_usb_ready) {
-            // tud_cdc_write 最多写到内部 FIFO，循环直到全部写完
-            uint8_t *ptr = (uint8_t *)item;
-            size_t remaining = recv_size;
-            while (remaining > 0) {
-                uint32_t written = tud_cdc_write(ptr, remaining);
-                tud_cdc_write_flush();
-                ptr      += written;
-                remaining -= written;
-                if (written == 0) {
-                    // FIFO 暂满，让出 CPU 等待下次
-                    vTaskDelay(pdMS_TO_TICKS(1));
-                }
+        // tud_cdc_write 最多写到内部 FIFO，循环直到全部写完
+        uint8_t *ptr = (uint8_t *)item;
+        size_t remaining = recv_size;
+        while (remaining > 0) {
+            uint32_t written = tud_cdc_write(ptr, remaining);
+            tud_cdc_write_flush();
+            ptr      += written;
+            remaining -= written;
+            if (written == 0) {
+                // FIFO 暂满，让出 CPU 等待下次
+                vTaskDelay(pdMS_TO_TICKS(1));
             }
         }
         // 无论是否发送都必须归还 item
@@ -83,10 +69,10 @@ void usb_audio_init(void)
     tinyusb_config_cdcacm_t acm_cfg = {
         .usb_dev = TINYUSB_USBDEV_0,
         .cdc_port = TINYUSB_CDC_ACM_0,
-        .rx_unread_buf_sz = 64,
+        .rx_unread_buf_sz = 512,  /* 需容纳 PC 端单次发送块（512 字节）*/
         .callback_rx = NULL,
         .callback_rx_wanted_char = NULL,
-        .callback_line_state_changed = usb_line_state_cb,
+        .callback_line_state_changed = NULL,
         .callback_line_coding_changed = NULL,
     };
     ESP_ERROR_CHECK(tusb_cdc_acm_init(&acm_cfg));
