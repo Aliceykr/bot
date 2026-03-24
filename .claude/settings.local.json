@@ -22,7 +22,9 @@
       "WebFetch(domain:blog.csdn.net)",
       "WebFetch(domain:lingshunlab.com)",
       "WebFetch(domain:gitee.com)",
-      "WebFetch(domain:developer.baidu.com)"
+      "WebFetch(domain:developer.baidu.com)",
+      "Bash(source ~/export-esp.sh)",
+      "Bash(source /c/Espressif/frameworks/esp-idf-v5.*/export.sh)"
     ]
   }
 }

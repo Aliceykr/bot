@@ -17,6 +17,18 @@
 
 LV_FONT_DECLARE(lv_font_simhei_16);
 
+/* 前向声明 */
+static void chat_back_btn_cb(lv_event_t *e);
+static void close_btn_cb(lv_event_t *e);
+
+/* 全局 UI 对象 */
+static lv_obj_t *selected_label;
+static lv_obj_t *list;
+static lv_group_t *group;
+static lv_obj_t *wifi_spinner_cont    = NULL;  /* WiFi 加载弹窗容器 */
+static lv_obj_t *weather_spinner_cont = NULL;  /* 天气加载弹窗容器 */
+static TaskHandle_t wifi_task_handle = NULL;
+
 // 通用：屏幕删除时释放关联的 lv_group
 static void group_delete_cb(lv_event_t *e)
 {
@@ -24,13 +36,104 @@ static void group_delete_cb(lv_event_t *e)
     if (g) lv_group_delete(g);
 }
 
-static void chat_back_btn_cb(lv_event_t *e);  // 前向声明
+/* 将编码器输入设备绑定到指定 group，g 为 NULL 时绑定主菜单 group */
+static void indev_set_group(lv_group_t *g)
+{
+    lv_indev_t *indev = lv_indev_get_next(NULL);
+    while (indev) {
+        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) {
+            lv_indev_set_group(indev, g ? g : group);
+            break;
+        }
+        indev = lv_indev_get_next(indev);
+    }
+}
 
-static lv_obj_t *selected_label;
-static lv_obj_t *list;
-static lv_group_t *group;
-static lv_obj_t *spinner_cont = NULL;
-static TaskHandle_t wifi_task_handle = NULL;
+/* 安全删除加载弹窗：检查有效性后直接删除，清空指针防二次触发。
+ * lv_obj_delete 会触发 LV_EVENT_DELETE，group_delete_cb 自动释放 group。 */
+static void safe_delete_loading_dialog(lv_obj_t **pp)
+{
+    if (!pp || !*pp) return;
+    lv_obj_t *obj = *pp;
+    *pp = NULL;
+    if (lv_obj_is_valid(obj)) lv_obj_delete(obj);
+}
+
+/* 创建通用加载弹窗（spinner + 提示文字 + 取消按钮）。
+ * 弹窗持有独立 lv_group，销毁时由 group_delete_cb 自动释放，编码器自动切入弹窗 group。 */
+static lv_obj_t *create_loading_dialog(const char *title_text, lv_event_cb_t cancel_cb)
+{
+    lv_obj_t *cont = lv_obj_create(lv_screen_active());
+    lv_obj_set_size(cont, 200, 150);
+    lv_obj_center(cont);
+    lv_obj_set_style_bg_color(cont, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_border_color(cont, lv_color_hex(0xe94560), 0);
+    lv_obj_set_style_border_width(cont, 2, 0);
+    lv_obj_set_style_pad_all(cont, 8, 0);
+    lv_obj_set_layout(cont, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(cont, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *spinner = lv_spinner_create(cont);
+    lv_obj_set_size(spinner, 50, 50);
+
+    lv_obj_t *lbl = lv_label_create(cont);
+    lv_label_set_text(lbl, title_text);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(0xffffff), 0);
+
+    lv_obj_t *cancel_btn = lv_button_create(cont);
+    lv_obj_set_size(cancel_btn, 80, 32);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x555555), 0);
+    lv_obj_add_event_cb(cancel_btn, cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, "Cancel");
+    lv_obj_center(cancel_lbl);
+
+    /* 独立 group 隔离主列表编码器，弹窗销毁时由 group_delete_cb 自动释放 */
+    lv_group_t *lg = lv_group_create();
+    lv_group_add_obj(lg, cancel_btn);
+    lv_obj_add_event_cb(cont, group_delete_cb, LV_EVENT_DELETE, lg);
+    indev_set_group(lg);
+    lv_group_focus_obj(cancel_btn);
+    return cont;
+}
+
+/* 创建通用结果弹窗（文字提示 + OK 按钮）。
+ * 弹窗持有独立 lv_group，关闭时由 group_delete_cb 自动释放，修复原有 group 泄漏。 */
+static lv_obj_t *create_result_dialog(const char *text, uint32_t text_color)
+{
+    lv_obj_t *mbox = lv_obj_create(lv_screen_active());
+    lv_obj_set_size(mbox, 200, 120);
+    lv_obj_center(mbox);
+    lv_obj_set_style_bg_color(mbox, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_border_color(mbox, lv_color_hex(0xe94560), 0);
+    lv_obj_set_style_border_width(mbox, 2, 0);
+    lv_obj_set_style_pad_all(mbox, 8, 0);
+    lv_obj_set_layout(mbox, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(mbox, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(mbox, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *lbl = lv_label_create(mbox);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(text_color), 0);
+    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *ok_btn = lv_button_create(mbox);
+    lv_obj_set_size(ok_btn, 80, 32);
+    lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0xe94560), 0);
+    lv_obj_add_event_cb(ok_btn, close_btn_cb, LV_EVENT_CLICKED, mbox);
+    lv_obj_t *ok_lbl = lv_label_create(ok_btn);
+    lv_label_set_text(ok_lbl, "OK");
+    lv_obj_center(ok_lbl);
+
+    /* 独立 group，弹窗关闭时自动释放，修复原有 group 泄漏 */
+    lv_group_t *pg = lv_group_create();
+    lv_group_add_obj(pg, ok_btn);
+    lv_obj_add_event_cb(mbox, group_delete_cb, LV_EVENT_DELETE, pg);
+    indev_set_group(pg);
+    lv_group_focus_obj(ok_btn);
+    return mbox;
+}
 
 // 天气查询队列
 typedef struct {
@@ -71,11 +174,7 @@ static void back_btn_cb(lv_event_t *e)
 {
     // auto_del=true 让动画结束后自动删除天气屏幕
     lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
-    lv_indev_t *indev = lv_indev_get_next(NULL);
-    while (indev) {
-        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) { lv_indev_set_group(indev, group); break; }
-        indev = lv_indev_get_next(indev);
-    }
+    indev_set_group(group);
 }
 
 static void show_weather_screen(const weather_data_t *d)
@@ -180,11 +279,7 @@ static void show_weather_screen(const weather_data_t *d)
 
     lv_group_t *wg = lv_group_create();
     lv_group_add_obj(wg, back_btn);
-    lv_indev_t *indev = lv_indev_get_next(NULL);
-    while (indev) {
-        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) { lv_indev_set_group(indev, wg); break; }
-        indev = lv_indev_get_next(indev);
-    }
+    indev_set_group(wg);
     lv_group_focus_obj(back_btn);
     lv_obj_add_event_cb(scr, group_delete_cb, LV_EVENT_DELETE, wg);
     lv_screen_load_anim(scr, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
@@ -193,12 +288,8 @@ static void show_weather_screen(const weather_data_t *d)
 static void weather_cancel_btn_cb(lv_event_t *e)
 {
     weather_fetching = false;
-    if (spinner_cont) { lv_obj_delete(spinner_cont); spinner_cont = NULL; }
-    lv_indev_t *indev = lv_indev_get_next(NULL);
-    while (indev) {
-        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) { lv_indev_set_group(indev, group); break; }
-        indev = lv_indev_get_next(indev);
-    }
+    safe_delete_loading_dialog(&weather_spinner_cont);
+    indev_set_group(group);
 }
 
 static void weather_fetch_task(void *arg)
@@ -311,11 +402,7 @@ static void chat_back_btn_cb(lv_event_t *e)
     chat_spinner = NULL;
     chat_scr = NULL;
     lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
-    lv_indev_t *indev = lv_indev_get_next(NULL);
-    while (indev) {
-        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) { lv_indev_set_group(indev, group); break; }
-        indev = lv_indev_get_next(indev);
-    }
+    indev_set_group(group);
 }
 
 static void chat_result_check_cb(lv_timer_t *t)
@@ -459,11 +546,7 @@ static void asr_back_cb(lv_event_t *e)
     asr_status_label = NULL;
     asr_btn = NULL;
     lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
-    lv_indev_t *indev = lv_indev_get_next(NULL);
-    while (indev) {
-        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) { lv_indev_set_group(indev, group); break; }
-        indev = lv_indev_get_next(indev);
-    }
+    indev_set_group(group);
 }
 
 static void show_asr_screen(void)
@@ -526,11 +609,7 @@ static void show_asr_screen(void)
     lv_group_t *ag = lv_group_create();
     lv_group_add_obj(ag, asr_btn);
     lv_group_add_obj(ag, back_btn);
-    lv_indev_t *indev = lv_indev_get_next(NULL);
-    while (indev) {
-        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) { lv_indev_set_group(indev, ag); break; }
-        indev = lv_indev_get_next(indev);
-    }
+    indev_set_group(ag);
     lv_group_focus_obj(asr_btn);
     lv_obj_add_event_cb(asr_scr, group_delete_cb, LV_EVENT_DELETE, ag);
     lv_timer_create(asr_timer_cb, 20, NULL);
@@ -602,11 +681,7 @@ static void show_chat_screen(void)
     lv_group_t *cg = lv_group_create();
     lv_group_add_obj(cg, chat_keyboard);
     lv_group_add_obj(cg, back_btn);
-    lv_indev_t *indev = lv_indev_get_next(NULL);
-    while (indev) {
-        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) { lv_indev_set_group(indev, cg); break; }
-        indev = lv_indev_get_next(indev);
-    }
+    indev_set_group(cg);
     lv_group_focus_obj(chat_keyboard);
 
     // 定时检查 AI 回复
@@ -644,80 +719,28 @@ static void wifi_connect_task(void *arg)
 static void close_btn_cb(lv_event_t *e)
 {
     lv_obj_t *mbox = lv_event_get_user_data(e);
-    lv_obj_delete(mbox);
-    // 恢复编码器到列表
-    lv_indev_t *indev = lv_indev_get_next(NULL);
-    while (indev) {
-        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) {
-            lv_indev_set_group(indev, group);
-            break;
-        }
-        indev = lv_indev_get_next(indev);
-    }
+    lv_obj_delete(mbox);  /* group_delete_cb 自动释放 popup_group */
+    indev_set_group(group);  /* 恢复主菜单编码器 */
 }
 
 static void show_result_box(bool ok, bool cancelled, const char *ip)
 {
     wifi_connecting = false;
-    if (spinner_cont) {
-        lv_obj_delete(spinner_cont);
-        spinner_cont = NULL;
-    }
+    safe_delete_loading_dialog(&wifi_spinner_cont);
+
     if (cancelled) {
-        // 恢复编码器
-        lv_indev_t *indev = lv_indev_get_next(NULL);
-        while (indev) {
-            if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) {
-                lv_indev_set_group(indev, group);
-                break;
-            }
-            indev = lv_indev_get_next(indev);
-        }
+        indev_set_group(group);
         return;
     }
 
-    // 结果弹窗，高度足够放文字和按钮
-    lv_obj_t *mbox = lv_obj_create(lv_screen_active());
-    lv_obj_set_size(mbox, 200, 120);
-    lv_obj_center(mbox);
-    lv_obj_set_style_bg_color(mbox, lv_color_hex(0x16213e), 0);
-    lv_obj_set_style_border_color(mbox, lv_color_hex(0xe94560), 0);
-    lv_obj_set_style_border_width(mbox, 2, 0);
-    lv_obj_set_style_pad_all(mbox, 8, 0);
-    lv_obj_set_layout(mbox, LV_LAYOUT_FLEX);
-    lv_obj_set_flex_flow(mbox, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(mbox, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    /* 构造结果文字后创建结果弹窗 */
+    char msg[64];
+    if (ok)
+        snprintf(msg, sizeof(msg), LV_SYMBOL_OK " Connected!\n%s", ip);
+    else
+        snprintf(msg, sizeof(msg), LV_SYMBOL_CLOSE " WiFi Failed!");
 
-    lv_obj_t *result = lv_label_create(mbox);
-    lv_obj_set_style_text_align(result, LV_TEXT_ALIGN_CENTER, 0);
-    if (ok) {
-        lv_label_set_text_fmt(result, LV_SYMBOL_OK " Connected!\n%s", ip);
-        lv_obj_set_style_text_color(result, lv_color_hex(0x00ff00), 0);
-    } else {
-        lv_label_set_text(result, LV_SYMBOL_CLOSE " WiFi Failed!");
-        lv_obj_set_style_text_color(result, lv_color_hex(0xff0000), 0);
-    }
-
-    lv_obj_t *close_btn = lv_button_create(mbox);
-    lv_obj_set_size(close_btn, 80, 32);
-    lv_obj_set_style_bg_color(close_btn, lv_color_hex(0xe94560), 0);
-    lv_obj_add_event_cb(close_btn, close_btn_cb, LV_EVENT_CLICKED, mbox);
-    lv_obj_t *close_lbl = lv_label_create(close_btn);
-    lv_label_set_text(close_lbl, "OK");
-    lv_obj_center(close_lbl);
-
-    // 弹窗用独立group，隔离主列表编码器操作
-    lv_group_t *popup_group = lv_group_create();
-    lv_group_add_obj(popup_group, close_btn);
-    lv_indev_t *indev = lv_indev_get_next(NULL);
-    while (indev) {
-        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) {
-            lv_indev_set_group(indev, popup_group);
-            break;
-        }
-        indev = lv_indev_get_next(indev);
-    }
-    lv_group_focus_obj(close_btn);
+    create_result_dialog(msg, ok ? 0x00ff00 : 0xff0000);
 }
 
 static void wifi_status_timer_cb(lv_timer_t *timer)
@@ -731,43 +754,14 @@ static void wifi_status_timer_cb(lv_timer_t *timer)
     weather_result_t wresp;
     if (xQueueReceive(weather_result_queue, &wresp, 0) == pdTRUE) {
         weather_fetching = false;
-        if (spinner_cont) {
-            lv_obj_delete(spinner_cont);
-            spinner_cont = NULL;
-        }
+        safe_delete_loading_dialog(&weather_spinner_cont);
         if (wresp.success) {
             show_weather_screen(&wresp.data);
         } else {
-            // 显示错误弹窗
-            lv_obj_t *mbox = lv_obj_create(lv_screen_active());
-            lv_obj_set_size(mbox, 200, 120);
-            lv_obj_center(mbox);
-            lv_obj_set_style_bg_color(mbox, lv_color_hex(0x16213e), 0);
-            lv_obj_set_style_border_color(mbox, lv_color_hex(0xe94560), 0);
-            lv_obj_set_style_border_width(mbox, 2, 0);
-            lv_obj_set_style_pad_all(mbox, 8, 0);
-            lv_obj_set_layout(mbox, LV_LAYOUT_FLEX);
-            lv_obj_set_flex_flow(mbox, LV_FLEX_FLOW_COLUMN);
-            lv_obj_set_flex_align(mbox, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-            lv_obj_t *err_lbl = lv_label_create(mbox);
-            lv_label_set_text_fmt(err_lbl, LV_SYMBOL_CLOSE " %s", wresp.data.error_msg);
-            lv_obj_set_style_text_color(err_lbl, lv_color_hex(0xff0000), 0);
-            lv_obj_set_style_text_align(err_lbl, LV_TEXT_ALIGN_CENTER, 0);
-            lv_obj_t *ok_btn = lv_button_create(mbox);
-            lv_obj_set_size(ok_btn, 80, 32);
-            lv_obj_set_style_bg_color(ok_btn, lv_color_hex(0xe94560), 0);
-            lv_obj_add_event_cb(ok_btn, close_btn_cb, LV_EVENT_CLICKED, mbox);
-            lv_obj_t *ok_lbl = lv_label_create(ok_btn);
-            lv_label_set_text(ok_lbl, "OK");
-            lv_obj_center(ok_lbl);
-            lv_group_t *eg = lv_group_create();
-            lv_group_add_obj(eg, ok_btn);
-            lv_indev_t *indev = lv_indev_get_next(NULL);
-            while (indev) {
-                if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) { lv_indev_set_group(indev, eg); break; }
-                indev = lv_indev_get_next(indev);
-            }
-            lv_group_focus_obj(ok_btn);
+            /* 构造错误信息后创建结果弹窗 */
+            char err_msg[80];
+            snprintf(err_msg, sizeof(err_msg), LV_SYMBOL_CLOSE " %s", wresp.data.error_msg);
+            create_result_dialog(err_msg, 0xff0000);
         }
     }
 }
@@ -782,89 +776,12 @@ static void list_event_cb(lv_event_t *e)
     if (strstr(txt, "WiFi")) {
         if (wifi_connecting) return;
         wifi_connecting = true;
-
-        // 加载弹窗
-        spinner_cont = lv_obj_create(lv_screen_active());
-        lv_obj_set_size(spinner_cont, 200, 150);
-        lv_obj_center(spinner_cont);
-        lv_obj_set_style_bg_color(spinner_cont, lv_color_hex(0x16213e), 0);
-        lv_obj_set_style_border_color(spinner_cont, lv_color_hex(0xe94560), 0);
-        lv_obj_set_style_border_width(spinner_cont, 2, 0);
-        lv_obj_set_style_pad_all(spinner_cont, 8, 0);
-        lv_obj_set_layout(spinner_cont, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(spinner_cont, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_flex_align(spinner_cont, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-        lv_obj_t *spinner = lv_spinner_create(spinner_cont);
-        lv_obj_set_size(spinner, 50, 50);
-
-        lv_obj_t *lbl = lv_label_create(spinner_cont);
-        lv_label_set_text(lbl, "WiFi Connecting...");
-        lv_obj_set_style_text_color(lbl, lv_color_hex(0xffffff), 0);
-
-        lv_obj_t *cancel_btn = lv_button_create(spinner_cont);
-        lv_obj_set_size(cancel_btn, 80, 32);
-        lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x555555), 0);
-        lv_obj_add_event_cb(cancel_btn, cancel_btn_cb, LV_EVENT_CLICKED, NULL);
-        lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
-        lv_label_set_text(cancel_lbl, "Cancel");
-        lv_obj_center(cancel_lbl);
-
-        // 加载弹窗用独立group，隔离主列表
-        lv_group_t *loading_group = lv_group_create();
-        lv_group_add_obj(loading_group, cancel_btn);
-        lv_indev_t *indev = lv_indev_get_next(NULL);
-        while (indev) {
-            if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) {
-                lv_indev_set_group(indev, loading_group);
-                break;
-            }
-            indev = lv_indev_get_next(indev);
-        }
-        lv_group_focus_obj(cancel_btn);
-
+        wifi_spinner_cont = create_loading_dialog("WiFi Connecting...", cancel_btn_cb);
         xTaskCreate(wifi_connect_task, "wifi_task", 4096, NULL, 3, &wifi_task_handle);
     } else if (strstr(txt, "天气")) {
         if (weather_fetching) return;
         weather_fetching = true;
-
-        spinner_cont = lv_obj_create(lv_screen_active());
-        lv_obj_set_size(spinner_cont, 200, 150);
-        lv_obj_center(spinner_cont);
-        lv_obj_set_style_bg_color(spinner_cont, lv_color_hex(0x16213e), 0);
-        lv_obj_set_style_border_color(spinner_cont, lv_color_hex(0xe94560), 0);
-        lv_obj_set_style_border_width(spinner_cont, 2, 0);
-        lv_obj_set_style_pad_all(spinner_cont, 8, 0);
-        lv_obj_set_layout(spinner_cont, LV_LAYOUT_FLEX);
-        lv_obj_set_flex_flow(spinner_cont, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_flex_align(spinner_cont, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-        lv_obj_t *spinner = lv_spinner_create(spinner_cont);
-        lv_obj_set_size(spinner, 50, 50);
-
-        lv_obj_t *lbl = lv_label_create(spinner_cont);
-        lv_label_set_text(lbl, "Fetching Weather...");
-        lv_obj_set_style_text_color(lbl, lv_color_hex(0xffffff), 0);
-
-        lv_obj_t *cancel_btn = lv_button_create(spinner_cont);
-        lv_obj_set_size(cancel_btn, 80, 32);
-        lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x555555), 0);
-        lv_obj_add_event_cb(cancel_btn, weather_cancel_btn_cb, LV_EVENT_CLICKED, NULL);
-        lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
-        lv_label_set_text(cancel_lbl, "Cancel");
-        lv_obj_center(cancel_lbl);
-
-        lv_group_t *loading_group = lv_group_create();
-        lv_group_add_obj(loading_group, cancel_btn);
-        lv_indev_t *indev = lv_indev_get_next(NULL);
-        while (indev) {
-            if (lv_indev_get_type(indev) == LV_INDEV_TYPE_ENCODER) {
-                lv_indev_set_group(indev, loading_group);
-                break;
-            }
-            indev = lv_indev_get_next(indev);
-        }
-        lv_group_focus_obj(cancel_btn);
+        weather_spinner_cont = create_loading_dialog("Fetching Weather...", weather_cancel_btn_cb);
         xTaskCreate(weather_fetch_task, "weather_task", 16384, NULL, 3, NULL);
     } else if (strstr(txt, "聊天")) {
         show_chat_screen();
