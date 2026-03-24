@@ -1,6 +1,6 @@
 # Bot - ESP32-S3 AI 智能助手工程
 
-基于 ESP-IDF + LVGL 的 ESP32-S3 嵌入式 AI 助手，支持 WiFi 连接、天气查询、AI 聊天、语音录音，配备 TFT LCD 图形界面和旋转编码器交互。
+基于 ESP-IDF + LVGL 的 ESP32-S3 嵌入式 AI 助手，支持 WiFi 连接、天气查询、AI 聊天、语音识别对话，配备 TFT LCD 图形界面和旋转编码器交互。
 
 ## 硬件
 
@@ -79,7 +79,7 @@ bot/
 - **WiFi 连接**：后台任务连接，弹窗显示进度和结果，NTP 时间同步
 - **天气查询**：HTTP 获取实时天气，独立天气详情界面
 - **AI 聊天**：OpenAI 兼容 API，键盘输入，滚动对话记录
-- **语音录音**：INMP441 I2S 采集，PCM 数据通过 USB CDC 发送至电脑（ASR 云识别接口已实现，可选启用）
+- **语音助手**：INMP441 I2S 采集，百度 ASR 云识别，识别结果自动送入 LLM，语音助手界面直接显示模型回复
 
 ## 编译烧录
 
@@ -113,6 +113,8 @@ idf.py flash monitor
 | `wifi_task` | 3 | 4096 | WiFi 连接 + NTP 同步（一次性）|
 | `weather_task` | 3 | 16384 | HTTP 天气查询（一次性）|
 | `chat_task` | 3 | 16384 | LLM API 请求（一次性）|
+| `asr_task` | 3 | 16384 | 百度 ASR 识别请求（一次性）|
+| `asr_llm` | 3 | 16384 | 语音助手 LLM 请求（一次性，ASR 完成后触发）|
 
 ### 弹窗与 UI 线程安全
 
@@ -137,6 +139,6 @@ idf.py flash monitor
 ## 注意事项
 
 - `user/asr_config.h` 和 `user/model_config.h` 已加入 `.gitignore`，不会提交到版本库
-- ASR 云识别功能默认关闭（录音数据通过 USB CDC 发送至电脑），如需启用请取消 `asr.c` 中的注释
+- 语音助手流程：录音 → 百度 ASR 识别 → LLM 回复，状态栏依次显示「识别中...」→「思考中...」→「完成」
 - LCD SPI 时钟 40MHz，全帧刷新约 30ms（~33fps）
 - PSRAM 双缓冲共占用约 300KB，WiFi + mbedTLS 运行时需额外约 100KB 内部堆
