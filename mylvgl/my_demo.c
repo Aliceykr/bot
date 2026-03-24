@@ -456,7 +456,6 @@ typedef struct {
 
 static QueueHandle_t asr_result_queue = NULL;
 
-/* asr_recognize_task 暂时停用，音频通过 USB CDC 发送
 static void asr_recognize_task(void *arg)
 {
     uint32_t audio_len = *(uint32_t *)arg;
@@ -466,7 +465,6 @@ static void asr_recognize_task(void *arg)
     xQueueSend(asr_result_queue, &res, 0);
     vTaskDelete(NULL);
 }
-*/
 
 static void asr_btn_cb(lv_event_t *e)
 {
@@ -477,44 +475,28 @@ static void asr_btn_cb(lv_event_t *e)
         lv_label_set_text(asr_status_label, "录音中...");
         lv_obj_set_style_bg_color(asr_btn, lv_color_hex(0xe94560), 0);
         lv_obj_t *lbl = lv_obj_get_child(asr_btn, 0);
-        if (lbl) lv_label_set_text(lbl, LV_SYMBOL_STOP " 停止录音");
+        if (lbl) lv_label_set_text(lbl, "停止录音");
     } else {
         asr_recording = false;
         asr_audio_len = asr_record_stop();
         lv_obj_t *lbl = lv_obj_get_child(asr_btn, 0);
-        if (lbl) lv_label_set_text(lbl, LV_SYMBOL_AUDIO " 开始录音");
+        if (lbl) lv_label_set_text(lbl, "开始录音");
         if (asr_audio_len == 0) {
             lv_label_set_text(asr_status_label, "录音太短，请重试");
             lv_obj_set_style_bg_color(asr_btn, lv_color_hex(0x16213e), 0);
             return;
         }
-        lv_label_set_text(asr_status_label, "已发送至电脑");
-        lv_obj_set_style_bg_color(asr_btn, lv_color_hex(0x16213e), 0);
-        /* 识别功能暂时关闭，音频已通过 USB CDC 实时发送
         asr_processing = true;
         lv_label_set_text(asr_status_label, "识别中...");
         lv_obj_set_style_bg_color(asr_btn, lv_color_hex(0x555555), 0);
         uint32_t *len_arg = malloc(sizeof(uint32_t));
         *len_arg = asr_audio_len;
-        StaticTask_t *task_buf = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
-        StackType_t  *task_stack = heap_caps_malloc(32768, MALLOC_CAP_SPIRAM);
-        if (!task_buf || !task_stack) {
+        BaseType_t ret = xTaskCreate(asr_recognize_task, "asr_task", 16384, len_arg, 3, NULL);
+        if (ret != pdPASS) {
             lv_label_set_text(asr_status_label, "内存不足");
             asr_processing = false;
             free(len_arg);
-            if (task_buf) heap_caps_free(task_buf);
-            if (task_stack) heap_caps_free(task_stack);
-        } else {
-            heap_caps_free(task_buf);
-            heap_caps_free(task_stack);
-            BaseType_t ret = xTaskCreate(asr_recognize_task, "asr_task", 16384, len_arg, 3, NULL);
-            if (ret != pdPASS) {
-                lv_label_set_text(asr_status_label, "内存不足");
-                asr_processing = false;
-                free(len_arg);
-            }
         }
-        */
     }
 }
 
@@ -602,8 +584,9 @@ static void show_asr_screen(void)
     lv_obj_set_style_border_width(asr_btn, 2, 0);
     lv_obj_add_event_cb(asr_btn, asr_btn_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *btn_lbl = lv_label_create(asr_btn);
-    lv_label_set_text(btn_lbl, LV_SYMBOL_AUDIO " 开始录音");
+    lv_label_set_text(btn_lbl, "开始录音");
     lv_obj_set_style_text_color(btn_lbl, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(btn_lbl, &lv_font_simhei_16, 0);
     lv_obj_center(btn_lbl);
 
     lv_group_t *ag = lv_group_create();

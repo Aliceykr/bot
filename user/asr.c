@@ -1,6 +1,5 @@
 #include "asr.h"
 #include "asr_config.h"
-#include "usb_audio.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -141,6 +140,7 @@ uint32_t asr_record_stop(void)
     s_recording = false;
     i2s_channel_disable(s_rx_chan);
     uint32_t bytes = s_rec_pos * sizeof(int16_t);
+    ESP_LOGI(TAG, "stop: s_rec_pos=%lu", (unsigned long)s_rec_pos);
     // 检查音量：取前100个样本的最大绝对值
     int32_t max_val = 0;
     uint32_t check = s_rec_pos > 100 ? 100 : s_rec_pos;
@@ -171,19 +171,14 @@ void asr_record_read(void)
         ESP_LOGI(TAG, "raw32 L=%ld R=%ld", (long)tmp[0], (long)tmp[1]);
     }
     // STEREO模式：偶数=左声道(INMP441 L/R=GND)，右移8位取24bit有效位的高16bit
-    static int16_t tmp16[512];
-    int out_samples = 0;
     for (int i = 0; i < stereo_samples - 1 && s_rec_pos < max_samples; i += 2) {
         int32_t raw = tmp[i];  // 左声道
         // INMP441: 数据在高24位，右移16位取高16bit，再放大2倍
         int32_t val = (raw >> 16) * 3;
         if (val >  32767) val =  32767;
         if (val < -32768) val = -32768;
-        tmp16[out_samples++] = (int16_t)val;
         s_rec_buf[s_rec_pos++] = (int16_t)val;
     }
-    // 发送 16bit PCM 到电脑
-    if (out_samples > 0) usb_audio_send(tmp16, out_samples * sizeof(int16_t));
 }
 
 // ================================================================
