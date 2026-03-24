@@ -455,6 +455,7 @@ typedef struct {
 } asr_task_result_t;
 
 static QueueHandle_t asr_result_queue = NULL;
+static QueueHandle_t asr_llm_result_queue = NULL;  /* ASR→LLM 结果队列 */
 
 static void asr_recognize_task(void *arg)
 {
@@ -463,6 +464,17 @@ static void asr_recognize_task(void *arg)
     asr_task_result_t res;
     res.success = asr_recognize(audio_len, &res.data);
     xQueueSend(asr_result_queue, &res, 0);
+    vTaskDelete(NULL);
+}
+
+/* ASR→LLM 后台任务：将 ASR 识别文字送入模型，结果通过队列返回 LVGL 线程 */
+static void asr_llm_task(void *arg)
+{
+    char *asr_text = (char *)arg;
+    chat_result_t res;  /* 复用 chat_result_t */
+    res.success = model_chat(asr_text, &res.data);
+    free(asr_text);
+    xQueueSend(asr_llm_result_queue, &res, 0);
     vTaskDelete(NULL);
 }
 
@@ -505,16 +517,57 @@ static void asr_timer_cb(lv_timer_t *t)
     if (!asr_scr || !lv_obj_is_valid(asr_scr)) { lv_timer_delete(t); return; }
     if (asr_recording) asr_record_read();
     if (!asr_result_queue) return;
-    asr_task_result_t res;
-    if (xQueueReceive(asr_result_queue, &res, 0) != pdTRUE) return;
+
+    /* --- 阶段1：收到 ASR 识别结果，转发给 LLM --- */
+    asr_task_result_t asr_res;
+    if (xQueueReceive(asr_result_queue, &asr_res, 0) == pdTRUE) {
+        if (asr_res.success && strlen(asr_res.data.result) > 0) {
+            lv_label_set_text(asr_status_label, "思考中...");
+            /* 将识别文字复制给 LLM 任务（独立 heap 分配，任务内 free） */
+            char *text = malloc(ASR_MAX_RESULT);
+            if (text) {
+                strncpy(text, asr_res.data.result, ASR_MAX_RESULT - 1);
+                text[ASR_MAX_RESULT - 1] = '\0';  /* 确保字符串以 null 结尾 */
+                if (!asr_llm_result_queue)
+                    asr_llm_result_queue = xQueueCreate(2, sizeof(chat_result_t));
+                BaseType_t ret = xTaskCreate(asr_llm_task, "asr_llm", 16384, text, 3, NULL);
+                if (ret != pdPASS) {
+                    /* 任务创建失败：释放内存，恢复状态，防止界面卡死 */
+                    free(text);
+                    lv_label_set_text(asr_result_label, "内存不足");
+                    lv_label_set_text(asr_status_label, "错误");
+                    lv_obj_set_style_bg_color(asr_btn, lv_color_hex(0x16213e), 0);
+                    asr_processing = false;
+                }
+            } else {
+                /* malloc 失败：恢复状态 */
+                lv_label_set_text(asr_result_label, "内存不足");
+                lv_label_set_text(asr_status_label, "错误");
+                lv_obj_set_style_bg_color(asr_btn, lv_color_hex(0x16213e), 0);
+                asr_processing = false;
+            }
+        } else {
+            /* ASR 识别失败，直接显示错误，不送 LLM */
+            lv_label_set_text(asr_result_label, "识别失败");
+            lv_label_set_text(asr_status_label, asr_res.data.error_msg);
+            lv_obj_set_style_bg_color(asr_btn, lv_color_hex(0x16213e), 0);
+            asr_processing = false;
+        }
+    }
+
+    /* --- 阶段2：收到 LLM 回复，显示到界面 --- */
+    if (!asr_llm_result_queue) return;
+    chat_result_t llm_res;
+    if (xQueueReceive(asr_llm_result_queue, &llm_res, 0) != pdTRUE) return;
+
     asr_processing = false;
     lv_obj_set_style_bg_color(asr_btn, lv_color_hex(0x16213e), 0);
-    if (res.success && strlen(res.data.result) > 0) {
-        lv_label_set_text(asr_result_label, res.data.result);
-        lv_label_set_text(asr_status_label, "识别完成");
+    if (llm_res.success) {
+        lv_label_set_text(asr_result_label, llm_res.data.output);
+        lv_label_set_text(asr_status_label, "完成");
     } else {
-        lv_label_set_text(asr_result_label, "识别失败");
-        lv_label_set_text(asr_status_label, res.data.error_msg);
+        lv_label_set_text(asr_result_label, "模型错误");
+        lv_label_set_text(asr_status_label, llm_res.data.error_msg);
     }
 }
 
@@ -527,6 +580,7 @@ static void asr_back_cb(lv_event_t *e)
     asr_result_label = NULL;
     asr_status_label = NULL;
     asr_btn = NULL;
+    asr_llm_result_queue = NULL;  /* 置空指针，避免 use-after-free，下次进入界面时重建 */
     lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
     indev_set_group(group);
 }
