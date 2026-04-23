@@ -26,7 +26,8 @@
       "Bash(source ~/export-esp.sh)",
       "Bash(source /c/Espressif/frameworks/esp-idf-v5.*/export.sh)",
       "WebFetch(domain:ai.baidu.com)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(curl:*)"
     ]
   }
 }
