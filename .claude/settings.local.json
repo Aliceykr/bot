@@ -27,7 +27,11 @@
       "Bash(source /c/Espressif/frameworks/esp-idf-v5.*/export.sh)",
       "WebFetch(domain:ai.baidu.com)",
       "WebSearch",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(git submodule *)",
+      "Bash(git rm *)",
+      "Bash(rm -f .gitmodules)",
+      "Bash(git add *)"
     ]
   }
 }
