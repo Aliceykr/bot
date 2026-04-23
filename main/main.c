@@ -6,7 +6,6 @@
 #include "lv_port_disp.h"
 #include "lv_port_indev.h"
 #include "my_demo.h"
-#include "usb_audio.h"
 #include "speaker.h"
 
 static void lvgl_tick_task(void *arg)
@@ -40,7 +39,6 @@ static void lvgl_task(void *arg)
 
 void app_main(void)
 {
-    usb_audio_init();
     speaker_init();
     LCD_Init();
 
