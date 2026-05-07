@@ -19,9 +19,7 @@ static void lvgl_tick_task(void *arg)
 
 static void lvgl_task(void *arg)
 {
-    ESP_LOGI("MAIN", "lvgl_task started, calling my_demo");
     my_demo();
-    ESP_LOGI("MAIN", "my_demo done, entering main loop");
 
     // 绑定编码器到列表的 group
     lv_group_t *group = my_demo_get_group();

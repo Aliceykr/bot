@@ -1,7 +1,7 @@
 #include "lcd.h"
 #include "lcdfont.h"
 
-static spi_device_handle_t s_spi = NULL;
+spi_device_handle_t s_spi = NULL;
 static void lcd_delay_ms(uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
 
 static void lcd_spi_send(const uint8_t *data, size_t len)
@@ -31,12 +31,12 @@ void LCD_GPIO_Init(void)
         .sclk_io_num   = LCD_SCLK_PIN,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = LCD_W * LCD_H * 2 + 8,
+        .max_transfer_sz = 4096,
     };
     spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
 
     spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = 40 * 1000 * 1000,
+        .clock_speed_hz = 80 * 1000 * 1000,
         .mode           = 0,
         .spics_io_num   = -1,  // 无 CS
         .queue_size     = 7,
