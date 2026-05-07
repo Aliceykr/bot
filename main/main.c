@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_log.h"
 #include "lcd.h"
 #include "lvgl.h"
 #include "lv_port_disp.h"
@@ -18,7 +19,9 @@ static void lvgl_tick_task(void *arg)
 
 static void lvgl_task(void *arg)
 {
+    ESP_LOGI("MAIN", "lvgl_task started, calling my_demo");
     my_demo();
+    ESP_LOGI("MAIN", "my_demo done, entering main loop");
 
     // 绑定编码器到列表的 group
     lv_group_t *group = my_demo_get_group();

@@ -1,37 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python3 -c \"with open\\(''C:/Users/Aliceykr/Desktop/bot/user/lcdfont.h'', ''rb''\\) as f: d=f.read\\(\\); print\\(len\\(d\\), d[16000:16100]\\)\")",
-      "Bash(where python:*)",
-      "Bash(python -c \"with open\\(''C:/Users/Aliceykr/Desktop/bot/user/lcdfont.h'', ''rb''\\) as f: d=f.read\\(\\); print\\(len\\(d\\)\\)\")",
-      "Bash(python C:/Users/Aliceykr/Desktop/bot/gen_gb2312.py)",
-      "Bash(python C:/Users/Aliceykr/Desktop/bot/gen_main.py)",
-      "Bash(idf.py build:*)",
-      "WebFetch(domain:uapis.cn)",
-      "Bash(npm --version)",
-      "Bash(npm install:*)",
-      "Bash(grep -roh [x80-xff][x80-xff][x80-xff] /c/Users/Aliceykr/Desktop/bot/mylvgl/ /c/Users/Aliceykr/Desktop/bot/user/wifi.h)",
-      "Bash(python C:/Users/Aliceykr/Desktop/bot/gen_chars.py)",
-      "Bash(lv_font_conv --font 'C:/Windows/Fonts/simhei.ttf' --symbols-file chars.txt --size 16 --format lvgl --bpp 4 -o user/lv_font_simhei_16.c --no-compress)",
-      "Bash(lv_font_conv --font 'C:/Windows/Fonts/simhei.ttf' -r 0x20-0x7F -r 0x4E00-0x9FFF -r 0x3000-0x303F -r 0xFF00-0xFFEF --size 16 --format lvgl --bpp 4 -o user/lv_font_simhei_16.c --no-compress)",
-      "Bash(lv_font_conv --font 'C:/Windows/Fonts/simhei.ttf' -r 0x20-0x7F -r 0x4E00-0x9FFF -r 0x3000-0x303F -r 0xFF00-0xFFEF --size 20 --format lvgl --bpp 4 -o user/lv_font_simhei_20.c --no-compress)",
-      "Bash(lv_font_conv --help)",
-      "Bash(lv_font_conv --font 'C:/Windows/Fonts/simhei.ttf' -r 0x20-0x7F -r 0x4E00-0x9FFF -r 0x3000-0x303F -r 0xFF00-0xFFEF --size 16 --format lvgl --bpp 4 -o user/lv_font_simhei_16.c --no-compress --lv-include 'lvgl/lvgl.h')",
-      "WebFetch(domain:docs.siliconflow.cn)",
-      "WebFetch(domain:cloud.baidu.com)",
-      "WebFetch(domain:blog.csdn.net)",
-      "WebFetch(domain:lingshunlab.com)",
-      "WebFetch(domain:gitee.com)",
-      "WebFetch(domain:developer.baidu.com)",
-      "Bash(source ~/export-esp.sh)",
-      "Bash(source /c/Espressif/frameworks/esp-idf-v5.*/export.sh)",
-      "WebFetch(domain:ai.baidu.com)",
-      "WebSearch",
-      "Bash(curl:*)",
-      "Bash(git submodule *)",
-      "Bash(git rm *)",
-      "Bash(rm -f .gitmodules)",
-      "Bash(git add *)"
+      "Bash(git clone:*)",
+      "Bash(git config:*)",
+      "Bash(cp:*)",
+      "Bash(\"D:/ESP-IDF/v5.1.2/esp-idf/tools/idf.py\" set-target *)"
     ]
   }
 }

@@ -138,11 +138,10 @@ void LCD_Backlight(uint8_t on)
 void LCD_Init(void)
 {
     LCD_GPIO_Init();
-    LCD_RES_Clr(); lcd_delay_ms(100);
-    LCD_RES_Set(); lcd_delay_ms(100);
-    // 背光由外部控制，初始化完成后再开
+    LCD_RES_Clr(); lcd_delay_ms(200);
+    LCD_RES_Set(); lcd_delay_ms(200);
 
-    LCD_WR_REG(0x11); lcd_delay_ms(120);
+    LCD_WR_REG(0x11); lcd_delay_ms(200);
     LCD_WR_REG(0xCF);
     LCD_WR_DATA8(0x00); LCD_WR_DATA8(0xC1); LCD_WR_DATA8(0x30);
     LCD_WR_REG(0xED);

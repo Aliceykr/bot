@@ -90,7 +90,7 @@ bool wifi_connect(void)
             .sta = {
                 .ssid     = WIFI_SSID,
                 .password = WIFI_PASSWORD,
-                .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+                .threshold.authmode = WIFI_AUTH_WPA_PSK,
             },
         };
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
