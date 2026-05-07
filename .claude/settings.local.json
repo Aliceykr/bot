@@ -4,7 +4,12 @@
       "Bash(git clone:*)",
       "Bash(git config:*)",
       "Bash(cp:*)",
-      "Bash(\"D:/ESP-IDF/v5.1.2/esp-idf/tools/idf.py\" set-target *)"
+      "Bash(\"D:/ESP-IDF/v5.1.2/esp-idf/tools/idf.py\" set-target *)",
+      "Bash(ls -la build/bot.bin)",
+      "Bash(stat --printf=\"%s\" build/bot.bin)",
+      "Bash(wc -c)",
+      "Bash(xtensa-esp32s3-elf-objdump -b binary -m unknown -D -)",
+      "Bash(python3 -c ' *)"
     ]
   }
 }

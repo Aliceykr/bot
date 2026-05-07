@@ -13,6 +13,25 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+
+/* 在 PSRAM 上创建大栈任务：栈→PSRAM，TCB→内部 DRAM */
+static BaseType_t xTaskCreatePSRAM(TaskFunction_t func, const char *name,
+                                    uint32_t stack, void *arg, UBaseType_t prio,
+                                    TaskHandle_t *handle)
+{
+    StackType_t *stk = heap_caps_malloc(stack, MALLOC_CAP_SPIRAM);
+    StaticTask_t *tcb = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
+    if (!stk || !tcb) {
+        ESP_LOGE("PSRAM_TASK", "alloc failed for %s", name);
+        free(stk); free(tcb);
+        return pdFAIL;
+    }
+    TaskHandle_t h = xTaskCreateStatic(func, name, stack / sizeof(StackType_t),
+                                        arg, prio, stk, tcb);
+    if (handle) *handle = h;
+    return h ? pdPASS : pdFAIL;
+}
 #include "esp_system.h"
 #include "esp_heap_caps.h"
 
@@ -369,7 +388,7 @@ static void chat_send_cb(lv_event_t *e)
         // 改用动态任务避免泄漏
         heap_caps_free(task_buf);
         heap_caps_free(task_stack);
-        BaseType_t ret = xTaskCreate(chat_fetch_task, "chat_task", 16384, msg, 3, NULL);
+        BaseType_t ret = xTaskCreatePSRAM(chat_fetch_task, "chat_task", 16384, msg, 3, NULL);
         if (ret != pdPASS) {
             ESP_LOGE("CHAT", "chat_task 创建失败");
             chat_fetching = false;
@@ -507,7 +526,7 @@ static void asr_btn_cb(lv_event_t *e)
         lv_obj_set_style_bg_color(asr_btn, lv_color_hex(0x555555), 0);
         uint32_t *len_arg = malloc(sizeof(uint32_t));
         *len_arg = asr_audio_len;
-        BaseType_t ret = xTaskCreate(asr_recognize_task, "asr_task", 16384, len_arg, 3, NULL);
+        BaseType_t ret = xTaskCreatePSRAM(asr_recognize_task, "asr_task", 16384, len_arg, 3, NULL);
         if (ret != pdPASS) {
             lv_label_set_text(asr_status_label, "内存不足");
             asr_processing = false;
@@ -534,7 +553,7 @@ static void asr_timer_cb(lv_timer_t *t)
                 text[ASR_MAX_RESULT - 1] = '\0';  /* 确保字符串以 null 结尾 */
                 if (!asr_llm_result_queue)
                     asr_llm_result_queue = xQueueCreate(2, sizeof(chat_result_t));
-                BaseType_t ret = xTaskCreate(asr_llm_task, "asr_llm", 16384, text, 3, NULL);
+                BaseType_t ret = xTaskCreatePSRAM(asr_llm_task, "asr_llm", 16384, text, 3, NULL);
                 if (ret != pdPASS) {
                     /* 任务创建失败：释放内存，恢复状态，防止界面卡死 */
                     free(text);
@@ -823,7 +842,7 @@ static void list_event_cb(lv_event_t *e)
         if (weather_fetching) return;
         weather_fetching = true;
         weather_spinner_cont = create_loading_dialog("Fetching Weather...", weather_cancel_btn_cb);
-        xTaskCreate(weather_fetch_task, "weather_task", 16384, NULL, 3, NULL);
+        xTaskCreatePSRAM(weather_fetch_task, "weather_task", 16384, NULL, 3, NULL);
     } else if (strstr(txt, "聊天")) {
         show_chat_screen();
     } else if (strstr(txt, "语音")) {
