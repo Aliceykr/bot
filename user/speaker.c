@@ -14,8 +14,9 @@
 /* 每次从 RingBuffer 取出并写入 I2S 的最大字节数 */
 #define SPK_TX_CHUNK        512
 
-/* 播放任务栈大小与优先级（与 usb_tx_task 同优先级，低于 LVGL 任务）*/
-#define SPK_TASK_STACK      2048
+/* 播放任务栈：4KB。之前 2KB 在高采样率 + stereo 展开时会溢出
+ * （stereo_buf 512 × 2 字节 + I2S 写入调用栈 + ESP_LOG 栈）*/
+#define SPK_TASK_STACK      4096
 #define SPK_TASK_PRIO       3
 
 /* ================================================================
@@ -48,12 +49,6 @@ static void spk_tx_task(void *arg)
          * MAX98357A L/R 接 GND 取左声道。 */
         int16_t *src = (int16_t *)item;
         size_t n_samples = recv_size / sizeof(int16_t);
-        /* 调试：每100次打印一次样本值，确认数据正常 */
-        static int dbg_cnt = 0;
-        if (++dbg_cnt >= 100) {
-            dbg_cnt = 0;
-            ESP_LOGI(TAG, "pcm[0]=%d pcm[1]=%d n=%d", src[0], src[1], (int)n_samples);
-        }
         /* stereo_buf 需容纳 n_samples * 2 个 int16。
          * 单次从 RingBuffer 取最多 SPK_TX_CHUNK 字节（=SPK_TX_CHUNK/2 个 mono 样本），
          * 展开为 stereo 后 = SPK_TX_CHUNK 个 int16 = SPK_TX_CHUNK*2 字节。

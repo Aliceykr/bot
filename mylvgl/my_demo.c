@@ -914,10 +914,11 @@ static void rom_item_cb(lv_event_t *e)
     ESP_LOGI("ROM_CB", "creating task, DRAM free=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
-    /* 游戏任务栈 8KB 放内部 DRAM（不能用 PSRAM：SPIFFS 读 ROM 时要关 flash cache，
+    /* 游戏任务栈 12KB 放内部 DRAM（不能用 PSRAM：SPIFFS 读 ROM 时要关 flash cache，
      * 关 cache 后 PSRAM 不可访问会 panic）。WiFi 已停，DRAM 够用。
+     * 12KB 栈余量给 Walnut 的深 opcode dispatch + 音频 mix + fopen/SPIFFS。
      * 绑 Core 1 避免 Core 0 的系统任务打扰 */
-    if (xTaskCreatePinnedToCore(game_run_task, "game_run", 8192, copy, 10,
+    if (xTaskCreatePinnedToCore(game_run_task, "game_run", 12288, copy, 10,
                                  &s_game_task, 1) != pdPASS) {
         ESP_LOGE("ROM_CB", "xTaskCreatePinnedToCore failed");
         free(copy);

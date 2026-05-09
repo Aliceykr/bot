@@ -1,6 +1,6 @@
 # Bot — ESP32-S3 AI 智能语音助手 & Game Boy 模拟器
 
-基于 ESP-IDF + LVGL 的 ESP32-S3 嵌入式项目，集成 WiFi、天气查询、AI 聊天、语音识别、语音合成、Game Boy 游戏模拟器，配备 TFT LCD 图形界面与旋转编码器交互。
+基于 ESP-IDF + LVGL 的 ESP32-S3 嵌入式项目，集成 WiFi、天气查询、AI 聊天、语音识别、语音合成、Game Boy 游戏模拟器（含音频），配备 TFT LCD 图形界面与旋转编码器交互。
 
 ---
 
@@ -65,15 +65,14 @@ A/B 相由 PCNT 硬件正交解码，SW 按键 5ms 轮询状态机（20ms 防抖
 bot/
 ├── main/
 │   ├── main.c                    # 应用入口：初始化外设、创建 LVGL 任务
+│   ├── psram_task.c / .h         # PSRAM 栈任务创建工具（含自动回收 cleaner）
 │   ├── CMakeLists.txt            # 编译入口，列出所有源文件
 │   └── idf_component.yml        # IDF 组件依赖
 ├── mylvgl/
 │   ├── my_demo.c                 # LVGL 主界面逻辑（菜单/天气/聊天/语音/游戏）
 │   ├── my_demo.h
-│   ├── lv_port_disp.c            # LVGL 显示驱动（PARTIAL 双缓冲 + 异步 DMA）
-│   ├── lv_port_disp.h
-│   ├── lv_port_indev.c           # LVGL 输入设备（PCNT 编码器）
-│   └── lv_port_indev.h
+│   ├── lv_port_disp.c / .h       # LVGL 显示驱动（PARTIAL 双缓冲 + 异步 DMA）
+│   ├── lv_port_indev.c / .h      # LVGL 输入设备（PCNT 编码器）
 ├── user/
 │   ├── lcd.c / lcd.h             # ILI9341 SPI LCD 底层驱动
 │   ├── lcdfont.h                 # ASCII 点阵字库（12/16/24/32px）
@@ -89,15 +88,19 @@ bot/
 │   ├── weather.c / weather.h     # 天气 HTTP 查询与解析
 │   ├── wifi.c / wifi.h           # WiFi STA 连接 + 守护任务（断线重连）
 │   ├── sntp_time.c / sntp_time.h # SNTP 网络时间同步（阿里云 NTP）
-│   ├── health.c / health.h       # 堆内存健康监控（周期打印 DRAM/PSRAM 水位）
-│   ├── lv_font_simhei_16.c       # 思黑体 16px LVGL 中文字体
-│   └── lv_font_simhei_20.c       # 思黑体 20px LVGL 中文字体
+│   ├── health.c / health.h       # 堆内存健康监控（60s 周期打印水位）
+│   └── lv_font_simhei_16.c       # 思黑体 16px LVGL 中文字体
 ├── game/
-│   ├── gb_emu.c / gb_emu.h       # Peanut-GB Game Boy 模拟器集成
+│   ├── gb_emu.c / gb_emu.h       # Game Boy 模拟器集成（Walnut-CGB / Peanut-GB）
+│   ├── gb_audio.c / gb_audio.h   # GB 音频：MiniGB APU → stereo→mono → speaker
+│   ├── minigb_apu.c              # MiniGB APU 音频处理单元（第三方）
 │   ├── game_runtime.c / .h       # 游戏生命周期管理（加载/运行/退出）
 │   ├── rom_loader.c / .h         # SPIFFS ROM 扫描与加载
-│   ├── peanut_gb.h               # Peanut-GB 单头文件模拟器
+│   ├── walnut_cgb.h              # Walnut-CGB 模拟器核心（高性能，32位路径）
+│   ├── peanut_gb.h               # Peanut-GB 模拟器核心（原始 8 位，备用）
 │   └── CMakeLists.txt
+├── spiffs_image/
+│   └── roms/                     # 放置 .gb / .gbc ROM 文件
 ├── lvgl/                         # LVGL 9.x 源码
 ├── lv_conf.h                     # LVGL 配置
 ├── partitions.csv                # 自定义分区表（6MBx2 OTA + 4MB SPIFFS）
@@ -116,12 +119,27 @@ bot/
 
 - **WiFi 连接** — 后台连接 WiFi，弹窗显示进度，成功后自动同步 NTP 时间
 - **天气查询** — HTTP 拉取实时天气，展示温度、湿度、风力、实时时钟
-- **游戏** — 扫描 SPIFFS 中的 .gb/.gbc ROM 文件，选择运行 Peanut-GB 模拟器
+- **游戏** — 扫描 SPIFFS 中的 .gb/.gbc ROM 文件，选择运行 Game Boy 模拟器
 - **聊天助手** — 屏幕键盘输入文字，调用 LLM API 获取回复，滚动对话记录
 - **语音助手** — 录音 → ASR 识别 → LLM 回复 → TTS 合成语音播放
 - **重启** — 软件重启设备
 
-### 2. 语音助手完整流程
+### 2. Game Boy 模拟器
+
+- 基于 Walnut-CGB（Peanut-GB 高性能重写版），支持 DMG + CGB 游戏
+- 双取指链式架构 + 32 位 DMA 路径，专为 ESP32-S3 等 32 位 MCU 优化
+- GB 原生分辨率 160x144，1.5 倍缩放到 240x216
+- SPI 80MHz 异步 DMA 双行缓冲渲染
+- 小 ROM（<=256KB）自动复制到 DRAM 加速
+- 长按编码器 SW 键（800ms）退出游戏
+
+### 3. Game Boy 音频
+
+- MiniGB APU 模拟全部 4 个 GB 声道（方波x2 + 波形 + 噪声）
+- 每帧合成 ~268 个 stereo 样本（16kHz），合并为 mono 推入 speaker RingBuffer
+- 与游戏模拟器同步运行，非阻塞输出（缓冲满时丢帧保仿真帧率）
+
+### 4. 语音助手完整流程
 
 ```
 用户按键开始录音
@@ -137,16 +155,7 @@ INMP441 I2S 采集（16kHz 16bit mono，最长10秒，缓存于 PSRAM）
 MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 ```
 
-### 3. Game Boy 模拟器
-
-- 基于 Peanut-GB，GB 原生分辨率 160x144，1.5 倍缩放到 240x216
-- SPI 80MHz 异步 DMA 双行缓冲渲染
-- 小 ROM（<=256KB）自动复制到 DRAM 加速
-- Frame skip = 1（60fps 仿真，30fps 显示）
-- 游戏运行时独占 SPI 总线，LVGL 显示暂停
-- 长按编码器 SW 键（800ms）退出游戏
-
-### 4. WiFi 守护
+### 5. WiFi 守护
 
 - 首次连接：EventGroup 等待结果，最多重试 3 次
 - 运行期断线：常驻守护任务自动重连，指数退避（5s → 5min）
@@ -158,28 +167,33 @@ MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 
 ### 任务结构
 
-| 任务名 | 优先级 | 栈大小 | 核心 | 说明 |
-|--------|--------|--------|------|------|
-| `lv_tick` | 5 | 2048 B | 任意 | LVGL 时钟（5ms tick） |
-| `lv_task` | 4 | 32768 B (PSRAM) | 任意 | LVGL 渲染 + flush |
-| `enc_task` | 6 | 2048 B | 任意 | SW 按键状态机（5ms 轮询） |
-| `spk_tx` | 3 | 2048 B | 任意 | RingBuffer → I2S DMA 播放 |
-| `asr_rec` | 5 | 2048 B | 任意 | I2S 录音常驻任务 |
-| `wifi_task` | 3 | 4096 B | 任意 | WiFi 连接 + NTP 同步（一次性） |
-| `wifi_guard` | 4 | 3072 B | 任意 | 断线重连守护（常驻） |
-| `weather_task` | 3 | 16384 B | 任意 | 天气查询（一次性） |
-| `chat_task` | 3 | 16384 B | 任意 | LLM 请求（一次性） |
-| `asr_task` | 3 | 16384 B | 任意 | ASR 识别（一次性） |
-| `asr_llm` | 3 | 16384 B | 任意 | ASR → LLM → TTS（一次性） |
-| `game_run` | 10 | 8192 B | 任意 | GB 模拟器主循环（游戏运行期间） |
-| `exit_watch` | 4 | 2048 B | 任意 | 长按退出监视 |
-| `health` | 1 | 2048 B | 任意 | 堆内存监控（60s 周期） |
+| 任务名 | 优先级 | 栈大小 | 说明 |
+|--------|--------|--------|------|
+| `lv_tick` | 5 | 2048 B | LVGL 时钟（5ms tick） |
+| `lv_task` | 4 | 32768 B (PSRAM) | LVGL 渲染 + flush |
+| `enc_task` | 6 | 2048 B | SW 按键状态机（5ms 轮询） |
+| `spk_tx` | 3 | 2048 B | RingBuffer → I2S DMA 播放 |
+| `asr_rec` | 5 | 2048 B | I2S 录音常驻任务 |
+| `wifi_task` | 3 | 4096 B | WiFi 连接 + NTP 同步（一次性） |
+| `wifi_guard` | 4 | 3072 B | 断线重连守护（常驻） |
+| `weather_task` | 3 | 16384 B | 天气查询（一次性） |
+| `chat_task` | 3 | 16384 B | LLM 请求（一次性） |
+| `asr_task` | 3 | 16384 B | ASR 识别（一次性） |
+| `asr_llm` | 3 | 16384 B | ASR → LLM → TTS（一次性） |
+| `game_run` | 10 | 8192 B | GB 模拟器主循环 |
+| `exit_watch` | 4 | 2048 B | 长按退出监视 |
+| `health` | 1 | 2048 B | 堆内存监控（60s 周期） |
+| `psram_cleaner` | 1 | 2048 B | 回收 PSRAM 任务栈和 TCB |
+
+### PSRAM 任务创建
+
+`psram_task.c` 提供 `xTaskCreatePSRAM()` 和 `xTaskCreatePSRAMPinnedToCore()`，将任务栈分配到 PSRAM（节省内部 DRAM），TCB 留在内部 DRAM（FreeRTOS 要求）。任务函数正常 `return` 后，后台 cleaner 任务自动回收栈和 TCB 内存。
 
 ### 线程安全
 
 - LVGL 对象操作均在 `lv_task` 单线程执行
 - 后台任务通过 FreeRTOS Queue 传递结果，`lv_timer` 回调轮询队列更新 UI
-- `speaker_play()` 使用 RingBuffer 非阻塞写入，TTS HTTP 回调可直接调用
+- `speaker_play()` 使用 RingBuffer 非阻塞写入，TTS/GB 音频可直接调用
 - HTTP 响应缓冲由各模块 mutex 保护
 
 ### LCD 刷新机制
@@ -200,7 +214,7 @@ PARTIAL 模式 + DRAM 双缓冲 + 异步 DMA：
 ### 环境要求
 
 - ESP-IDF v5.1+（推荐 v5.1.2）
-- ESP32-S3 目标芯片（`idf.py set-target esp32s3`）
+- ESP32-S3 目标芯片
 
 ### 步骤
 
@@ -218,7 +232,7 @@ cp user/asr_config.h.example user/asr_config.h
 cp user/model_config.h.example user/model_config.h
 ```
 
-编辑 `user/asr_config.h` 填入百度 AI 平台的 API Key 和 Secret Key。
+编辑 `user/asr_config.h` 填入百度 AI 平台 API Key 和 Secret Key。
 编辑 `user/model_config.h` 填入 LLM API Key、接口 URL 和模型名称。
 
 **3. 放入 Game Boy ROM（可选）**
@@ -242,14 +256,16 @@ idf.py -p COM5 -b 2000000 flash
 | 配置项 | 值 | 说明 |
 |--------|-----|------|
 | CPU 频率 | 240 MHz | 满速运行 |
-| Flash 模式 | QIO | 代码取指速度约为 DIO 的 2 倍 |
+| Flash 模式 | QIO | 代码取指约为 DIO 的 2 倍 |
 | Flash 频率 | 80 MHz | flash 时钟 |
 | Flash 大小 | 16 MB | N16R8 板载 |
 | PSRAM | Octal 80MHz | 8MB 八线 PSRAM |
+| SPIRAM_RODATA | 启用 | 只读常量放 PSRAM，释放 ~80KB 内部 DRAM |
+| SPIRAM_FETCH_INSTRUCTIONS | 禁用 | 代码留 flash XIP，PSRAM 跑模拟器反而慢 |
 | 编译优化 | -O2 | 性能优化 |
+| mbedTLS 动态缓冲 | 启用 | SSL 内存按需分配 |
+| mbedTLS 外部内存 | 启用 | SSL 从 PSRAM 分配，减少内部 DRAM 碎片 |
 | FreeRTOS HZ | 1000 | 1ms tick 精度 |
-| mbedTLS 动态缓冲 | 启用 | SSL 内存按需分配，释放内部 DRAM |
-| BSS 段外部 | 启用 | 零初始化数据放 PSRAM |
 
 ### 分区表（partitions.csv）
 
@@ -257,7 +273,7 @@ idf.py -p COM5 -b 2000000 flash
 |------|------|------|
 | app0 | 6 MB | OTA 分区 0 |
 | app1 | 6 MB | OTA 分区 1 |
-| spiffs | 4 MB | 文件系统（ROM、字体等） |
+| spiffs | 4 MB | 文件系统（ROM 等） |
 | nvs | 20 KB | WiFi 凭证等持久数据 |
 
 ### user/asr_config.h
@@ -288,8 +304,18 @@ idf.py -p COM5 -b 2000000 flash
 - **PSRAM 必须选 Octal Mode**：录音缓冲、ROM 数据、HTTP 响应均分配于 PSRAM
 - **I2S 资源分配**：I2S_NUM_0 = 麦克风（RX），I2S_NUM_1 = 扬声器（TX），互不干扰
 - **LCD SPI 时钟**：80 MHz，PARTIAL 模式异步 DMA 刷新
-- **WiFi + mbedTLS**：运行时需约 100 KB 内部堆，`CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=16384` 预留空间
 - **编码器导航**：旋转 = 移动焦点，按键 = 确认。弹窗弹出时焦点自动切到弹窗 group
+
+---
+
+## 代码统计
+
+| 类别 | 行数 |
+|------|------|
+| 纯手写代码 | ~4,600 行 |
+| 字体数据（lv_font_simhei_16 + lcdfont）| ~385,000 行 |
+| 模拟器库（walnut_cgb.h + minigb_apu.c）| ~10,500 行 |
+| LVGL 库 | 未计入 |
 
 ---
 
@@ -299,7 +325,7 @@ idf.py -p COM5 -b 2000000 flash
 
 | 内容 | 大小 |
 |------|------|
-| 固件（ESP-IDF + LVGL + 应用 + 游戏模拟器）| ~4 MB |
+| 固件（ESP-IDF + LVGL + 应用 + 游戏模拟器 + APU）| ~4.1 MB |
 | SPIFFS（ROM 存储）| 4 MB |
 | OTA 备份分区 | 6 MB |
 | 引导 + NVS + 其他 | ~0.5 MB |
@@ -311,7 +337,7 @@ idf.py -p COM5 -b 2000000 flash
 | ASR 录音缓冲区 | ~320 KB |
 | HTTP 响应缓冲（动态扩容）| 4-32 KB |
 | ROM 数据（游戏运行时）| 32 KB - 2 MB |
-| BSS 外部段 | ~12 KB |
+| BSS + rodata 外部段 | ~100 KB |
 | 剩余可用 | **~7 MB** |
 
 ### 内部 DRAM（~338 KB 可用段）
