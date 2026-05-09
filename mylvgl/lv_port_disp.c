@@ -151,3 +151,9 @@ void lv_port_disp_resume(void)
 {
     s_flush_suspended = false;
 }
+
+/* 查询当前是否处于暂停状态（供 LVGL 主任务决定是否跳过 lv_timer_handler）*/
+bool lv_port_disp_is_suspended(void)
+{
+    return s_flush_suspended;
+}

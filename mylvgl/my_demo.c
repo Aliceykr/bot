@@ -888,8 +888,10 @@ static void rom_item_cb(lv_event_t *e)
     /* 切到黑屏，游戏任务会自己填充屏幕 */
     LCD_Fill(0, 0, LCD_W, LCD_H, 0x0000);
 
-    /* 游戏任务栈 8KB，优先级 10（高于 LVGL=4 和 health=1，保证帧时序稳定） */
-    if (xTaskCreate(game_run_task, "game_run", 8192, copy, 10, &s_game_task) != pdPASS) {
+    /* 游戏任务栈 8KB，优先级 10，**绑到 Core 1** 专用仿真：
+     * Core 0 处理 WiFi/USB/lwIP 中断，Core 1 跑 Peanut-GB 不受打扰 */
+    if (xTaskCreatePinnedToCore(game_run_task, "game_run", 8192, copy, 10,
+                                 &s_game_task, 1) != pdPASS) {
         free(copy);
         s_game_active = false;
         return;
@@ -952,8 +954,9 @@ static void show_game_screen(void)
         lv_obj_set_style_text_color(msg, lv_color_hex(0xaaaaaa), 0);
     } else {
         for (int i = 0; i < count; i++) {
-            char label[ROM_MAX_NAME + 24];
-            snprintf(label, sizeof(label), "%s  (%uK)",
+            char label[ROM_MAX_NAME + 32];
+            /* %.48s 明确限长，避免编译器 format-truncation 告警 */
+            snprintf(label, sizeof(label), "%.48s  (%uK)",
                      s_roms[i].name, (unsigned)(s_roms[i].size / 1024));
             lv_obj_t *btn = lv_list_add_button(rlist, LV_SYMBOL_PLAY, label);
             lv_obj_set_style_bg_color(btn, lv_color_hex(0x16213e), 0);

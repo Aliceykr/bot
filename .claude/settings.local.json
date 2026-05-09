@@ -49,7 +49,8 @@
       "Bash(grep -n \"CONFIG_ESPTOOLPY_PORT\\\\|ESPTOOLPY_PORT\" sdkconfig)",
       "Bash(d:/esp-idf/Tool/python_env/idf5.1_py3.11_env/Scripts/python.exe -m kconfgen --list-separator=semicolon --kconfig D:/ESP-IDF/v5.1.2/esp-idf/Kconfig --sdkconfig-rename D:/ESP-IDF/v5.1.2/esp-idf/sdkconfig.rename --config C:/Users/Aliceykr/Desktop/bot/sdkconfig --defaults C:/Users/Aliceykr/Desktop/bot/sdkconfig.defaults --defaults C:/Users/Aliceykr/Desktop/bot/sdkconfig.defaults.esp32s3)",
       "Bash(powershell -Command \"\\(Get-CimInstance Win32_Processor\\).NumberOfLogicalProcessors\")",
-      "WebSearch"
+      "WebSearch",
+      "Bash(\"d:/esp-idf/Tool/python_env/idf5.1_py3.11_env/Scripts/python.exe\" \"d:/esp-idf/v5.1.2/esp-idf/components/esptool_py/esptool/esptool.py\" --chip esp32s3 -p COM5 flash_id)"
     ]
   }
 }

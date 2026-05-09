@@ -13,4 +13,7 @@ void lv_port_disp_suspend(void);
  * 强制一次整屏重绘，覆盖游戏期间画面。 */
 void lv_port_disp_resume(void);
 
+/* 查询当前是否处于暂停状态（暂停期间 lvgl_task 应跳过 lv_timer_handler） */
+bool lv_port_disp_is_suspended(void);
+
 #endif

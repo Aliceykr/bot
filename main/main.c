@@ -36,6 +36,12 @@ static void lvgl_task(void *arg)
     }
 
     while (1) {
+        /* 游戏运行期间 LVGL 完全冻结：不处理 timer / indev，
+         * 避免编码器旋转触发 LVGL 事件抢占 CPU 影响游戏帧率 */
+        if (lv_port_disp_is_suspended()) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
         lv_timer_handler();
         vTaskDelay(pdMS_TO_TICKS(5));
     }
