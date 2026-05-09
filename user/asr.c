@@ -229,6 +229,45 @@ uint32_t asr_record_stop(void)
 bool asr_is_recording(void) { return s_recording; }
 
 // ================================================================
+// I2S 释放 / 回收（给 ESP-SR 等模块临时使用 I2S_NUM_0）
+// ================================================================
+void asr_mic_deinit(void)
+{
+    s_rec_active = false;
+    s_recording  = false;
+    if (s_rx_chan) {
+        i2s_channel_disable(s_rx_chan);
+        i2s_del_channel(s_rx_chan);
+        s_rx_chan = NULL;
+    }
+    ESP_LOGI(TAG, "I2S NUM 0 已释放");
+}
+
+void asr_mic_reinit(void)
+{
+    if (s_rx_chan) {
+        ESP_LOGW(TAG, "I2S NUM 0 已存在，跳过 reinit");
+        return;
+    }
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    i2s_new_channel(&chan_cfg, NULL, &s_rx_chan);
+    i2s_std_config_t std_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(MIC_SAMPLE_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = MIC_SCK_PIN,
+            .ws   = MIC_WS_PIN,
+            .dout = I2S_GPIO_UNUSED,
+            .din  = MIC_SD_PIN,
+            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+        },
+    };
+    i2s_channel_init_std_mode(s_rx_chan, &std_cfg);
+    ESP_LOGI(TAG, "I2S NUM 0 重新初始化完成");
+}
+
+// ================================================================
 // 识别
 // ================================================================
 bool asr_recognize(uint32_t audio_len_bytes, asr_result_t *out)

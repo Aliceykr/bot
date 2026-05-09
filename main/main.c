@@ -14,6 +14,8 @@
 #include "keypad.h"
 #include "rom_loader.h"
 #include "psram_task.h"
+#include "esp_sr.h"
+#include "ble_prov.h"
 
 static void lvgl_tick_task(void *arg)
 {
@@ -65,6 +67,8 @@ void app_main(void)
     psram_task_init();
 
     speaker_init();
+    esp_sr_init();
+    ble_prov_init();
     LCD_Init();
 
     /* 矩阵键盘：GB 模拟器运行时用作 8 键输入，菜单期间也会扫描但不拦截事件 */

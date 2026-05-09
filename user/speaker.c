@@ -163,3 +163,7 @@ int speaker_play(const int16_t *pcm, size_t len_bytes)
     BaseType_t ret = xRingbufferSend(s_ringbuf, pcm, len_bytes, 0);
     return (ret == pdTRUE) ? (int)len_bytes : 0;
 }
+
+/* ================================================================
+ * A2DP 蓝牙音箱：让出/恢复 I2S_NUM_1（保留，未来可用）
+ * ================================================================ */

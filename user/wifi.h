@@ -18,6 +18,9 @@ typedef enum {
 #define WIFI_PASSWORD  "22222222"
 #define WIFI_MAX_RETRY 10
 
+// 动态设置 WiFi 凭据（蓝牙配网用），下次 wifi_connect 时生效
+void wifi_set_credentials(const char *ssid, const char *password);
+
 // 初始化并连接 WiFi，阻塞直到连接成功或失败
 // 返回 true 表示连接成功
 bool wifi_connect(void);

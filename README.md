@@ -1,6 +1,6 @@
 # Bot — ESP32-S3 AI 智能语音助手 & Game Boy 模拟器
 
-基于 ESP-IDF + LVGL 的 ESP32-S3 嵌入式项目，集成 WiFi、天气查询、AI 聊天、语音识别、语音合成、Game Boy 游戏模拟器（含音频），配备 TFT LCD 图形界面与旋转编码器交互。
+基于 ESP-IDF + LVGL 的 ESP32-S3 嵌入式项目，集成 WiFi、天气查询、AI 聊天、在线/离线语音识别、语音合成、Game Boy 游戏模拟器（含音频）、BLE 蓝牙配网，配备 TFT LCD 图形界面与旋转编码器 + 按键矩阵交互。
 
 ---
 
@@ -13,6 +13,7 @@
 | 麦克风 | INMP441 | I2S 数字麦克风，I2S_NUM_0 |
 | 扬声器 | MAX98357A + 喇叭 | I2S D 类功放，I2S_NUM_1 |
 | 输入 | 旋转编码器（A/B/SW）| PCNT 硬件计数 + GPIO 轮询 |
+| 按键 | 3x3 矩阵键盘（9 键）| 游戏方向键 + A/B/START/SELECT/EXIT |
 
 ---
 
@@ -57,6 +58,16 @@
 
 A/B 相由 PCNT 硬件正交解码，SW 按键 5ms 轮询状态机（20ms 防抖）。
 
+### 3x3 按键矩阵
+
+| 行/列 | GPIO41 (C0) | GPIO42 (C1) | GPIO47 (C2) |
+|--------|-------------|-------------|-------------|
+| GPIO1 (R0)  | B | UP | A |
+| GPIO2 (R1)  | LEFT | EXIT | RIGHT |
+| GPIO14 (R2) | SELECT | DOWN | START |
+
+2ms 扫描周期，两次连续一致读取才确认。游戏模式切换：`keypad_set_game_mode(true)` 启用按键输出。
+
 ---
 
 ## 目录结构
@@ -67,9 +78,9 @@ bot/
 │   ├── main.c                    # 应用入口：初始化外设、创建 LVGL 任务
 │   ├── psram_task.c / .h         # PSRAM 栈任务创建工具（含自动回收 cleaner）
 │   ├── CMakeLists.txt            # 编译入口，列出所有源文件
-│   └── idf_component.yml        # IDF 组件依赖
+│   └── idf_component.yml        # IDF 组件依赖（esp-sr）
 ├── mylvgl/
-│   ├── my_demo.c                 # LVGL 主界面逻辑（菜单/天气/聊天/语音/游戏）
+│   ├── my_demo.c                 # LVGL 主界面逻辑（菜单/天气/聊天/语音/游戏/BLE）
 │   ├── my_demo.h
 │   ├── lv_port_disp.c / .h       # LVGL 显示驱动（PARTIAL 双缓冲 + 异步 DMA）
 │   ├── lv_port_indev.c / .h      # LVGL 输入设备（PCNT 编码器）
@@ -86,9 +97,12 @@ bot/
 │   ├── speaker.c / speaker.h     # MAX98357A I2S 音频输出 + RingBuffer 播放队列
 │   ├── tts.c / tts.h             # 百度语音合成 API（流式 PCM 播放）
 │   ├── weather.c / weather.h     # 天气 HTTP 查询与解析
-│   ├── wifi.c / wifi.h           # WiFi STA 连接 + 守护任务（断线重连）
+│   ├── wifi.c / wifi.h           # WiFi STA 连接 + 守护任务（断线重连）+ 动态凭据
 │   ├── sntp_time.c / sntp_time.h # SNTP 网络时间同步（阿里云 NTP）
 │   ├── health.c / health.h       # 堆内存健康监控（60s 周期打印水位）
+│   ├── esp_sr.c / esp_sr.h       # ESP-SR 离线中文命令词识别（AFE + MultiNet7）
+│   ├── ble_prov.c / ble_prov.h   # BLE GATT 蓝牙配网（WiFi SSID/password 推送）
+│   ├── keypad.c / keypad.h       # 3x3 矩阵键盘扫描（游戏控制）
 │   └── lv_font_simhei_16.c       # 思黑体 16px LVGL 中文字体
 ├── game/
 │   ├── gb_emu.c / gb_emu.h       # Game Boy 模拟器集成（Walnut-CGB / Peanut-GB）
@@ -103,7 +117,7 @@ bot/
 │   └── roms/                     # 放置 .gb / .gbc ROM 文件
 ├── lvgl/                         # LVGL 9.x 源码
 ├── lv_conf.h                     # LVGL 配置
-├── partitions.csv                # 自定义分区表（6MBx2 OTA + 4MB SPIFFS）
+├── partitions.csv                # 自定义分区表（6MB+5.5MB OTA + SPIFFS + model）
 ├── sdkconfig.defaults            # 公共默认配置
 ├── sdkconfig.defaults.esp32s3    # ESP32-S3 专用配置
 └── CMakeLists.txt                # 顶层 CMake
@@ -118,11 +132,12 @@ bot/
 开机后显示功能列表，通过旋转编码器上下选择、按键确认：
 
 - **WiFi 连接** — 后台连接 WiFi，弹窗显示进度，成功后自动同步 NTP 时间
-- **天气查询** — HTTP 拉取实时天气，展示温度、湿度、风力、实时时钟
+- **天气与日期** — HTTP 拉取实时天气，展示温度、湿度、风力、实时时钟
 - **游戏** — 扫描 SPIFFS 中的 .gb/.gbc ROM 文件，选择运行 Game Boy 模拟器
 - **聊天助手** — 屏幕键盘输入文字，调用 LLM API 获取回复，滚动对话记录
-- **语音助手** — 录音 → ASR 识别 → LLM 回复 → TTS 合成语音播放
-- **重启** — 软件重启设备
+- **语音助手** — 在线流程：录音 → 百度 ASR 识别 → LLM 回复 → 百度 TTS 合成播放
+- **语音命令** — 离线 ESP-SR 中文命令词识别（按钮触发，无需唤醒词）
+- **蓝牙** — 开启 BLE 广播，手机发送 "SSID_xxx password_xxx" 进行 WiFi 配网
 
 ### 2. Game Boy 模拟器
 
@@ -131,7 +146,8 @@ bot/
 - GB 原生分辨率 160x144，1.5 倍缩放到 240x216
 - SPI 80MHz 异步 DMA 双行缓冲渲染
 - 小 ROM（<=256KB）自动复制到 DRAM 加速
-- 长按编码器 SW 键（800ms）退出游戏
+- 3x3 按键矩阵提供完整的 GB 控制输入（A/B/方向/START/SELECT/EXIT）
+- 进入游戏自动暂停 WiFi 和 BLE，退出后恢复进入前活跃的服务
 
 ### 3. Game Boy 音频
 
@@ -139,7 +155,7 @@ bot/
 - 每帧合成 ~268 个 stereo 样本（16kHz），合并为 mono 推入 speaker RingBuffer
 - 与游戏模拟器同步运行，非阻塞输出（缓冲满时丢帧保仿真帧率）
 
-### 4. 语音助手完整流程
+### 4. 语音助手（在线）
 
 ```
 用户按键开始录音
@@ -155,11 +171,29 @@ INMP441 I2S 采集（16kHz 16bit mono，最长10秒，缓存于 PSRAM）
 MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 ```
 
-### 5. WiFi 守护
+### 5. 语音命令（离线 ESP-SR）
+
+使用 ESP-SR 的 MultiNet7 中文离线命令词识别，无需网络：
+
+- 按键触发识别（无需唤醒词），AFE 噪声抑制 + VAD
+- 预定义 11 个中文命令：返回、确认、取消、连接网络、查看天气、打开游戏、打开聊天、语音助手、退出游戏、调大音量、调小音量
+- I2S_NUM_0 与在线 ASR 共享，通过 deinit/reinit 切换
+
+### 6. BLE 蓝牙配网
+
+基于 Bluedroid BLE GATT 的 WiFi 配网功能：
+
+- 手机 BLE 扫描连接 "ESP32-Bot"
+- 发送 "SSID_名称 password_密码" 即可自动连接 WiFi
+- 连接结果通过 BLE Notify 返回手机
+- 游戏时自动暂停 BLE，退出后恢复
+
+### 7. WiFi 守护
 
 - 首次连接：EventGroup 等待结果，最多重试 3 次
 - 运行期断线：常驻守护任务自动重连，指数退避（5s → 5min）
 - 用户主动断开：停止守护，不自动重连
+- 支持动态凭据设置（BLE 配网写入）
 
 ---
 
@@ -172,7 +206,7 @@ MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 | `lv_tick` | 5 | 2048 B | LVGL 时钟（5ms tick） |
 | `lv_task` | 4 | 32768 B (PSRAM) | LVGL 渲染 + flush |
 | `enc_task` | 6 | 2048 B | SW 按键状态机（5ms 轮询） |
-| `spk_tx` | 3 | 2048 B | RingBuffer → I2S DMA 播放 |
+| `spk_tx` | 3 | 4096 B | RingBuffer → I2S DMA 播放 |
 | `asr_rec` | 5 | 2048 B | I2S 录音常驻任务 |
 | `wifi_task` | 3 | 4096 B | WiFi 连接 + NTP 同步（一次性） |
 | `wifi_guard` | 4 | 3072 B | 断线重连守护（常驻） |
@@ -184,6 +218,9 @@ MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 | `exit_watch` | 4 | 2048 B | 长按退出监视 |
 | `health` | 1 | 2048 B | 堆内存监控（60s 周期） |
 | `psram_cleaner` | 1 | 2048 B | 回收 PSRAM 任务栈和 TCB |
+| `esp_sr_feed` | 6 | 4096 B | ESP-SR AFE 音频喂入（Core 0） |
+| `esp_sr_detect` | 5 | 8192 B | ESP-SR MultiNet 命令检测（Core 1） |
+| `keypad_scan` | 5 | 2048 B | 按键矩阵扫描（2ms 周期） |
 
 ### PSRAM 任务创建
 
@@ -213,7 +250,7 @@ PARTIAL 模式 + DRAM 双缓冲 + 异步 DMA：
 
 ### 环境要求
 
-- ESP-IDF v5.1+（推荐 v5.1.2）
+- ESP-IDF v5.4+（推荐 v5.4.3）
 - ESP32-S3 目标芯片
 
 ### 步骤
@@ -262,18 +299,20 @@ idf.py -p COM5 -b 2000000 flash
 | PSRAM | Octal 80MHz | 8MB 八线 PSRAM |
 | SPIRAM_RODATA | 启用 | 只读常量放 PSRAM，释放 ~80KB 内部 DRAM |
 | SPIRAM_FETCH_INSTRUCTIONS | 禁用 | 代码留 flash XIP，PSRAM 跑模拟器反而慢 |
-| 编译优化 | -O2 | 性能优化 |
+| 编译优化 | -Os | 体积优化，节省 ~10-20% 代码空间 |
 | mbedTLS 动态缓冲 | 启用 | SSL 内存按需分配 |
 | mbedTLS 外部内存 | 启用 | SSL 从 PSRAM 分配，减少内部 DRAM 碎片 |
 | FreeRTOS HZ | 1000 | 1ms tick 精度 |
+| Bluetooth LE | Bluedroid | BLE GATT 配网（ESP32-S3 仅支持 BLE） |
 
 ### 分区表（partitions.csv）
 
 | 分区 | 大小 | 用途 |
 |------|------|------|
 | app0 | 6 MB | OTA 分区 0 |
-| app1 | 6 MB | OTA 分区 1 |
-| spiffs | 4 MB | 文件系统（ROM 等） |
+| app1 | 5.5 MB | OTA 分区 1 |
+| storage | ~1.5 MB | SPIFFS 文件系统（ROM 等） |
+| model | 3 MB | ESP-SR 模型数据 |
 | nvs | 20 KB | WiFi 凭证等持久数据 |
 
 ### user/asr_config.h
@@ -303,8 +342,11 @@ idf.py -p COM5 -b 2000000 flash
 - **凭证安全**：`asr_config.h` 和 `model_config.h` 含 API Key，已加入 `.gitignore`
 - **PSRAM 必须选 Octal Mode**：录音缓冲、ROM 数据、HTTP 响应均分配于 PSRAM
 - **I2S 资源分配**：I2S_NUM_0 = 麦克风（RX），I2S_NUM_1 = 扬声器（TX），互不干扰
+- **I2S_NUM_0 共享**：在线 ASR 和离线 ESP-SR 通过 deinit/reinit 共享 I2S_NUM_0
 - **LCD SPI 时钟**：80 MHz，PARTIAL 模式异步 DMA 刷新
 - **编码器导航**：旋转 = 移动焦点，按键 = 确认。弹窗弹出时焦点自动切到弹窗 group
+- **ESP32-S3 蓝牙限制**：仅支持 BLE，不支持 Classic BT（A2DP 不可用）
+- **游戏模式**：进入游戏自动暂停 WiFi + BLE，退出后仅恢复进入前活跃的服务
 
 ---
 
@@ -312,7 +354,7 @@ idf.py -p COM5 -b 2000000 flash
 
 | 类别 | 行数 |
 |------|------|
-| 纯手写代码 | ~4,600 行 |
+| 纯手写代码 | ~5,200 行 |
 | 字体数据（lv_font_simhei_16 + lcdfont）| ~385,000 行 |
 | 模拟器库（walnut_cgb.h + minigb_apu.c）| ~10,500 行 |
 | LVGL 库 | 未计入 |
@@ -325,10 +367,10 @@ idf.py -p COM5 -b 2000000 flash
 
 | 内容 | 大小 |
 |------|------|
-| 固件（ESP-IDF + LVGL + 应用 + 游戏模拟器 + APU）| ~4.1 MB |
-| SPIFFS（ROM 存储）| 4 MB |
-| OTA 备份分区 | 6 MB |
-| 引导 + NVS + 其他 | ~0.5 MB |
+| 固件（ESP-IDF + LVGL + 应用 + 游戏模拟器 + ESP-SR + BLE）| ~4.6 MB |
+| SPIFFS（ROM 存储）| ~1.5 MB |
+| ESP-SR 模型分区 | 3 MB |
+| OTA 备份分区 | 5.5 MB |
 
 ### PSRAM（8 MB Octal）
 

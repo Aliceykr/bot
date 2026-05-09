@@ -28,6 +28,10 @@ static bool s_initialized = false;     /* WiFi 子系统一次性初始化标志
 static bool s_user_stopped = false;    /* 用户主动 wifi_disconnect() */
 static bool s_has_connected_once = false;  /* 至少连接成功过一次（用于区分首次连接 vs 运行期断线）*/
 
+/* 动态凭据（蓝牙配网写入，wifi_connect 使用） */
+static char s_ssid[33]     = WIFI_SSID;
+static char s_password[65] = WIFI_PASSWORD;
+
 /* 守护任务：运行期断线时指数退避重连，永不放弃 */
 static TaskHandle_t s_guardian_handle = NULL;
 static uint32_t     s_backoff_idx = 0;
@@ -193,11 +197,11 @@ bool wifi_connect(void)
 
         wifi_config_t wifi_config = {
             .sta = {
-                .ssid     = WIFI_SSID,
-                .password = WIFI_PASSWORD,
                 .threshold.authmode = WIFI_AUTH_WPA_PSK,
             },
         };
+        strncpy((char *)wifi_config.sta.ssid, s_ssid, sizeof(wifi_config.sta.ssid) - 1);
+        strncpy((char *)wifi_config.sta.password, s_password, sizeof(wifi_config.sta.password) - 1);
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
         s_initialized = true;
@@ -284,5 +288,23 @@ void wifi_resume_after_game(void)
         ESP_LOGW(TAG, "wifi_resume: esp_wifi_start 返回 %d", err);
     } else {
         ESP_LOGI(TAG, "WiFi 恢复启动，等待自动重连");
+    }
+}
+
+void wifi_set_credentials(const char *ssid, const char *password)
+{
+    if (!ssid || !password) return;
+    strncpy(s_ssid, ssid, sizeof(s_ssid) - 1);
+    s_ssid[sizeof(s_ssid) - 1] = '\0';
+    strncpy(s_password, password, sizeof(s_password) - 1);
+    s_password[sizeof(s_password) - 1] = '\0';
+    ESP_LOGI(TAG, "凭据已更新: SSID=%s", s_ssid);
+
+    /* 如果 WiFi 已初始化，立即更新驱动配置 */
+    if (s_initialized) {
+        wifi_config_t cfg = { .sta = { .threshold.authmode = WIFI_AUTH_WPA_PSK } };
+        strncpy((char *)cfg.sta.ssid, s_ssid, sizeof(cfg.sta.ssid) - 1);
+        strncpy((char *)cfg.sta.password, s_password, sizeof(cfg.sta.password) - 1);
+        esp_wifi_set_config(WIFI_IF_STA, &cfg);
     }
 }

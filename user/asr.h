@@ -30,4 +30,10 @@ bool asr_get_token(void);
 // 上传录音并识别（阻塞）
 bool asr_recognize(uint32_t audio_len_bytes, asr_result_t *out);
 
+// 释放 I2S_NUM_0（给 ESP-SR 等模块使用），录音任务保持 idling
+void asr_mic_deinit(void);
+
+// 用相同配置重新初始化 I2S_NUM_0，恢复录音功能
+void asr_mic_reinit(void);
+
 #endif

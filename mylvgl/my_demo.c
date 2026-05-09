@@ -7,6 +7,8 @@
 #include "model.h"
 #include "asr.h"
 #include "tts.h"
+#include "esp_sr.h"
+#include "ble_prov.h"
 #include <string.h>
 #include <time.h>
 #include "freertos/FreeRTOS.h"
@@ -624,6 +626,200 @@ static void asr_back_cb(lv_event_t *e)
     indev_set_group(group);
 }
 
+// ================================================================
+// 语音命令界面（ESP-SR 离线命令词识别）
+// ================================================================
+static lv_obj_t *sr_cmd_scr         = NULL;
+static lv_obj_t *sr_cmd_result_lbl  = NULL;
+static lv_obj_t *sr_cmd_status_lbl  = NULL;
+static lv_obj_t *sr_cmd_btn         = NULL;
+static bool sr_cmd_active = false;
+
+typedef struct {
+    bool detected;
+    int  command_id;
+    float probability;
+    char command_str[128];
+} sr_cmd_ui_result_t;
+
+static QueueHandle_t sr_cmd_result_queue = NULL;
+
+/* ESP-SR 回调（运行在 detect 任务上下文）→ 通过队列通知 LVGL */
+static void sr_cmd_result_cb(int id, const char *text, float prob)
+{
+    sr_cmd_ui_result_t res = {0};
+    if (id >= 0 && text) {
+        res.detected   = true;
+        res.command_id = id;
+        res.probability = prob;
+        strncpy(res.command_str, text, sizeof(res.command_str) - 1);
+    }
+    if (sr_cmd_result_queue) {
+        xQueueSend(sr_cmd_result_queue, &res, 0);
+    }
+}
+
+/* LVGL timer 轮询识别结果 */
+static void sr_cmd_timer_cb(lv_timer_t *t)
+{
+    if (!sr_cmd_scr || !lv_obj_is_valid(sr_cmd_scr)) {
+        lv_timer_delete(t);
+        return;
+    }
+    if (!sr_cmd_result_queue) return;
+
+    sr_cmd_ui_result_t res;
+    if (xQueueReceive(sr_cmd_result_queue, &res, 0) != pdTRUE) return;
+
+    sr_cmd_active = false;
+    lv_obj_set_style_bg_color(sr_cmd_btn, lv_color_hex(0x16213e), 0);
+    lv_obj_t *btn_lbl = lv_obj_get_child(sr_cmd_btn, 0);
+    if (btn_lbl) lv_label_set_text(btn_lbl, "开始识别");
+
+    if (res.detected) {
+        lv_label_set_text_fmt(sr_cmd_result_lbl, "识别: %s\n置信度: %.0f%%",
+                              res.command_str, res.probability * 100);
+        lv_label_set_text(sr_cmd_status_lbl, "识别成功");
+    } else {
+        lv_label_set_text(sr_cmd_result_lbl, "未识别到命令");
+        lv_label_set_text(sr_cmd_status_lbl, "超时");
+    }
+
+    esp_sr_stop_listening();
+}
+
+static void sr_cmd_btn_cb(lv_event_t *e)
+{
+    if (sr_cmd_active) {
+        /* 正在监听 → 手动停止 */
+        sr_cmd_active = false;
+        esp_sr_stop_listening();
+        lv_label_set_text(sr_cmd_status_lbl, "已停止");
+        lv_obj_set_style_bg_color(sr_cmd_btn, lv_color_hex(0x16213e), 0);
+        lv_obj_t *btn_lbl = lv_obj_get_child(sr_cmd_btn, 0);
+        if (btn_lbl) lv_label_set_text(btn_lbl, "开始识别");
+        return;
+    }
+
+    if (esp_sr_is_listening()) return;
+
+    if (!sr_cmd_result_queue)
+        sr_cmd_result_queue = xQueueCreate(4, sizeof(sr_cmd_ui_result_t));
+
+    if (esp_sr_start_listening(sr_cmd_result_cb)) {
+        sr_cmd_active = true;
+        lv_label_set_text(sr_cmd_status_lbl, "正在监听...");
+        lv_obj_set_style_bg_color(sr_cmd_btn, lv_color_hex(0xe94560), 0);
+        lv_obj_t *btn_lbl = lv_obj_get_child(sr_cmd_btn, 0);
+        if (btn_lbl) lv_label_set_text(btn_lbl, "停止识别");
+    } else {
+        lv_label_set_text(sr_cmd_status_lbl, "启动失败");
+    }
+}
+
+static void sr_cmd_back_cb(lv_event_t *e)
+{
+    if (sr_cmd_active) {
+        esp_sr_stop_listening();
+        sr_cmd_active = false;
+    }
+    sr_cmd_scr = NULL;
+    sr_cmd_result_lbl = NULL;
+    sr_cmd_status_lbl = NULL;
+    sr_cmd_btn = NULL;
+    lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
+    indev_set_group(group);
+}
+
+// ================================================================
+// 蓝牙开关（菜单直接切换，无独立界面）
+// ================================================================
+
+static void show_ble_screen(void)
+{
+    if (ble_prov_is_active()) {
+        ble_prov_stop();
+        create_result_dialog(LV_SYMBOL_BLUETOOTH " 蓝牙已关闭", 0x888888);
+    } else {
+        if (ble_prov_start(NULL)) {
+            create_result_dialog(LV_SYMBOL_BLUETOOTH " 蓝牙已开启\n设备: ESP32-Bot", 0x1E90FF);
+        } else {
+            create_result_dialog(LV_SYMBOL_CLOSE " 蓝牙启动失败", 0xff0000);
+        }
+    }
+}
+
+static void show_sr_cmd_screen(void)
+{
+    sr_cmd_scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(sr_cmd_scr, lv_color_hex(0x0f3460), 0);
+    lv_obj_set_style_pad_all(sr_cmd_scr, 0, 0);
+
+    /* 标题 */
+    lv_obj_t *title = lv_label_create(sr_cmd_scr);
+    lv_label_set_text(title, "语音命令");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xe94560), 0);
+    lv_obj_set_style_text_font(title, &lv_font_simhei_16, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    /* 返回按钮 */
+    lv_obj_t *back_btn = lv_button_create(sr_cmd_scr);
+    lv_obj_set_size(back_btn, 40, 24);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 4, 4);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0xe94560), 0);
+    lv_obj_add_event_cb(back_btn, sr_cmd_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT);
+    lv_obj_center(back_lbl);
+
+    /* 结果显示区 */
+    lv_obj_t *result_cont = lv_obj_create(sr_cmd_scr);
+    lv_obj_set_size(result_cont, LCD_W - 10, 160);
+    lv_obj_align(result_cont, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_color(result_cont, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_border_width(result_cont, 0, 0);
+    lv_obj_set_style_pad_all(result_cont, 6, 0);
+
+    sr_cmd_result_lbl = lv_label_create(result_cont);
+    lv_label_set_text(sr_cmd_result_lbl, "按下方按钮开始识别\n支持命令: 返回/确认/查看天气/打开游戏 等");
+    lv_obj_set_style_text_color(sr_cmd_result_lbl, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(sr_cmd_result_lbl, &lv_font_simhei_16, 0);
+    lv_label_set_long_mode(sr_cmd_result_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(sr_cmd_result_lbl, LCD_W - 22);
+
+    /* 状态标签 */
+    sr_cmd_status_lbl = lv_label_create(sr_cmd_scr);
+    lv_label_set_text(sr_cmd_status_lbl, "就绪");
+    lv_obj_set_style_text_color(sr_cmd_status_lbl, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_font(sr_cmd_status_lbl, &lv_font_simhei_16, 0);
+    lv_obj_align(sr_cmd_status_lbl, LV_ALIGN_BOTTOM_MID, 0, -50);
+
+    /* 操作按钮 */
+    sr_cmd_btn = lv_button_create(sr_cmd_scr);
+    lv_obj_set_size(sr_cmd_btn, 120, 40);
+    lv_obj_align(sr_cmd_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_set_style_bg_color(sr_cmd_btn, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_border_color(sr_cmd_btn, lv_color_hex(0xe94560), 0);
+    lv_obj_set_style_border_width(sr_cmd_btn, 2, 0);
+    lv_obj_add_event_cb(sr_cmd_btn, sr_cmd_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *btn_txt = lv_label_create(sr_cmd_btn);
+    lv_label_set_text(btn_txt, "开始识别");
+    lv_obj_set_style_text_color(btn_txt, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(btn_txt, &lv_font_simhei_16, 0);
+    lv_obj_center(btn_txt);
+
+    /* 编码器 group */
+    lv_group_t *sg = lv_group_create();
+    lv_group_add_obj(sg, sr_cmd_btn);
+    lv_group_add_obj(sg, back_btn);
+    indev_set_group(sg);
+    lv_group_focus_obj(sr_cmd_btn);
+    lv_obj_add_event_cb(sr_cmd_scr, group_delete_cb, LV_EVENT_DELETE, sg);
+
+    lv_timer_create(sr_cmd_timer_cb, 50, NULL);
+    lv_screen_load_anim(sr_cmd_scr, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+}
+
 static void show_asr_screen(void)
 {
     if (!asr_result_queue)
@@ -867,9 +1063,10 @@ static void game_task_exited_cb(void *user_data)
     lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
     indev_set_group(group);
 
-    /* 游戏结束后恢复 WiFi */
-    ESP_LOGI("GAME", "游戏退出，恢复 WiFi");
+    /* 游戏结束后恢复 WiFi 和蓝牙（仅恢复游戏前活跃的服务） */
+    ESP_LOGI("GAME", "游戏退出，恢复 WiFi/蓝牙");
     wifi_resume_after_game();
+    ble_prov_resume();
 }
 
 /* 游戏运行任务：阻塞调用 game_runtime_run，退出后通知 LVGL */
@@ -923,6 +1120,9 @@ static void rom_item_cb(lv_event_t *e)
         /* 等 WiFi 内部清理 buffer，一般 100-200ms 就够 */
         vTaskDelay(pdMS_TO_TICKS(300));
     }
+    /* 蓝牙也需要暂停，腾出 BLE 栈内存 */
+    ble_prov_suspend();
+
     ESP_LOGI("ROM_CB", "creating task, DRAM free=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 
@@ -1039,8 +1239,12 @@ static void list_event_cb(lv_event_t *e)
         xTaskCreatePSRAM(weather_fetch_task, "weather_task", 16384, NULL, 3, NULL);
     } else if (strstr(txt, "聊天")) {
         show_chat_screen();
-    } else if (strstr(txt, "语音")) {
+    } else if (strstr(txt, "语音助手")) {
         show_asr_screen();
+    } else if (strstr(txt, "语音命令")) {
+        show_sr_cmd_screen();
+    } else if (strstr(txt, "蓝牙")) {
+        show_ble_screen();
     } else if (strstr(txt, "游戏")) {
         show_game_screen();
     }
@@ -1081,7 +1285,8 @@ void my_demo(void)
         LV_SYMBOL_PLAY,        /* 游戏：用 PLAY 图标 */
         LV_SYMBOL_CALL,
         LV_SYMBOL_AUDIO,
-        LV_SYMBOL_POWER,
+        LV_SYMBOL_BELL,        /* 语音命令（ESP-SR 离线） */
+        LV_SYMBOL_BLUETOOTH,   /* 蓝牙配网 */
     };
     static const char *labels[] = {
         "WiFi 连接",
@@ -1089,12 +1294,13 @@ void my_demo(void)
         "游戏",
         "聊天助手",
         "语音助手",
-        "重启",
+        "语音命令",
+        "蓝牙",
     };
 
     group = lv_group_create();
 
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 7; i++) {
         lv_obj_t *btn = lv_list_add_button(list, icons[i], labels[i]);
         lv_obj_set_style_bg_color(btn, lv_color_hex(0x16213e), 0);
         lv_obj_set_style_bg_color(btn, lv_color_hex(0xe94560), LV_STATE_FOCUSED);

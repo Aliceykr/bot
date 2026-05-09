@@ -29,11 +29,17 @@ CONFIG_ESP32S3_DEFAULT_CPU_FREQ_MHZ=240
 
 CONFIG_FREERTOS_HZ=1000
 
-# Compiler optimization: performance (-O2)
-CONFIG_COMPILER_OPTIMIZATION_PERF=y
+# Compiler optimization: size (-Os), saves ~10-20% code size to fit OTA partitions
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 # Let mbedtls allocate from PSRAM pool, avoiding internal DRAM fragmentation
 # that causes HTTPS handshake to fail on WiFi-heavy workloads.
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 CONFIG_LWIP_TCP_WND_DEFAULT=2880
+
+# Bluetooth LE (Bluedroid BLE only)
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=y
+CONFIG_BT_BLE_ENABLED=y
+CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
