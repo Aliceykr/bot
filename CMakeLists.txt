@@ -4,7 +4,14 @@
 # CMakeLists in this exact order for cmake to work correctly
 cmake_minimum_required(VERSION 3.16)
 
-set(EXTRA_COMPONENT_DIRS ${CMAKE_SOURCE_DIR}/lvgl)
+set(EXTRA_COMPONENT_DIRS
+    ${CMAKE_SOURCE_DIR}/lvgl
+    ${CMAKE_SOURCE_DIR}/game
+)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(bot)
+
+# 把 spiffs_image/ 目录打包成 SPIFFS 镜像，烧录到名为 "storage" 的分区
+# 使用命令: idf.py flash storage-flash  （或 idf.py flash 同时烧代码和存储）
+spiffs_create_partition_image(storage spiffs_image FLASH_IN_PROJECT)

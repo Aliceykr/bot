@@ -168,7 +168,8 @@ static void event_handler(void *arg, esp_event_base_t event_base,
  * ================================================================ */
 bool wifi_connect(void)
 {
-    /* 初始化 NVS */
+    /* 初始化 NVS（已在 app_main 做过一次，此处幂等重复调用是安全的：
+     * nvs_flash_init 第二次起会直接返回 ESP_OK 不做动作）*/
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();

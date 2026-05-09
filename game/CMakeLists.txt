@@ -1,0 +1,15 @@
+idf_component_register(
+    SRCS
+        "rom_loader.c"
+        "game_runtime.c"
+        "gb_emu.c"
+    INCLUDE_DIRS
+        "."
+        "../user"
+    REQUIRES
+        lvgl
+        spiffs
+        esp_partition
+        driver
+        esp_timer
+)

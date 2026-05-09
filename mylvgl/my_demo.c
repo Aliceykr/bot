@@ -15,6 +15,9 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
+#include "rom_loader.h"
+#include "game_runtime.h"
+#include "lv_port_disp.h"
 
 /* 业务临时任务（weather / chat / asr / tts）均为一次性任务，末尾调
  * vTaskDelete(NULL) 后由 IDLE 自动回收栈和 TCB，必须使用 xTaskCreate
@@ -26,6 +29,8 @@ LV_FONT_DECLARE(lv_font_simhei_16);
 /* 前向声明 */
 static void chat_back_btn_cb(lv_event_t *e);
 static void close_btn_cb(lv_event_t *e);
+static void show_game_screen(void);
+static void game_back_btn_cb(lv_event_t *e);
 
 /* 全局 UI 对象 */
 static lv_obj_t *list;
@@ -833,6 +838,138 @@ static void wifi_status_timer_cb(lv_timer_t *timer)
     }
 }
 
+// ================================================================
+// 游戏界面：ROM 列表 + 进入 runtime
+// ================================================================
+
+/* runtime 任务保活句柄。游戏运行时非 NULL */
+static TaskHandle_t s_game_task = NULL;
+/* 标记游戏是否正在运行中（runtime 占用屏幕期间 LVGL 不再 flush）*/
+static volatile bool s_game_active = false;
+
+/* 游戏退出完成回调（由运行任务退出后 lv_async_call 投递到 LVGL 线程）*/
+static void game_task_exited_cb(void *user_data)
+{
+    s_game_active = false;
+    /* 恢复 LVGL 显示输出，然后强制整屏重绘覆盖游戏期间画面 */
+    lv_port_disp_resume();
+    lv_obj_invalidate(lv_screen_active());
+    /* 回到菜单 */
+    lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
+    indev_set_group(group);
+}
+
+/* 游戏运行任务：阻塞调用 game_runtime_run，退出后通知 LVGL */
+static void game_run_task(void *arg)
+{
+    char *rom_name = (char *)arg;
+    game_runtime_run(rom_name);
+    free(rom_name);
+    s_game_task = NULL;
+    /* 把恢复逻辑投递到 LVGL 线程执行 */
+    lv_async_call(game_task_exited_cb, NULL);
+    vTaskDelete(NULL);
+}
+
+/* 列表项被点击：启动该 ROM */
+static void rom_item_cb(lv_event_t *e)
+{
+    if (s_game_active) return;
+    const char *rom_name = (const char *)lv_event_get_user_data(e);
+    if (!rom_name) return;
+
+    /* 复制名字给任务（task 运行期间 user_data 源对象可能被 LVGL 销毁）*/
+    char *copy = strdup(rom_name);
+    if (!copy) return;
+
+    s_game_active = true;
+    /* 暂停 LVGL 输出，等待当前 DMA 完成，让游戏 runtime 独占 SPI 总线 */
+    lv_port_disp_suspend();
+    /* 切到黑屏，游戏任务会自己填充屏幕 */
+    LCD_Fill(0, 0, LCD_W, LCD_H, 0x0000);
+
+    /* 游戏任务栈 8KB，优先级 10（高于 LVGL=4 和 health=1，保证帧时序稳定） */
+    if (xTaskCreate(game_run_task, "game_run", 8192, copy, 10, &s_game_task) != pdPASS) {
+        free(copy);
+        s_game_active = false;
+        return;
+    }
+}
+
+static void game_back_btn_cb(lv_event_t *e)
+{
+    lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
+    indev_set_group(group);
+}
+
+static void show_game_screen(void)
+{
+    rom_loader_init();
+
+    lv_obj_t *scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x0f3460), 0);
+    lv_obj_set_style_pad_all(scr, 0, 0);
+
+    /* 标题 */
+    lv_obj_t *title = lv_label_create(scr);
+    lv_label_set_text(title, "游戏 - 选择 ROM");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xe94560), 0);
+    lv_obj_set_style_text_font(title, &lv_font_simhei_16, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    /* 返回按钮 */
+    lv_obj_t *back_btn = lv_button_create(scr);
+    lv_obj_set_size(back_btn, 40, 24);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 4, 4);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0xe94560), 0);
+    lv_obj_add_event_cb(back_btn, game_back_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT);
+    lv_obj_center(back_lbl);
+
+    /* ROM 列表 */
+    lv_obj_t *rlist = lv_list_create(scr);
+    lv_obj_set_size(rlist, LCD_W - 10, LCD_H - 50);
+    lv_obj_align(rlist, LV_ALIGN_TOP_MID, 0, 36);
+    lv_obj_set_style_bg_color(rlist, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_border_width(rlist, 0, 0);
+    lv_obj_set_style_radius(rlist, 4, 0);
+
+    /* 编码器 group */
+    lv_group_t *gg = lv_group_create();
+    lv_group_add_obj(gg, back_btn);
+
+    /* 扫描 ROM：放在 static 里让 user_data 指针长期有效 */
+    static rom_entry_t s_roms[ROM_MAX_COUNT];
+    int count = 0;
+    bool ok = rom_loader_scan(s_roms, &count);
+
+    if (!ok) {
+        lv_obj_t *msg = lv_list_add_text(rlist, "SPIFFS 挂载失败");
+        lv_obj_set_style_text_color(msg, lv_color_hex(0xff4040), 0);
+    } else if (count == 0) {
+        lv_obj_t *msg = lv_list_add_text(rlist, "未找到 .gb / .gbc 文件\n请放到 spiffs_image/roms/");
+        lv_obj_set_style_text_color(msg, lv_color_hex(0xaaaaaa), 0);
+    } else {
+        for (int i = 0; i < count; i++) {
+            char label[ROM_MAX_NAME + 24];
+            snprintf(label, sizeof(label), "%s  (%uK)",
+                     s_roms[i].name, (unsigned)(s_roms[i].size / 1024));
+            lv_obj_t *btn = lv_list_add_button(rlist, LV_SYMBOL_PLAY, label);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x16213e), 0);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0xe94560), LV_STATE_FOCUSED);
+            lv_obj_set_style_text_color(btn, lv_color_hex(0xffffff), 0);
+            lv_obj_add_event_cb(btn, rom_item_cb, LV_EVENT_CLICKED, s_roms[i].name);
+            lv_group_add_obj(gg, btn);
+        }
+    }
+
+    indev_set_group(gg);
+    lv_obj_add_event_cb(scr, group_delete_cb, LV_EVENT_DELETE, gg);
+
+    lv_screen_load_anim(scr, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+}
+
 static void list_event_cb(lv_event_t *e)
 {
     lv_obj_t *btn = lv_event_get_target(e);
@@ -854,6 +991,8 @@ static void list_event_cb(lv_event_t *e)
         show_chat_screen();
     } else if (strstr(txt, "语音")) {
         show_asr_screen();
+    } else if (strstr(txt, "游戏")) {
+        show_game_screen();
     }
 }
 
@@ -889,7 +1028,7 @@ void my_demo(void)
     static const char *icons[] = {
         LV_SYMBOL_WIFI,
         LV_SYMBOL_EYE_OPEN,
-        LV_SYMBOL_BATTERY_FULL,
+        LV_SYMBOL_PLAY,        /* 游戏：用 PLAY 图标 */
         LV_SYMBOL_CALL,
         LV_SYMBOL_AUDIO,
         LV_SYMBOL_POWER,
@@ -897,7 +1036,7 @@ void my_demo(void)
     static const char *labels[] = {
         "WiFi 连接",
         "天气与日期",
-        "电池",
+        "游戏",
         "聊天助手",
         "语音助手",
         "重启",

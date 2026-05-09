@@ -3,6 +3,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "nvs_flash.h"
 #include "lcd.h"
 #include "lvgl.h"
 #include "lv_port_disp.h"
@@ -10,32 +11,7 @@
 #include "my_demo.h"
 #include "speaker.h"
 #include "health.h"
-
-/* 在 PSRAM 上创建任务：栈分配于 SPIRAM，TCB 必须在内部 DRAM */
-static TaskHandle_t xTaskCreatePSRAM(TaskFunction_t pxTaskCode,
-                                     const char *pcName,
-                                     uint32_t ulStackDepth,
-                                     void *pvParameters,
-                                     UBaseType_t uxPriority)
-{
-    StackType_t *stack = heap_caps_malloc(ulStackDepth * sizeof(StackType_t),
-                                          MALLOC_CAP_SPIRAM);
-    if (!stack) {
-        ESP_LOGE("PSRAM_TASK", "stack alloc failed %u", (unsigned)ulStackDepth);
-        return NULL;
-    }
-    StaticTask_t *tcb = heap_caps_malloc(sizeof(StaticTask_t),
-                                          MALLOC_CAP_INTERNAL);
-    if (!tcb) {
-        ESP_LOGE("PSRAM_TASK", "TCB alloc failed");
-        free(stack);
-        return NULL;
-    }
-    TaskHandle_t handle = xTaskCreateStatic(pxTaskCode, pcName,
-                                            ulStackDepth, pvParameters,
-                                            uxPriority, stack, tcb);
-    return handle;
-}
+#include "rom_loader.h"
 
 static void lvgl_tick_task(void *arg)
 {
@@ -67,6 +43,16 @@ static void lvgl_task(void *arg)
 
 void app_main(void)
 {
+    /* NVS 和 SPIFFS 尽早初始化，不依赖任何业务路径。
+     * 这样进游戏菜单无需先联 WiFi 或触发其他功能 */
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        nvs_flash_erase();
+        nvs_flash_init();
+    }
+    rom_loader_init();  /* 挂载 /spiffs，ROM 列表可用 */
+
     speaker_init();
     LCD_Init();
 
@@ -74,9 +60,12 @@ void app_main(void)
     lv_port_disp_init();
     lv_port_indev_init();
 
-    /* 小栈任务留内部 DRAM，大栈任务用 PSRAM */
+    /* 小栈任务和 LVGL 主任务都用内部 DRAM 栈：
+     * SPIFFS / NVS 等 flash IO 要求调用线程栈不能在 PSRAM（关 cache 后
+     * PSRAM 访问会 panic）。LVGL 任务需要访问 SPIFFS 扫描 ROM 列表。
+     * 16KB DRAM 栈对 LVGL 菜单逻辑足够（原来 32KB PSRAM 里实际用不到 6KB）。*/
     xTaskCreate(lvgl_tick_task, "lv_tick", 2048, NULL, 5, NULL);
-    xTaskCreatePSRAM(lvgl_task, "lv_task", 32768, NULL, 4);
+    xTaskCreate(lvgl_task, "lv_task", 16384, NULL, 4, NULL);
 
     /* 启动健康监控：周期打印堆水位，便于发现长期运行中的内存泄漏 */
     health_monitor_start();

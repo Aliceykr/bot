@@ -40,6 +40,10 @@ static lv_color_t   *buf2 = NULL;
 static spi_transaction_t s_trans[MAX_TRANS_PER_FLUSH];
 static int s_pending = 0;  /* 当前已入队但未 get_result 的事务数 */
 
+/* 暂停标志：置位时 disp_flush 立即 ready，不再发送 SPI。
+ * 用于游戏模式接管 LCD 前释放 SPI 总线 */
+static volatile bool s_flush_suspended = false;
+
 /* 等待所有已入队的 DMA 事务完成 */
 static void wait_all_dma(void)
 {
@@ -52,6 +56,13 @@ static void wait_all_dma(void)
 
 static void disp_flush(lv_display_t *disp_drv, const lv_area_t *area, uint8_t *px_map)
 {
+    /* 暂停模式：不发送 SPI，直接告诉 LVGL 已完成。游戏模式下用这种方式
+     * 让出 SPI 总线，避免 polling 和 queue 两种传输模式互相冲突 */
+    if (s_flush_suspended) {
+        lv_display_flush_ready(disp_drv);
+        return;
+    }
+
     /* 等上一轮所有 DMA 完成，才能修改窗口地址和复用 trans 池 */
     wait_all_dma();
 
@@ -124,4 +135,19 @@ void lv_port_disp_init(void)
 
     ESP_LOGI("DISP", "PARTIAL mode, DRAM 2×%u bytes, SPI 80MHz, %s",
              (unsigned)DISP_BUF_SIZE, buf2 ? "double-buffer" : "single-buffer");
+}
+
+/* 暂停 LVGL 的 SPI 输出，并等待所有 DMA 完成。调用后 SPI 总线空闲，
+ * 其他模块（如游戏 runtime）可独占使用 LCD。 */
+void lv_port_disp_suspend(void)
+{
+    s_flush_suspended = true;
+    /* 等干净再返回，避免调用者刚开始用 SPI 就撞上尾随的 DMA */
+    wait_all_dma();
+}
+
+/* 恢复 LVGL 输出。恢复后一般需要手动 invalidate 强制整屏重绘 */
+void lv_port_disp_resume(void)
+{
+    s_flush_suspended = false;
 }
