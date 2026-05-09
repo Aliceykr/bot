@@ -19,6 +19,8 @@
 #include "rom_loader.h"
 #include "game_runtime.h"
 #include "lv_port_disp.h"
+#include "lv_port_indev.h"
+#include "keypad.h"
 #include "psram_task.h"
 
 /* 业务临时任务（weather / chat / asr / tts）均为一次性任务，末尾调
@@ -853,6 +855,11 @@ static volatile bool s_game_active = false;
 static void game_task_exited_cb(void *user_data)
 {
     s_game_active = false;
+
+    /* 输入恢复到菜单模式：编码器生效、键盘失效 */
+    keypad_set_game_mode(false);
+    lv_port_indev_set_menu_mode(true);
+
     /* 恢复 LVGL 显示输出，然后强制整屏重绘覆盖游戏期间画面 */
     lv_port_disp_resume();
     lv_obj_invalidate(lv_screen_active());
@@ -896,6 +903,11 @@ static void rom_item_cb(lv_event_t *e)
     ESP_LOGI("ROM_CB", "calling lv_port_disp_suspend...");
     /* 暂停 LVGL 输出，等待当前 DMA 完成，让游戏 runtime 独占 SPI 总线 */
     lv_port_disp_suspend();
+
+    /* 切换输入模式：键盘启用（含长按退出检测），编码器屏蔽 */
+    keypad_set_game_mode(true);
+    lv_port_indev_set_menu_mode(false);
+
     ESP_LOGI("ROM_CB", "suspended, fill black");
     /* 切到黑屏，游戏任务会自己填充屏幕 */
     LCD_Fill(0, 0, LCD_W, LCD_H, 0x0000);
@@ -923,6 +935,9 @@ static void rom_item_cb(lv_event_t *e)
         ESP_LOGE("ROM_CB", "xTaskCreatePinnedToCore failed");
         free(copy);
         s_game_active = false;
+        /* 启动失败也要把输入模式恢复回去 */
+        keypad_set_game_mode(false);
+        lv_port_indev_set_menu_mode(true);
         /* 游戏启动失败，恢复 WiFi */
         wifi_resume_after_game();
         return;

@@ -262,7 +262,7 @@ bool gb_emu_run(const uint8_t *rom_data, size_t rom_size)
     while (!s_exit_requested) {
         /* 读矩阵键盘位图 → 映射成 GB direct.joypad（0=按下，位布局见 walnut_cgb.h）
          * 布局：R0C0=B  R0C1=UP  R0C2=A
-         *       R1C0=LEFT       R1C2=RIGHT
+         *       R1C0=LEFT   R1C1=EXIT（长按退出，不映射按键）  R1C2=RIGHT
          *       R2C0=SELECT R2C1=DOWN R2C2=START */
         uint16_t kp = keypad_get_bits();
         uint8_t pad = 0xFF;
@@ -276,9 +276,8 @@ bool gb_emu_run(const uint8_t *rom_data, size_t rom_size)
         if (kp & KEYPAD_BIT_R2C2) pad &= (uint8_t)~JOYPAD_START;
         s_gb.direct.joypad = pad;
 
-        /* 同时按 SELECT + START 视作退出游戏快捷键 */
-        if ((kp & (KEYPAD_BIT_R2C0 | KEYPAD_BIT_R2C2)) ==
-            (KEYPAD_BIT_R2C0 | KEYPAD_BIT_R2C2)) {
+        /* 长按中间键 800ms → keypad 模块置位，这里消费 */
+        if (keypad_consume_exit_request()) {
             s_exit_requested = true;
         }
 
@@ -326,6 +325,9 @@ bool gb_emu_run(const uint8_t *rom_data, size_t rom_size)
     }
 
     ESP_LOGI(TAG, "退出模拟器主循环");
+
+    /* 销毁 APU 任务 + 信号量，释放 ram */
+    gb_audio_deinit();
 
     if (s_ctx.cart_ram) {
         heap_caps_free(s_ctx.cart_ram);

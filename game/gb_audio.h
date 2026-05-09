@@ -12,8 +12,11 @@
 /* 初始化：重置 APU 状态。进入游戏时调一次 */
 void gb_audio_init(void);
 
-/* 生成一帧（~59.7Hz 周期）的 PCM 并推入 speaker RingBuffer。
- * 在 gb_emu 主循环每帧末尾调用。 */
+/* 销毁 APU 任务 + 信号量，释放相关 RAM。退出游戏时调一次。 */
+void gb_audio_deinit(void);
+
+/* 通知 APU 任务合成一帧 PCM 并推入 speaker RingBuffer。
+ * 在 gb_emu 主循环每帧末尾调用。实际合成由 Core0 的 apu_task 执行。 */
 void gb_audio_emit_frame(void);
 
 /* Walnut 从这些全局符号调用（在 peanut_gb.h 和 walnut_cgb.h 中引用）*/

@@ -25,6 +25,9 @@
 
 static lv_indev_t *indev_encoder;
 
+/* 菜单/游戏模式开关。menu_mode=true 时正常上报；false 时吃掉所有输入 */
+static volatile bool s_menu_mode = true;
+
 /* PCNT 单元：硬件累积正交计数，溢出自动回绕 */
 static pcnt_unit_handle_t s_pcnt = NULL;
 static int32_t s_last_count = 0;
@@ -80,6 +83,20 @@ static void encoder_task(void *arg)
 /* LVGL 输入读回调：从 PCNT 取增量，除以每卡位脉冲数 */
 static void encoder_read(lv_indev_t *indev, lv_indev_data_t *data)
 {
+    /* 游戏模式下屏蔽所有编码器输入：
+     * - 不上报旋转事件（enc_diff=0）
+     * - 不上报按键（state=RELEASED）
+     * - 同时清空 PCNT 累积计数，避免退出游戏时"补报"一堆残留滚动。
+     * 扫描任务和 PCNT 仍在跑，硬件状态保留；只是 LVGL 看不到事件。*/
+    if (!s_menu_mode) {
+        if (s_pcnt) {
+            pcnt_unit_get_count(s_pcnt, (int *)&s_last_count);
+        }
+        data->enc_diff = 0;
+        data->state    = LV_INDEV_STATE_RELEASED;
+        return;
+    }
+
     if (s_pcnt) {
         int cur = 0;
         pcnt_unit_get_count(s_pcnt, &cur);
@@ -169,4 +186,10 @@ void lv_port_indev_init(void)
     indev_encoder = lv_indev_create();
     lv_indev_set_type(indev_encoder, LV_INDEV_TYPE_ENCODER);
     lv_indev_set_read_cb(indev_encoder, encoder_read);
+}
+
+void lv_port_indev_set_menu_mode(bool enable)
+{
+    s_menu_mode = enable;
+    ESP_LOGI(TAG, "encoder menu_mode=%d", (int)enable);
 }
