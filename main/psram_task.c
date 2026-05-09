@@ -78,6 +78,16 @@ BaseType_t xTaskCreatePSRAM(TaskFunction_t func, const char *name,
                              uint32_t stack_bytes, void *arg,
                              UBaseType_t prio, TaskHandle_t *handle_out)
 {
+    return xTaskCreatePSRAMPinnedToCore(func, name, stack_bytes, arg, prio,
+                                         handle_out, tskNO_AFFINITY);
+}
+
+BaseType_t xTaskCreatePSRAMPinnedToCore(TaskFunction_t func, const char *name,
+                                        uint32_t stack_bytes, void *arg,
+                                        UBaseType_t prio,
+                                        TaskHandle_t *handle_out,
+                                        BaseType_t core_id)
+{
     if (!s_cleanup_queue) psram_task_init();
     if (!s_cleanup_queue) return pdFAIL;
 
@@ -101,9 +111,9 @@ BaseType_t xTaskCreatePSRAM(TaskFunction_t func, const char *name,
     ctx->cleanup.tcb   = tcb;
     ctx->cleanup.stack = stack;
 
-    TaskHandle_t h = xTaskCreateStatic(task_entry, name,
-                                        stack_bytes / sizeof(StackType_t),
-                                        ctx, prio, stack, tcb);
+    TaskHandle_t h = xTaskCreateStaticPinnedToCore(
+        task_entry, name, stack_bytes / sizeof(StackType_t),
+        ctx, prio, stack, tcb, core_id);
     if (!h) {
         heap_caps_free(stack);
         heap_caps_free(tcb);

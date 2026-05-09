@@ -257,3 +257,32 @@ const char *wifi_get_ip(void)
 {
     return s_ip_str;
 }
+
+
+/* ================================================================
+ * 游戏模式下暂停 / 恢复 WiFi
+ * ================================================================ */
+
+void wifi_suspend_for_game(void)
+{
+    /* 置 user_stopped 防止 DISCONNECTED 事件被守护任务当成异常重连 */
+    s_user_stopped = true;
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+    s_status = WIFI_STATUS_DISCONNECTED;
+    memcpy(s_ip_str, "0.0.0.0", 8);
+    ESP_LOGI(TAG, "WiFi 已为游戏暂停");
+}
+
+void wifi_resume_after_game(void)
+{
+    if (!s_initialized) return;  /* 从未连过 WiFi，跳过 */
+    s_user_stopped = false;
+    s_backoff_idx = 0;
+    esp_err_t err = esp_wifi_start();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "wifi_resume: esp_wifi_start 返回 %d", err);
+    } else {
+        ESP_LOGI(TAG, "WiFi 恢复启动，等待自动重连");
+    }
+}

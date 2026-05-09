@@ -3,6 +3,8 @@ idf_component_register(
         "rom_loader.c"
         "game_runtime.c"
         "gb_emu.c"
+        "gb_audio.c"
+        "minigb_apu.c"
     INCLUDE_DIRS
         "."
         "../user"

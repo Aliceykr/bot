@@ -15,6 +15,7 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
+#include "esp_wifi.h"
 #include "rom_loader.h"
 #include "game_runtime.h"
 #include "lv_port_disp.h"
@@ -858,6 +859,10 @@ static void game_task_exited_cb(void *user_data)
     /* 回到菜单 */
     lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
     indev_set_group(group);
+
+    /* 游戏结束后恢复 WiFi */
+    ESP_LOGI("GAME", "游戏退出，恢复 WiFi");
+    wifi_resume_after_game();
 }
 
 /* 游戏运行任务：阻塞调用 game_runtime_run，退出后通知 LVGL */
@@ -894,15 +899,31 @@ static void rom_item_cb(lv_event_t *e)
     ESP_LOGI("ROM_CB", "suspended, fill black");
     /* 切到黑屏，游戏任务会自己填充屏幕 */
     LCD_Fill(0, 0, LCD_W, LCD_H, 0x0000);
-    ESP_LOGI("ROM_CB", "fill done, creating task");
+    ESP_LOGI("ROM_CB", "fill done");
 
-    /* 游戏任务栈 8KB，优先级 10，**绑到 Core 1** 专用仿真：
-     * Core 0 处理 WiFi/USB/lwIP 中断，Core 1 跑 Peanut-GB 不受打扰 */
+    /* 游戏不需要 WiFi，关掉腾出 ~80KB 内部 DRAM 给游戏任务栈和 scaled buffer。
+     * 退出游戏时 game_task_exited_cb 会调 wifi_resume_after_game 重连。 */
+    if (wifi_get_status() == WIFI_STATUS_CONNECTED ||
+        wifi_get_status() == WIFI_STATUS_RECONNECTING ||
+        wifi_get_status() == WIFI_STATUS_CONNECTING) {
+        ESP_LOGI("ROM_CB", "stopping WiFi for game");
+        wifi_suspend_for_game();
+        /* 等 WiFi 内部清理 buffer，一般 100-200ms 就够 */
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+    ESP_LOGI("ROM_CB", "creating task, DRAM free=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+
+    /* 游戏任务栈 8KB 放内部 DRAM（不能用 PSRAM：SPIFFS 读 ROM 时要关 flash cache，
+     * 关 cache 后 PSRAM 不可访问会 panic）。WiFi 已停，DRAM 够用。
+     * 绑 Core 1 避免 Core 0 的系统任务打扰 */
     if (xTaskCreatePinnedToCore(game_run_task, "game_run", 8192, copy, 10,
                                  &s_game_task, 1) != pdPASS) {
         ESP_LOGE("ROM_CB", "xTaskCreatePinnedToCore failed");
         free(copy);
         s_game_active = false;
+        /* 游戏启动失败，恢复 WiFi */
+        wifi_resume_after_game();
         return;
     }
     ESP_LOGI("ROM_CB", "task created, rom_item_cb returning");

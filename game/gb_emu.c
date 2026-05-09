@@ -21,12 +21,15 @@
  *
  * 性能策略：gb_run_frame_dualfetch() 代替 gb_run_frame()：双指令取
  */
-#define ENABLE_SOUND                    0
+#define ENABLE_SOUND                    1
 #define ENABLE_LCD                      1
 #define WALNUT_GB_12_COLOUR             0
 #define WALNUT_FULL_GBC_SUPPORT         0
 #define WALNUT_GB_HIGH_LCD_ACCURACY     0
 
+/* 先 include audio 头，让 walnut_cgb.h 里的 audio_read/audio_write
+ * 调用看到正确的函数原型（否则会警告 implicit declaration 并与后续定义冲突）*/
+#include "gb_audio.h"
 #include "walnut_cgb.h"
 
 #define TAG "GB_EMU"
@@ -238,6 +241,9 @@ bool gb_emu_run(const uint8_t *rom_data, size_t rom_size)
     s_gb.direct.frame_skip = 1;
     s_gb.direct.joypad = 0xFF;
 
+    /* 初始化 APU */
+    gb_audio_init();
+
     ESP_LOGI(TAG, "进入 Walnut-CGB 主循环（dualfetch + 32bit DMA）");
     int64_t last_log = esp_timer_get_time();
     int frames = 0;
@@ -250,6 +256,8 @@ bool gb_emu_run(const uint8_t *rom_data, size_t rom_size)
         /* Walnut 的高性能入口：双指令取 + 链式执行 */
         gb_run_frame_dualfetch(&s_gb);
         flush_pending_dma();
+        /* 每帧末尾生成音频并推给 speaker */
+        gb_audio_emit_frame();
         frames++;
 
         int64_t now = esp_timer_get_time();

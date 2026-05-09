@@ -19,6 +19,13 @@ BaseType_t xTaskCreatePSRAM(TaskFunction_t func, const char *name,
                              uint32_t stack_bytes, void *arg,
                              UBaseType_t prio, TaskHandle_t *handle);
 
+/* 绑核版本。core_id 可以是 0, 1, 或 tskNO_AFFINITY */
+BaseType_t xTaskCreatePSRAMPinnedToCore(TaskFunction_t func, const char *name,
+                                        uint32_t stack_bytes, void *arg,
+                                        UBaseType_t prio,
+                                        TaskHandle_t *handle,
+                                        BaseType_t core_id);
+
 /* 兼容旧 API：新代码不需要调，直接 return 即可。留着避免编译出错。 */
 void psram_task_exit(void);
 

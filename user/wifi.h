@@ -31,4 +31,12 @@ wifi_status_t wifi_get_status(void);
 // 获取分配到的 IP 地址字符串，如 "192.168.1.100"
 const char *wifi_get_ip(void);
 
+/* 游戏模式：完整停止 WiFi 并阻止守护任务重连，腾出所有 WiFi 内部 DRAM。
+ * 不释放 WiFi 子系统配置（下次 resume 直接用），仅 stop（发断开 + 释放 buffer）。
+ * 比 esp_wifi_stop 多做了：挡住守护任务，避免它立即重连回来。 */
+void wifi_suspend_for_game(void);
+
+/* 游戏结束后恢复 WiFi（异步，立即返回）。 */
+void wifi_resume_after_game(void);
+
 #endif
