@@ -18,6 +18,7 @@
 #include "rom_loader.h"
 #include "game_runtime.h"
 #include "lv_port_disp.h"
+#include "psram_task.h"
 
 /* 业务临时任务（weather / chat / asr / tts）均为一次性任务，末尾调
  * vTaskDelete(NULL) 后由 IDLE 自动回收栈和 TCB，必须使用 xTaskCreate
@@ -307,7 +308,7 @@ static void weather_fetch_task(void *arg)
     weather_result_t res;
     res.success = weather_fetch(&res.data);
     xQueueSend(weather_result_queue, &res, 0);
-    vTaskDelete(NULL);
+    psram_task_exit();
 }
 
 // ================================================================
@@ -369,7 +370,7 @@ static void chat_fetch_task(void *arg)
     res.success = model_chat(msg, &res.data);
     free(msg);
     xQueueSend(chat_result_queue, &res, 0);
-    vTaskDelete(NULL);
+    psram_task_exit();
 }
 
 static void chat_send_cb(lv_event_t *e)
@@ -397,8 +398,8 @@ static void chat_send_cb(lv_event_t *e)
     lv_obj_set_size(chat_spinner, 30, 30);
     lv_obj_align(chat_spinner, LV_ALIGN_TOP_RIGHT, -5, 5);
 
-    /* 一次性任务，栈字节数 16KB，vTaskDelete(NULL) 后 IDLE 自动回收 */
-    BaseType_t ret = xTaskCreate(chat_fetch_task, "chat_task", 16384, msg, 3, NULL);
+    /* PSRAM 栈 16KB + cleaner 自动回收 */
+    BaseType_t ret = xTaskCreatePSRAM(chat_fetch_task, "chat_task", 16384, msg, 3, NULL);
     if (ret != pdPASS) {
         ESP_LOGE("CHAT", "chat_task 创建失败");
         chat_fetching = false;
@@ -495,7 +496,7 @@ static void asr_recognize_task(void *arg)
     asr_task_result_t res;
     res.success = asr_recognize(audio_len, &res.data);
     xQueueSend(asr_result_queue, &res, 0);
-    vTaskDelete(NULL);
+    psram_task_exit();
 }
 
 /* ASR→LLM 后台任务：将 ASR 识别文字送入模型，结果通过队列返回 LVGL 线程 */
@@ -510,7 +511,7 @@ static void asr_llm_task(void *arg)
         tts_speak(res.data.output);
     }
     xQueueSend(asr_llm_result_queue, &res, 0);
-    vTaskDelete(NULL);
+    psram_task_exit();
 }
 
 static void asr_btn_cb(lv_event_t *e)
@@ -538,7 +539,7 @@ static void asr_btn_cb(lv_event_t *e)
         lv_obj_set_style_bg_color(asr_btn, lv_color_hex(0x555555), 0);
         uint32_t *len_arg = malloc(sizeof(uint32_t));
         *len_arg = asr_audio_len;
-        BaseType_t ret = xTaskCreate(asr_recognize_task, "asr_task", 16384, len_arg, 3, NULL);
+        BaseType_t ret = xTaskCreatePSRAM(asr_recognize_task, "asr_task", 16384, len_arg, 3, NULL);
         if (ret != pdPASS) {
             lv_label_set_text(asr_status_label, "内存不足");
             asr_processing = false;
@@ -565,7 +566,7 @@ static void asr_timer_cb(lv_timer_t *t)
                 text[ASR_MAX_RESULT - 1] = '\0';  /* 确保字符串以 null 结尾 */
                 if (!asr_llm_result_queue)
                     asr_llm_result_queue = xQueueCreate(2, sizeof(chat_result_t));
-                BaseType_t ret = xTaskCreate(asr_llm_task, "asr_llm", 16384, text, 3, NULL);
+                BaseType_t ret = xTaskCreatePSRAM(asr_llm_task, "asr_llm", 16384, text, 3, NULL);
                 if (ret != pdPASS) {
                     /* 任务创建失败：释放内存，恢复状态，防止界面卡死 */
                     free(text);
@@ -785,7 +786,7 @@ static void wifi_connect_task(void *arg)
     // 只有队列还空才发（取消时队列已有cancelled消息）
     xQueueSend(wifi_result_queue, &result, 0);
     wifi_task_handle = NULL;
-    vTaskDelete(NULL);
+    psram_task_exit();
 }
 
 static void close_btn_cb(lv_event_t *e)
@@ -863,7 +864,9 @@ static void game_task_exited_cb(void *user_data)
 static void game_run_task(void *arg)
 {
     char *rom_name = (char *)arg;
+    ESP_LOGI("GAME_TASK", "task started, rom=%s", rom_name);
     game_runtime_run(rom_name);
+    ESP_LOGI("GAME_TASK", "runtime returned");
     free(rom_name);
     s_game_task = NULL;
     /* 把恢复逻辑投递到 LVGL 线程执行 */
@@ -874,28 +877,35 @@ static void game_run_task(void *arg)
 /* 列表项被点击：启动该 ROM */
 static void rom_item_cb(lv_event_t *e)
 {
+    ESP_LOGI("ROM_CB", "clicked, s_game_active=%d", s_game_active);
     if (s_game_active) return;
     const char *rom_name = (const char *)lv_event_get_user_data(e);
-    if (!rom_name) return;
+    if (!rom_name) { ESP_LOGE("ROM_CB", "rom_name NULL"); return; }
+    ESP_LOGI("ROM_CB", "rom_name=%s", rom_name);
 
     /* 复制名字给任务（task 运行期间 user_data 源对象可能被 LVGL 销毁）*/
     char *copy = strdup(rom_name);
-    if (!copy) return;
+    if (!copy) { ESP_LOGE("ROM_CB", "strdup failed"); return; }
 
     s_game_active = true;
+    ESP_LOGI("ROM_CB", "calling lv_port_disp_suspend...");
     /* 暂停 LVGL 输出，等待当前 DMA 完成，让游戏 runtime 独占 SPI 总线 */
     lv_port_disp_suspend();
+    ESP_LOGI("ROM_CB", "suspended, fill black");
     /* 切到黑屏，游戏任务会自己填充屏幕 */
     LCD_Fill(0, 0, LCD_W, LCD_H, 0x0000);
+    ESP_LOGI("ROM_CB", "fill done, creating task");
 
     /* 游戏任务栈 8KB，优先级 10，**绑到 Core 1** 专用仿真：
      * Core 0 处理 WiFi/USB/lwIP 中断，Core 1 跑 Peanut-GB 不受打扰 */
     if (xTaskCreatePinnedToCore(game_run_task, "game_run", 8192, copy, 10,
                                  &s_game_task, 1) != pdPASS) {
+        ESP_LOGE("ROM_CB", "xTaskCreatePinnedToCore failed");
         free(copy);
         s_game_active = false;
         return;
     }
+    ESP_LOGI("ROM_CB", "task created, rom_item_cb returning");
 }
 
 static void game_back_btn_cb(lv_event_t *e)
@@ -984,12 +994,12 @@ static void list_event_cb(lv_event_t *e)
         if (wifi_connecting) return;
         wifi_connecting = true;
         wifi_spinner_cont = create_loading_dialog("WiFi Connecting...", cancel_btn_cb);
-        xTaskCreate(wifi_connect_task, "wifi_task", 4096, NULL, 3, &wifi_task_handle);
+        xTaskCreatePSRAM(wifi_connect_task, "wifi_task", 6144, NULL, 3, &wifi_task_handle);
     } else if (strstr(txt, "天气")) {
         if (weather_fetching) return;
         weather_fetching = true;
         weather_spinner_cont = create_loading_dialog("Fetching Weather...", weather_cancel_btn_cb);
-        xTaskCreate(weather_fetch_task, "weather_task", 16384, NULL, 3, NULL);
+        xTaskCreatePSRAM(weather_fetch_task, "weather_task", 16384, NULL, 3, NULL);
     } else if (strstr(txt, "聊天")) {
         show_chat_screen();
     } else if (strstr(txt, "语音")) {

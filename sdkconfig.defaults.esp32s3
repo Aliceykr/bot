@@ -14,8 +14,10 @@ CONFIG_ESPTOOLPY_FLASHFREQ="80m"
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
-# SPIRAM_FETCH_INSTRUCTIONS / SPIRAM_RODATA disabled on purpose:
-# putting code/rodata in PSRAM slows down CPU-heavy tasks (Peanut-GB).
+# SPIRAM_FETCH_INSTRUCTIONS disabled: code in PSRAM hurts CPU-heavy tasks (Peanut/Walnut).
+# SPIRAM_RODATA enabled: read-only constants in PSRAM saves ~80KB internal DRAM for
+# WiFi/mbedtls, no measurable impact on emulator hot loops (they use internal IRAM).
+CONFIG_SPIRAM_RODATA=y
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=16384
@@ -31,4 +33,7 @@ CONFIG_FREERTOS_HZ=1000
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+# Let mbedtls allocate from PSRAM pool, avoiding internal DRAM fragmentation
+# that causes HTTPS handshake to fail on WiFi-heavy workloads.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 CONFIG_LWIP_TCP_WND_DEFAULT=2880

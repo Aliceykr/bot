@@ -12,6 +12,7 @@
 #include "speaker.h"
 #include "health.h"
 #include "rom_loader.h"
+#include "psram_task.h"
 
 static void lvgl_tick_task(void *arg)
 {
@@ -58,6 +59,9 @@ void app_main(void)
         nvs_flash_init();
     }
     rom_loader_init();  /* 挂载 /spiffs，ROM 列表可用 */
+
+    /* PSRAM 任务管理：业务 HTTPS/cJSON 任务的栈从 PSRAM 分配，防泄漏 */
+    psram_task_init();
 
     speaker_init();
     LCD_Init();

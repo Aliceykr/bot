@@ -204,23 +204,9 @@ bool gb_emu_run(const uint8_t *rom_data, size_t rom_size)
     s_ctx.rom      = rom_data;
     s_ctx.rom_size = rom_size;
 
-    /* 小 ROM 拷到 DRAM 避免 PSRAM cache miss */
-    if (rom_size <= 256 * 1024) {
-        size_t dram_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-        if (dram_free >= rom_size + 64 * 1024) {
-            uint8_t *copy = heap_caps_malloc(rom_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-            if (copy) {
-                memcpy(copy, rom_data, rom_size);
-                s_ctx.rom_dram_copy = copy;
-                s_ctx.rom = copy;
-                ESP_LOGI(TAG, "ROM 已拷贝到 DRAM (%u bytes)", (unsigned)rom_size);
-            }
-        } else {
-            ESP_LOGW(TAG, "DRAM 不足 (%u 字节)，ROM 留 PSRAM", (unsigned)dram_free);
-        }
-    } else {
-        ESP_LOGI(TAG, "ROM 过大 (%u 字节)，仅使用 PSRAM", (unsigned)rom_size);
-    }
+    /* ROM 保留在 PSRAM。之前做过"小 ROM 拷到 DRAM 加速"的优化，
+     * 但 Walnut-CGB + dualfetch + 32bit DMA 已能稳 60fps，
+     * 不再需要 DRAM 副本。腾出 DRAM 给 WiFi/mbedtls 和其他业务。*/
 
     /* Walnut-CGB 的 gb_init 多两个 16/32 位回调 */
     enum gb_init_error_e rc = gb_init(&s_gb,

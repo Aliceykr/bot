@@ -1,4 +1,5 @@
 idf_component_register(SRCS "main.c"
+                          "psram_task.c"
                           "../mylvgl/lv_port_disp.c"
                           "../mylvgl/lv_port_indev.c"
                           "../mylvgl/my_demo.c"
