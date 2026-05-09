@@ -29,10 +29,19 @@
  * ================================================================ */
 static struct minigb_apu_ctx s_apu;
 
-/* 每帧 ~268 对 stereo 样本 */
-static audio_sample_t s_pcm_buf[AUDIO_SAMPLES_TOTAL];
+/* 每帧 ~268 对 stereo 样本。
+ * minigb_apu.h 里 AUDIO_SAMPLES 用了 double 表达式 (AUDIO_SAMPLE_RATE / VERTICAL_SYNC)，
+ * 不是整数常量表达式，导致在文件作用域定义数组时 gcc 报
+ * "variably modified at file scope" 警告。这里直接用编译期整数常量：
+ *   16000 Hz / 59.73 Hz ≈ 267.9 → 向上取 268 保证每帧 PCM 缓冲不溢出。
+ * 运行时 minigb_apu_audio_callback 会填入 AUDIO_SAMPLES_TOTAL 个样本，
+ * 实测 AUDIO_SAMPLES=268，这里给同样的 268 即可。 */
+#define GB_AUDIO_SAMPLES_PER_FRAME       268
+#define GB_AUDIO_SAMPLES_PER_FRAME_TOTAL (GB_AUDIO_SAMPLES_PER_FRAME * 2)
+
+static audio_sample_t s_pcm_buf[GB_AUDIO_SAMPLES_PER_FRAME_TOTAL];
 /* Mono 输出缓冲 */
-static int16_t s_mono_buf[AUDIO_SAMPLES];
+static int16_t s_mono_buf[GB_AUDIO_SAMPLES_PER_FRAME];
 
 /* 主线程向 APU 任务发信号：每帧仿真完生成一次。
  * 用计数信号量防止主线程在 APU 任务还没跑完时又发一次就丢失。
@@ -50,12 +59,13 @@ static void apu_task(void *arg)
             continue;
         }
 
-        /* 合成一帧 stereo PCM */
+        /* 合成一帧 stereo PCM。
+         * minigb 每次填充 AUDIO_SAMPLES_TOTAL（约 536）个 int16，
+         * 与 GB_AUDIO_SAMPLES_PER_FRAME_TOTAL 一致 */
         minigb_apu_audio_callback(&s_apu, s_pcm_buf);
 
-        /* Stereo → mono：取平均后饱和截断。
-         * (l + r) / 2 不会溢出（int32 范围充足），但结果再截到 int16 */
-        for (unsigned i = 0; i < AUDIO_SAMPLES; i++) {
+        /* Stereo → mono：取平均后饱和截断。 */
+        for (unsigned i = 0; i < GB_AUDIO_SAMPLES_PER_FRAME; i++) {
             int32_t l = s_pcm_buf[i * 2];
             int32_t r = s_pcm_buf[i * 2 + 1];
             int32_t m = (l + r) / 2;
@@ -65,7 +75,7 @@ static void apu_task(void *arg)
         }
 
         /* 推 speaker，非阻塞满则丢弃 */
-        speaker_play(s_mono_buf, AUDIO_SAMPLES * sizeof(int16_t));
+        speaker_play(s_mono_buf, GB_AUDIO_SAMPLES_PER_FRAME * sizeof(int16_t));
     }
 }
 
