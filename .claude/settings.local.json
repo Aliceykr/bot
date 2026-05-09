@@ -9,7 +9,8 @@
       "Bash(stat --printf=\"%s\" build/bot.bin)",
       "Bash(wc -c)",
       "Bash(xtensa-esp32s3-elf-objdump -b binary -m unknown -D -)",
-      "Bash(python3 -c ' *)"
+      "Bash(python3 -c ' *)",
+      "Bash(idf.py size *)"
     ]
   }
 }

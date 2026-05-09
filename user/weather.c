@@ -6,28 +6,62 @@
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "cJSON.h"
 
 #define TAG "WEATHER"
 
 #define WEATHER_URL "https://uapis.cn/api/v1/misc/weather"
 
-#define BUF_SIZE 2048
+/* 响应缓冲动态扩容：初始 4KB，最大 32KB，超过视为异常 */
+#define RESP_INIT_CAP  4096
+#define RESP_MAX_CAP   32768
 
-static char s_resp_buf[BUF_SIZE];
-static int  s_resp_len = 0;
+static char   *s_resp_buf = NULL;
+static size_t  s_resp_cap = 0;
+static size_t  s_resp_len = 0;
+static bool    s_resp_overflow = false;
+
+/* 互斥锁：保护 s_resp_buf 及后续 JSON 解析期间的模块状态，防并发调用 */
+static SemaphoreHandle_t s_mutex = NULL;
+static void ensure_mutex(void) {
+    if (!s_mutex) s_mutex = xSemaphoreCreateMutex();
+}
 
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
     switch (evt->event_id) {
-    case HTTP_EVENT_ON_DATA:
-        if (s_resp_len + evt->data_len < BUF_SIZE - 1) {
-            memcpy(s_resp_buf + s_resp_len, evt->data, evt->data_len);
-            s_resp_len += evt->data_len;
+    case HTTP_EVENT_ON_DATA: {
+        if (s_resp_overflow || !evt->data || evt->data_len <= 0) break;
+
+        if (!s_resp_buf) {
+            s_resp_buf = heap_caps_malloc(RESP_INIT_CAP, MALLOC_CAP_SPIRAM);
+            if (!s_resp_buf) { s_resp_overflow = true; break; }
+            s_resp_cap = RESP_INIT_CAP;
+            s_resp_len = 0;
         }
+
+        size_t need = s_resp_len + (size_t)evt->data_len + 1;  /* +1 for '\0' */
+        if (need > s_resp_cap) {
+            size_t new_cap = s_resp_cap;
+            while (new_cap < need && new_cap < RESP_MAX_CAP) new_cap *= 2;
+            if (new_cap > RESP_MAX_CAP) new_cap = RESP_MAX_CAP;
+            if (need > new_cap) { s_resp_overflow = true; break; }
+
+            char *np = heap_caps_realloc(s_resp_buf, new_cap, MALLOC_CAP_SPIRAM);
+            if (!np) { s_resp_overflow = true; break; }
+            s_resp_buf = np;
+            s_resp_cap = new_cap;
+        }
+
+        memcpy(s_resp_buf + s_resp_len, evt->data, evt->data_len);
+        s_resp_len += evt->data_len;
         break;
+    }
     case HTTP_EVENT_ON_FINISH:
-        s_resp_buf[s_resp_len] = '\0';
+        if (s_resp_buf && !s_resp_overflow) s_resp_buf[s_resp_len] = '\0';
         break;
     default:
         break;
@@ -38,7 +72,8 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 static bool http_get(const char *url)
 {
     s_resp_len = 0;
-    memset(s_resp_buf, 0, sizeof(s_resp_buf));
+    s_resp_overflow = false;
+    /* 缓冲复用，不在此处释放 */
 
     esp_http_client_config_t config = {
         .url            = url,
@@ -60,6 +95,10 @@ static bool http_get(const char *url)
 
 bool weather_fetch(weather_data_t *out)
 {
+    ensure_mutex();
+    if (s_mutex) xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    bool ret = false;
     memset(out, 0, sizeof(*out));
 
     // 检查 WiFi 是否已连接
@@ -67,14 +106,19 @@ bool weather_fetch(weather_data_t *out)
     if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
         snprintf(out->error_msg, sizeof(out->error_msg), "No WiFi / Network Error");
         out->error_code = -1;
-        return false;
+        goto out;
     }
 
     // 查询天气
     if (!http_get(WEATHER_URL)) {
         snprintf(out->error_msg, sizeof(out->error_msg), "No WiFi / Network Error");
         out->error_code = -1;
-        return false;
+        goto out;
+    }
+    if (s_resp_overflow) {
+        snprintf(out->error_msg, sizeof(out->error_msg), "Response too large");
+        out->error_code = -1;
+        goto out;
     }
     ESP_LOGI(TAG, "Weather response: %s", s_resp_buf);
 
@@ -82,7 +126,7 @@ bool weather_fetch(weather_data_t *out)
     if (!root) {
         snprintf(out->error_msg, sizeof(out->error_msg), "Parse Error");
         out->error_code = -1;
-        return false;
+        goto out;
     }
 
     // 检查错误码
@@ -95,33 +139,35 @@ bool weather_fetch(weather_data_t *out)
             snprintf(out->error_msg, sizeof(out->error_msg), "Error %d", code->valueint);
         }
         cJSON_Delete(root);
-        return false;
+        goto out;
     }
 
-    cJSON *data = root;  // 直接从root取，无data包裹
-    if (data) {
-        cJSON *item;
-        item = cJSON_GetObjectItem(data, "city");          if(item && item->valuestring) strncpy(out->city,          item->valuestring, sizeof(out->city)-1);
-        item = cJSON_GetObjectItem(data, "province");      if(item && item->valuestring) strncpy(out->province,      item->valuestring, sizeof(out->province)-1);
-        item = cJSON_GetObjectItem(data, "weather");       if(item && item->valuestring) strncpy(out->weather,       item->valuestring, sizeof(out->weather)-1);
-        // temperature 是数字类型
-        item = cJSON_GetObjectItem(data, "temperature");
-        if(item) snprintf(out->temperature, sizeof(out->temperature), "%d摄氏度", item->valueint);
-        item = cJSON_GetObjectItem(data, "humidity");
-        if(item) snprintf(out->humidity, sizeof(out->humidity), "%d", item->valueint);
-        item = cJSON_GetObjectItem(data, "wind_direction"); if(item && item->valuestring) strncpy(out->wind_direction, item->valuestring, sizeof(out->wind_direction)-1);
-        item = cJSON_GetObjectItem(data, "wind_power");    if(item && item->valuestring) strncpy(out->wind_power,    item->valuestring, sizeof(out->wind_power)-1);
-        item = cJSON_GetObjectItem(data, "report_time");
-        if (item && item->valuestring) {
-            // report_time 格式: "2026-03-21 19:26:37"
-            strncpy(out->date,     item->valuestring, 10);
-            out->date[10] = '\0';
-            strncpy(out->time_str, item->valuestring + 11, sizeof(out->time_str)-1);
-            // 解析时分秒
-            sscanf(item->valuestring + 11, "%d:%d:%d", &out->hour, &out->minute, &out->second);
-        }
+    /* uapis.cn 的响应是平铺的 JSON 对象，字段直接在顶层，无 data 包裹层 */
+    cJSON *item;
+    item = cJSON_GetObjectItem(root, "city");          if(item && item->valuestring) strncpy(out->city,          item->valuestring, sizeof(out->city)-1);
+    item = cJSON_GetObjectItem(root, "province");      if(item && item->valuestring) strncpy(out->province,      item->valuestring, sizeof(out->province)-1);
+    item = cJSON_GetObjectItem(root, "weather");       if(item && item->valuestring) strncpy(out->weather,       item->valuestring, sizeof(out->weather)-1);
+    // temperature 是数字类型
+    item = cJSON_GetObjectItem(root, "temperature");
+    if(item) snprintf(out->temperature, sizeof(out->temperature), "%d摄氏度", item->valueint);
+    item = cJSON_GetObjectItem(root, "humidity");
+    if(item) snprintf(out->humidity, sizeof(out->humidity), "%d", item->valueint);
+    item = cJSON_GetObjectItem(root, "wind_direction"); if(item && item->valuestring) strncpy(out->wind_direction, item->valuestring, sizeof(out->wind_direction)-1);
+    item = cJSON_GetObjectItem(root, "wind_power");    if(item && item->valuestring) strncpy(out->wind_power,    item->valuestring, sizeof(out->wind_power)-1);
+    item = cJSON_GetObjectItem(root, "report_time");
+    if (item && item->valuestring) {
+        // report_time 格式: "2026-03-21 19:26:37"
+        strncpy(out->date,     item->valuestring, 10);
+        out->date[10] = '\0';
+        strncpy(out->time_str, item->valuestring + 11, sizeof(out->time_str)-1);
+        // 解析时分秒
+        sscanf(item->valuestring + 11, "%d:%d:%d", &out->hour, &out->minute, &out->second);
     }
     cJSON_Delete(root);
-    return true;
+    ret = true;
+
+out:
+    if (s_mutex) xSemaphoreGive(s_mutex);
+    return ret;
 }
 

@@ -21,9 +21,6 @@ void asr_record_start(void);
 // 停止录音，返回录音字节数
 uint32_t asr_record_stop(void);
 
-// 从 I2S 读取数据到缓冲（录音期间需循环调用）
-void asr_record_read(void);
-
 // 是否正在录音
 bool asr_is_recording(void);
 

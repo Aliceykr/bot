@@ -6,25 +6,60 @@
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "cJSON.h"
 
 #define TAG "MODEL"
-#define BUF_SIZE 2048
 
-static char s_resp_buf[BUF_SIZE];
-static int  s_resp_len = 0;
+/* 响应缓冲动态扩容：初始 4KB，最大 32KB。大模型长回复 + 完整 JSON 封装可能超 4KB */
+#define RESP_INIT_CAP  4096
+#define RESP_MAX_CAP   32768
+
+static char   *s_resp_buf = NULL;
+static size_t  s_resp_cap = 0;
+static size_t  s_resp_len = 0;
+static bool    s_resp_overflow = false;
+
+/* 互斥锁：保护响应缓冲，防并发调用 */
+static SemaphoreHandle_t s_mutex = NULL;
+static void ensure_mutex(void) {
+    if (!s_mutex) s_mutex = xSemaphoreCreateMutex();
+}
 
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
     switch (evt->event_id) {
-    case HTTP_EVENT_ON_DATA:
-        if (s_resp_len + evt->data_len < BUF_SIZE - 1) {
-            memcpy(s_resp_buf + s_resp_len, evt->data, evt->data_len);
-            s_resp_len += evt->data_len;
+    case HTTP_EVENT_ON_DATA: {
+        if (s_resp_overflow || !evt->data || evt->data_len <= 0) break;
+
+        if (!s_resp_buf) {
+            s_resp_buf = heap_caps_malloc(RESP_INIT_CAP, MALLOC_CAP_SPIRAM);
+            if (!s_resp_buf) { s_resp_overflow = true; break; }
+            s_resp_cap = RESP_INIT_CAP;
+            s_resp_len = 0;
         }
+
+        size_t need = s_resp_len + (size_t)evt->data_len + 1;
+        if (need > s_resp_cap) {
+            size_t new_cap = s_resp_cap;
+            while (new_cap < need && new_cap < RESP_MAX_CAP) new_cap *= 2;
+            if (new_cap > RESP_MAX_CAP) new_cap = RESP_MAX_CAP;
+            if (need > new_cap) { s_resp_overflow = true; break; }
+
+            char *np = heap_caps_realloc(s_resp_buf, new_cap, MALLOC_CAP_SPIRAM);
+            if (!np) { s_resp_overflow = true; break; }
+            s_resp_buf = np;
+            s_resp_cap = new_cap;
+        }
+
+        memcpy(s_resp_buf + s_resp_len, evt->data, evt->data_len);
+        s_resp_len += evt->data_len;
         break;
+    }
     case HTTP_EVENT_ON_FINISH:
-        s_resp_buf[s_resp_len] = '\0';
+        if (s_resp_buf && !s_resp_overflow) s_resp_buf[s_resp_len] = '\0';
         break;
     default:
         break;
@@ -34,6 +69,10 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 
 bool model_chat(const char *user_msg, model_result_t *out)
 {
+    ensure_mutex();
+    if (s_mutex) xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    bool ret = false;
     memset(out, 0, sizeof(*out));
     strncpy(out->input, user_msg, MODEL_MAX_INPUT - 1);
 
@@ -57,7 +96,7 @@ bool model_chat(const char *user_msg, model_result_t *out)
     cJSON_Delete(root);
     if (!body) {
         snprintf(out->error_msg, sizeof(out->error_msg), "JSON build error");
-        return false;
+        goto out;
     }
 
     // 构造 Authorization header
@@ -65,7 +104,7 @@ bool model_chat(const char *user_msg, model_result_t *out)
     snprintf(auth_header, sizeof(auth_header), "Bearer %s", MODEL_API_KEY);
 
     s_resp_len = 0;
-    memset(s_resp_buf, 0, sizeof(s_resp_buf));
+    s_resp_overflow = false;
 
     esp_http_client_config_t config = {
         .url            = MODEL_API_URL,
@@ -88,7 +127,11 @@ bool model_chat(const char *user_msg, model_result_t *out)
 
     if (err != ESP_OK || status != 200) {
         snprintf(out->error_msg, sizeof(out->error_msg), "HTTP error %d", status);
-        return false;
+        goto out;
+    }
+    if (s_resp_overflow) {
+        snprintf(out->error_msg, sizeof(out->error_msg), "Response too large");
+        goto out;
     }
 
     ESP_LOGI(TAG, "Response: %s", s_resp_buf);
@@ -97,14 +140,14 @@ bool model_chat(const char *user_msg, model_result_t *out)
     cJSON *resp = cJSON_Parse(s_resp_buf);
     if (!resp) {
         snprintf(out->error_msg, sizeof(out->error_msg), "Parse error");
-        return false;
+        goto out;
     }
 
     cJSON *choices = cJSON_GetObjectItem(resp, "choices");
     if (!cJSON_IsArray(choices) || cJSON_GetArraySize(choices) == 0) {
         snprintf(out->error_msg, sizeof(out->error_msg), "No choices");
         cJSON_Delete(resp);
-        return false;
+        goto out;
     }
 
     cJSON *choice  = cJSON_GetArrayItem(choices, 0);
@@ -113,11 +156,15 @@ bool model_chat(const char *user_msg, model_result_t *out)
     if (!cJSON_IsString(content)) {
         snprintf(out->error_msg, sizeof(out->error_msg), "No content");
         cJSON_Delete(resp);
-        return false;
+        goto out;
     }
 
     strncpy(out->output, content->valuestring, MODEL_MAX_OUTPUT - 1);
     cJSON_Delete(resp);
     out->success = true;
-    return true;
+    ret = true;
+
+out:
+    if (s_mutex) xSemaphoreGive(s_mutex);
+    return ret;
 }

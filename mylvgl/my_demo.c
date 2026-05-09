@@ -14,26 +14,12 @@
 #include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
-
-/* 在 PSRAM 上创建大栈任务：栈→PSRAM，TCB→内部 DRAM */
-static BaseType_t xTaskCreatePSRAM(TaskFunction_t func, const char *name,
-                                    uint32_t stack, void *arg, UBaseType_t prio,
-                                    TaskHandle_t *handle)
-{
-    StackType_t *stk = heap_caps_malloc(stack, MALLOC_CAP_SPIRAM);
-    StaticTask_t *tcb = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
-    if (!stk || !tcb) {
-        ESP_LOGE("PSRAM_TASK", "alloc failed for %s", name);
-        free(stk); free(tcb);
-        return pdFAIL;
-    }
-    TaskHandle_t h = xTaskCreateStatic(func, name, stack / sizeof(StackType_t),
-                                        arg, prio, stk, tcb);
-    if (handle) *handle = h;
-    return h ? pdPASS : pdFAIL;
-}
 #include "esp_system.h"
-#include "esp_heap_caps.h"
+
+/* 业务临时任务（weather / chat / asr / tts）均为一次性任务，末尾调
+ * vTaskDelete(NULL) 后由 IDLE 自动回收栈和 TCB，必须使用 xTaskCreate
+ * （动态分配），不要用 xTaskCreateStatic 否则永久泄漏。
+ * 16KB 栈放内部 DRAM，HTTPS+cJSON 访问更快，这些任务互斥且短命。 */
 
 LV_FONT_DECLARE(lv_font_simhei_16);
 
@@ -336,6 +322,40 @@ static lv_obj_t *chat_spinner = NULL;      // 加载动画
 static lv_obj_t *chat_scr = NULL;          // 聊天屏幕
 static char chat_log[1024] = "";           // 累积对话文本
 
+/* 追加一行到 chat_log，满了按行滚动丢弃最早记录。
+ * 调用方应保证 line 以 '\n' 结尾；'\n' 是 ASCII 字符，在 UTF-8 中不会与
+ * 多字节字符的续字节冲突，故按 '\n' 切分不会截断汉字。 */
+static void chat_log_append(const char *line)
+{
+    if (!line || !*line) return;
+    size_t cap     = sizeof(chat_log);       /* 含末尾 '\0' */
+    size_t used    = strlen(chat_log);
+    size_t add_len = strlen(line);
+
+    /* 如果新消息单条就超过缓冲，直接清空并截断存入 */
+    if (add_len >= cap) {
+        memcpy(chat_log, line, cap - 1);
+        chat_log[cap - 1] = '\0';
+        return;
+    }
+
+    /* 空间不够时按行丢弃最早记录 */
+    while (used + add_len + 1 > cap) {
+        char *nl = strchr(chat_log, '\n');
+        if (!nl) {
+            /* 没有换行符就整体清空（保护性分支）*/
+            chat_log[0] = '\0';
+            used = 0;
+            break;
+        }
+        size_t drop = (size_t)(nl - chat_log) + 1;  /* 含 '\n' */
+        memmove(chat_log, nl + 1, used - drop + 1); /* +1 拷贝 '\0' */
+        used -= drop;
+    }
+
+    memcpy(chat_log + used, line, add_len + 1);
+}
+
 static void chat_fetch_task(void *arg)
 {
     char *msg = (char *)arg;
@@ -356,7 +376,7 @@ static void chat_send_cb(lv_event_t *e)
     // 追加用户消息到日志
     char user_line[MODEL_MAX_INPUT + 8];
     snprintf(user_line, sizeof(user_line), "You: %s\n", txt);
-    strncat(chat_log, user_line, sizeof(chat_log) - strlen(chat_log) - 1);
+    chat_log_append(user_line);
     lv_label_set_text(chat_log_label, chat_log);
 
     // 复制输入内容给任务
@@ -372,29 +392,16 @@ static void chat_send_cb(lv_event_t *e)
     lv_obj_set_size(chat_spinner, 30, 30);
     lv_obj_align(chat_spinner, LV_ALIGN_TOP_RIGHT, -5, 5);
 
-    // 从 PSRAM 分配栈，避免内部堆耗尽
-    StaticTask_t *task_buf = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
-    StackType_t *task_stack = heap_caps_malloc(32768, MALLOC_CAP_SPIRAM);
-    if (!task_buf || !task_stack) {
-        ESP_LOGE("CHAT", "chat_task 栈分配失败");
+    /* 一次性任务，栈字节数 16KB，vTaskDelete(NULL) 后 IDLE 自动回收 */
+    BaseType_t ret = xTaskCreate(chat_fetch_task, "chat_task", 16384, msg, 3, NULL);
+    if (ret != pdPASS) {
+        ESP_LOGE("CHAT", "chat_task 创建失败");
         chat_fetching = false;
-        if (chat_spinner && lv_obj_is_valid(chat_spinner)) { lv_obj_delete(chat_spinner); chat_spinner = NULL; }
-        free(msg);
-        if (task_buf) heap_caps_free(task_buf);
-        if (task_stack) heap_caps_free(task_stack);
-    } else {
-        // 把 task_buf 和 task_stack 指针通过 msg 之外的方式传递以便释放
-        // 注意：StaticTask 的内存在任务删除后需手动释放，这里接受泄漏换稳定性
-        // 改用动态任务避免泄漏
-        heap_caps_free(task_buf);
-        heap_caps_free(task_stack);
-        BaseType_t ret = xTaskCreatePSRAM(chat_fetch_task, "chat_task", 16384, msg, 3, NULL);
-        if (ret != pdPASS) {
-            ESP_LOGE("CHAT", "chat_task 创建失败");
-            chat_fetching = false;
-            if (chat_spinner && lv_obj_is_valid(chat_spinner)) { lv_obj_delete(chat_spinner); chat_spinner = NULL; }
-            free(msg);
+        if (chat_spinner && lv_obj_is_valid(chat_spinner)) {
+            lv_obj_delete(chat_spinner);
+            chat_spinner = NULL;
         }
+        free(msg);
     }
 }
 
@@ -446,11 +453,11 @@ static void chat_result_check_cb(lv_timer_t *t)
     if (res.success) {
         char ai_line[MODEL_MAX_OUTPUT + 8];
         snprintf(ai_line, sizeof(ai_line), "AI: %s\n", res.data.output);
-        strncat(chat_log, ai_line, sizeof(chat_log) - strlen(chat_log) - 1);
+        chat_log_append(ai_line);
     } else {
         char err_line[80];
         snprintf(err_line, sizeof(err_line), "Error: %s\n", res.data.error_msg);
-        strncat(chat_log, err_line, sizeof(chat_log) - strlen(chat_log) - 1);
+        chat_log_append(err_line);
     }
     lv_label_set_text(chat_log_label, chat_log);
     // 滚动到底部
@@ -526,7 +533,7 @@ static void asr_btn_cb(lv_event_t *e)
         lv_obj_set_style_bg_color(asr_btn, lv_color_hex(0x555555), 0);
         uint32_t *len_arg = malloc(sizeof(uint32_t));
         *len_arg = asr_audio_len;
-        BaseType_t ret = xTaskCreatePSRAM(asr_recognize_task, "asr_task", 16384, len_arg, 3, NULL);
+        BaseType_t ret = xTaskCreate(asr_recognize_task, "asr_task", 16384, len_arg, 3, NULL);
         if (ret != pdPASS) {
             lv_label_set_text(asr_status_label, "内存不足");
             asr_processing = false;
@@ -538,7 +545,7 @@ static void asr_btn_cb(lv_event_t *e)
 static void asr_timer_cb(lv_timer_t *t)
 {
     if (!asr_scr || !lv_obj_is_valid(asr_scr)) { lv_timer_delete(t); return; }
-    if (asr_recording) asr_record_read();
+    /* 录音由 asr_rec_task 后台任务处理，不在 LVGL 上下文读 I2S */
     if (!asr_result_queue) return;
 
     /* --- 阶段1：收到 ASR 识别结果，转发给 LLM --- */
@@ -553,7 +560,7 @@ static void asr_timer_cb(lv_timer_t *t)
                 text[ASR_MAX_RESULT - 1] = '\0';  /* 确保字符串以 null 结尾 */
                 if (!asr_llm_result_queue)
                     asr_llm_result_queue = xQueueCreate(2, sizeof(chat_result_t));
-                BaseType_t ret = xTaskCreatePSRAM(asr_llm_task, "asr_llm", 16384, text, 3, NULL);
+                BaseType_t ret = xTaskCreate(asr_llm_task, "asr_llm", 16384, text, 3, NULL);
                 if (ret != pdPASS) {
                     /* 任务创建失败：释放内存，恢复状态，防止界面卡死 */
                     free(text);
@@ -842,7 +849,7 @@ static void list_event_cb(lv_event_t *e)
         if (weather_fetching) return;
         weather_fetching = true;
         weather_spinner_cont = create_loading_dialog("Fetching Weather...", weather_cancel_btn_cb);
-        xTaskCreatePSRAM(weather_fetch_task, "weather_task", 16384, NULL, 3, NULL);
+        xTaskCreate(weather_fetch_task, "weather_task", 16384, NULL, 3, NULL);
     } else if (strstr(txt, "聊天")) {
         show_chat_screen();
     } else if (strstr(txt, "语音")) {

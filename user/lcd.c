@@ -72,55 +72,6 @@ void LCD_Send_Buf(const uint8_t *buf, uint32_t len)
     }
 }
 
-/* 静态 DMA 事务对象：DMA 传输期间必须保持有效，故用静态分配 */
-static spi_transaction_t s_dma_trans;
-static bool              s_dma_pending = false;  /* 是否有未完成的异步事务 */
-
-/* 异步 DMA 发送：将数据分块（每块 ≤ 4092 字节）逐块通过中断驱动 DMA 发送。
- * 最后一块异步入队后立即返回，前面各块同步等待完成。
- * ESP32-S3 SPI DMA 单次事务硬件上限为 4092 字节。 */
-void LCD_Send_Buf_Async(const uint8_t *buf, uint32_t len)
-{
-    if (len == 0) return;
-
-    gpio_set_level(LCD_DC_PIN, 1);  /* 像素数据，DC 置高 */
-
-#define DMA_MAX_CHUNK 4092U  /* ESP32-S3 SPI DMA 单次事务最大字节数 */
-
-    const uint8_t *p      = buf;
-    uint32_t       remain = len;
-
-    while (remain > 0) {
-        uint32_t chunk = (remain > DMA_MAX_CHUNK) ? DMA_MAX_CHUNK : remain;
-        bool     last  = (chunk == remain);  /* 是否为最后一块 */
-
-        if (last) {
-            /* 最后一块：异步入队，函数返回后 DMA 仍在传输 */
-            memset(&s_dma_trans, 0, sizeof(s_dma_trans));
-            s_dma_trans.length    = (size_t)chunk * 8;
-            s_dma_trans.tx_buffer = p;
-            spi_device_queue_trans(s_spi, &s_dma_trans, portMAX_DELAY);
-            s_dma_pending = true;
-        } else {
-            /* 中间块：用中断驱动 DMA（任务阻塞等待，不占 CPU 忙等）*/
-            spi_transaction_t t = { .length = chunk * 8, .tx_buffer = p };
-            spi_device_transmit(s_spi, &t);
-        }
-
-        p      += chunk;
-        remain -= chunk;
-    }
-}
-
-/* 等待上次异步 DMA 传输完成，确保 SPI 总线空闲后再进行下一次操作 */
-void LCD_Send_Buf_Wait(void)
-{
-    if (!s_dma_pending) return;
-    spi_transaction_t *ret_trans;
-    spi_device_get_trans_result(s_spi, &ret_trans, portMAX_DELAY);
-    s_dma_pending = false;
-}
-
 void LCD_Address_Set(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2)
 {
     LCD_WR_REG(0x2a);

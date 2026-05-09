@@ -54,8 +54,13 @@ static void spk_tx_task(void *arg)
             dbg_cnt = 0;
             ESP_LOGI(TAG, "pcm[0]=%d pcm[1]=%d n=%d", src[0], src[1], (int)n_samples);
         }
-        /* stereo_buf 需容纳 n_samples*2 个 int16，最大 SPK_TX_CHUNK 字节 → SPK_TX_CHUNK 个 int16 */
-        static int16_t stereo_buf[SPK_TX_CHUNK];  /* SPK_TX_CHUNK 个 int16 = SPK_TX_CHUNK*2 字节 */
+        /* stereo_buf 需容纳 n_samples * 2 个 int16。
+         * 单次从 RingBuffer 取最多 SPK_TX_CHUNK 字节（=SPK_TX_CHUNK/2 个 mono 样本），
+         * 展开为 stereo 后 = SPK_TX_CHUNK 个 int16 = SPK_TX_CHUNK*2 字节。
+         * 静态断言防止将来修改 SPK_TX_CHUNK 时发生栈溢出 */
+        static int16_t stereo_buf[SPK_TX_CHUNK];
+        _Static_assert(sizeof(stereo_buf) >= (size_t)SPK_TX_CHUNK * 2,
+                       "stereo_buf too small for SPK_TX_CHUNK worth of stereo samples");
         for (size_t i = 0; i < n_samples; i++) {
             stereo_buf[i * 2]     = src[i];  /* L */
             stereo_buf[i * 2 + 1] = src[i];  /* R */

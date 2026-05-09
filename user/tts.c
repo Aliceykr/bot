@@ -1,12 +1,15 @@
 #include "tts.h"
 #include "asr_config.h"
 #include "speaker.h"
+#include "baidu_token.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 
@@ -14,18 +17,21 @@
 
 /* ================================================================
  * 模块内部状态（全部 static）
+ * access_token 由 baidu_token 模块统一管理，带过期刷新
  * ================================================================ */
-static char s_tts_token[256] = "";  /* access_token 缓存 */
 static bool s_is_pcm = false;        /* 当前响应是否为音频流 */
 static int  s_wav_skip = 0;          /* 已跳过的 WAV 头字节数（固定44字节）*/
 
-/* HTTP 响应缓冲（用于 token 响应及错误 JSON 收集） */
-#define TOKEN_BUF_SIZE 2048
+/* 错误响应缓冲（非音频流时收集 JSON 错误信息，固定小容量足够）*/
 #define ERR_BUF_SIZE   256
-static char  s_token_buf[TOKEN_BUF_SIZE];
-static int   s_token_len = 0;
 static char  s_err_buf[ERR_BUF_SIZE];
 static int   s_err_len = 0;
+
+/* 互斥锁：保护 tts_speak 全过程（encoded / body / s_err_buf 等 static 共享资源）*/
+static SemaphoreHandle_t s_mutex = NULL;
+static void ensure_mutex(void) {
+    if (!s_mutex) s_mutex = xSemaphoreCreateMutex();
+}
 
 /* ================================================================
  * percent-encode：对非字母数字及 -_.~ 以外的字节编码为 %XX
@@ -47,25 +53,6 @@ static void tts_url_encode(const char *src, char *dst, size_t dst_size)
         }
     }
     dst[di] = '\0';
-}
-
-/* ================================================================
- * Token 请求专用 HTTP 回调（响应较大，使用独立 s_token_buf）
- * ================================================================ */
-static esp_err_t token_http_event_cb(esp_http_client_event_t *evt)
-{
-    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data && evt->data_len > 0) {
-        int copy = evt->data_len;
-        if (s_token_len + copy >= TOKEN_BUF_SIZE - 1)
-            copy = TOKEN_BUF_SIZE - 1 - s_token_len;
-        if (copy > 0) {
-            memcpy(s_token_buf + s_token_len, evt->data, copy);
-            s_token_len += copy;
-        }
-    } else if (evt->event_id == HTTP_EVENT_ON_FINISH) {
-        s_token_buf[s_token_len] = '\0';
-    }
-    return ESP_OK;
 }
 
 /* ================================================================
@@ -143,71 +130,25 @@ static esp_err_t tts_http_event_cb(esp_http_client_event_t *evt)
 }
 
 /* ================================================================
- * 获取 Baidu access_token（首次请求，之后缓存）
- * ================================================================ */
-static bool tts_get_token(void)
-{
-    if (strlen(s_tts_token) > 0) return true;
-
-    static char url[320];
-    snprintf(url, sizeof(url),
-        "%s?grant_type=client_credentials&client_id=%s&client_secret=%s",
-        BAIDU_TOKEN_URL, BAIDU_API_KEY, BAIDU_SECRET_KEY);
-
-    /* 使用独立 token 缓冲，避免被截断 */
-    s_token_len = 0;
-    memset(s_token_buf, 0, sizeof(s_token_buf));
-
-    esp_http_client_config_t cfg = {
-        .url = url,
-        .event_handler = token_http_event_cb,
-        .timeout_ms = 10000,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .skip_cert_common_name_check = true,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    esp_http_client_set_method(client, HTTP_METHOD_POST);
-    esp_http_client_set_post_field(client, "", 0);
-    esp_err_t err = esp_http_client_perform(client);
-    int status   = esp_http_client_get_status_code(client);
-    esp_http_client_cleanup(client);
-
-    if (err != ESP_OK || status != 200) {
-        ESP_LOGE(TAG, "获取 token 失败: err=%d status=%d", err, status);
-        return false;
-    }
-
-    /* 直接字符串搜索提取 access_token，不依赖完整 JSON（响应可能很长）*/
-    const char *key = "\"access_token\":\"";
-    char *pos = strstr(s_token_buf, key);
-    if (pos) {
-        pos += strlen(key);
-        char *end = strchr(pos, '"');
-        if (end && (size_t)(end - pos) < sizeof(s_tts_token)) {
-            size_t len = (size_t)(end - pos);
-            memcpy(s_tts_token, pos, len);
-            s_tts_token[len] = '\0';
-        }
-    }
-    if (strlen(s_tts_token) == 0) {
-        ESP_LOGE(TAG, "access_token 提取失败，响应(%d bytes): %.200s", s_token_len, s_token_buf);
-        return false;
-    }
-    ESP_LOGI(TAG, "access_token 获取成功");
-    return true;
-}
-
-/* ================================================================
  * 公开接口
  * ================================================================ */
 bool tts_speak(const char *text)
 {
     if (!text || strlen(text) == 0) return false;
 
-    if (!tts_get_token()) return false;
+    ensure_mutex();
+    if (s_mutex) xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    bool ret = false;
+
+    const char *token = baidu_token_get();
+    if (!token) {
+        ESP_LOGE(TAG, "获取 token 失败");
+        goto out;
+    }
 
     /* percent-encode 文本（中文每字3字节，编码后9字节，512字节文本最坏约4608字节）
-     * 使用 static 避免在任务栈上分配大数组（tts_speak 由单一任务顺序调用）*/
+     * 使用 static 避免在任务栈上分配大数组；mutex 保护并发 */
     static char encoded[4096];
     tts_url_encode(text, encoded, sizeof(encoded));
 
@@ -215,10 +156,10 @@ bool tts_speak(const char *text)
     static char body[5120];
     int body_len = snprintf(body, sizeof(body),
         "tex=%s&tok=%s&cuid=esp32s3_bot&ctp=1&lan=zh&spd=5&pit=5&vol=9&per=0&aue=6",
-        encoded, s_tts_token);
+        encoded, token);
     if (body_len <= 0 || body_len >= (int)sizeof(body)) {
         ESP_LOGE(TAG, "body 构建失败或过长");
-        return false;
+        goto out;
     }
 
     ESP_LOGI(TAG, "开始合成: %.60s%s", text, strlen(text) > 60 ? "..." : "");
@@ -249,13 +190,22 @@ bool tts_speak(const char *text)
 
     if (err != ESP_OK || status != 200) {
         ESP_LOGE(TAG, "TTS 请求失败: err=%d status=%d", err, status);
-        return false;
+        /* HTTP 401：token 失效，下次重取 */
+        if (status == 401) baidu_token_invalidate();
+        goto out;
     }
     if (!s_is_pcm) {
         ESP_LOGE(TAG, "TTS 未返回 PCM 数据");
-        return false;
+        /* 百度 TTS 失败时返回 JSON 错误，包含 err_no。常见 token 错误：
+         * 501/502/503 token 相关。保守起见，失败且非 PCM 响应就失效 token */
+        baidu_token_invalidate();
+        goto out;
     }
 
     ESP_LOGI(TAG, "合成完成");
-    return true;
+    ret = true;
+
+out:
+    if (s_mutex) xSemaphoreGive(s_mutex);
+    return ret;
 }

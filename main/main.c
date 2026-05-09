@@ -9,6 +9,7 @@
 #include "lv_port_indev.h"
 #include "my_demo.h"
 #include "speaker.h"
+#include "health.h"
 
 /* 在 PSRAM 上创建任务：栈分配于 SPIRAM，TCB 必须在内部 DRAM */
 static TaskHandle_t xTaskCreatePSRAM(TaskFunction_t pxTaskCode,
@@ -76,4 +77,7 @@ void app_main(void)
     /* 小栈任务留内部 DRAM，大栈任务用 PSRAM */
     xTaskCreate(lvgl_tick_task, "lv_tick", 2048, NULL, 5, NULL);
     xTaskCreatePSRAM(lvgl_task, "lv_task", 32768, NULL, 4);
+
+    /* 启动健康监控：周期打印堆水位，便于发现长期运行中的内存泄漏 */
+    health_monitor_start();
 }

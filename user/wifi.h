@@ -10,6 +10,7 @@ typedef enum {
     WIFI_STATUS_CONNECTING,
     WIFI_STATUS_CONNECTED,
     WIFI_STATUS_FAILED,
+    WIFI_STATUS_RECONNECTING,  /* 运行期断线，后台守护任务正在退避重连 */
 } wifi_status_t;
 
 // WiFi 配置，修改为你的路由器信息
