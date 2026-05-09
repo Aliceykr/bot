@@ -11,6 +11,7 @@
 #include "my_demo.h"
 #include "speaker.h"
 #include "health.h"
+#include "keypad.h"
 #include "rom_loader.h"
 #include "psram_task.h"
 
@@ -65,6 +66,9 @@ void app_main(void)
 
     speaker_init();
     LCD_Init();
+
+    /* 矩阵键盘：GB 模拟器运行时用作 8 键输入，菜单期间也会扫描但不拦截事件 */
+    keypad_init();
 
     lv_init();
     lv_port_disp_init();

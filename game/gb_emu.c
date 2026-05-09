@@ -23,6 +23,9 @@
  */
 #define ENABLE_SOUND                    1
 #define ENABLE_LCD                      1
+/* DMG-only 模式：保持 60fps 稳定。
+ * CGB 彩色开过（WALNUT_GB_12_COLOUR=1 + WALNUT_FULL_GBC_SUPPORT=1），
+ * 但塞尔达 DX 场景下帧率掉到 30fps，CPU 不够。回退 DMG 灰白。 */
 #define WALNUT_GB_12_COLOUR             0
 #define WALNUT_FULL_GBC_SUPPORT         0
 #define WALNUT_GB_HIGH_LCD_ACCURACY     0
@@ -31,6 +34,7 @@
  * 调用看到正确的函数原型（否则会警告 implicit declaration 并与后续定义冲突）*/
 #include "gb_audio.h"
 #include "walnut_cgb.h"
+#include "keypad.h"
 
 #define TAG "GB_EMU"
 
@@ -45,7 +49,7 @@
 #define OFFSET_Y ((LCD_H - SCALED_H) / 2)
 
 /* DMG 4 色灰度调色板（RGB565 SWAPPED 格式）*/
-static const uint16_t s_palette_rgb565[4] = {
+static const uint16_t s_palette_dmg_rgb565[4] = {
     0xFFFF, /* 白 */
     0xB596, /* 浅灰 */
     0x52AA, /* 深灰 */
@@ -116,14 +120,15 @@ static void gb_error_cb(struct gb_s *gb, const enum gb_error_e gb_err, const uin
 
 /* ================================================================
  * 1.5× 横向缩放：160 px → 240 px
+ * DMG 模式：直接用灰度表查色
  * ================================================================ */
 static inline IRAM_ATTR void scale_line_1p5x(const uint8_t *src, uint16_t *dst_line)
 {
     const uint8_t *s = src;
     uint16_t *d = dst_line;
     for (int i = 0; i < 80; i++) {
-        uint16_t a = s_palette_rgb565[s[0] & LCD_COLOUR];
-        uint16_t b = s_palette_rgb565[s[1] & LCD_COLOUR];
+        uint16_t a = s_palette_dmg_rgb565[s[0] & LCD_COLOUR];
+        uint16_t b = s_palette_dmg_rgb565[s[1] & LCD_COLOUR];
         d[0] = a;
         d[1] = a;
         d[2] = b;
@@ -241,6 +246,8 @@ bool gb_emu_run(const uint8_t *rom_data, size_t rom_size)
     s_gb.direct.frame_skip = 1;
     s_gb.direct.joypad = 0xFF;
 
+    /* 矩阵键盘：app_main 已初始化，此处直接使用即可 */
+
     /* 初始化 APU */
     gb_audio_init();
 
@@ -253,6 +260,28 @@ bool gb_emu_run(const uint8_t *rom_data, size_t rom_size)
     const int64_t period_us = 16743;  /* 59.7Hz GB 原生帧时长 */
 
     while (!s_exit_requested) {
+        /* 读矩阵键盘位图 → 映射成 GB direct.joypad（0=按下，位布局见 walnut_cgb.h）
+         * 布局：R0C0=B  R0C1=UP  R0C2=A
+         *       R1C0=LEFT       R1C2=RIGHT
+         *       R2C0=SELECT R2C1=DOWN R2C2=START */
+        uint16_t kp = keypad_get_bits();
+        uint8_t pad = 0xFF;
+        if (kp & KEYPAD_BIT_R0C0) pad &= (uint8_t)~JOYPAD_B;
+        if (kp & KEYPAD_BIT_R0C1) pad &= (uint8_t)~JOYPAD_UP;
+        if (kp & KEYPAD_BIT_R0C2) pad &= (uint8_t)~JOYPAD_A;
+        if (kp & KEYPAD_BIT_R1C0) pad &= (uint8_t)~JOYPAD_LEFT;
+        if (kp & KEYPAD_BIT_R1C2) pad &= (uint8_t)~JOYPAD_RIGHT;
+        if (kp & KEYPAD_BIT_R2C0) pad &= (uint8_t)~JOYPAD_SELECT;
+        if (kp & KEYPAD_BIT_R2C1) pad &= (uint8_t)~JOYPAD_DOWN;
+        if (kp & KEYPAD_BIT_R2C2) pad &= (uint8_t)~JOYPAD_START;
+        s_gb.direct.joypad = pad;
+
+        /* 同时按 SELECT + START 视作退出游戏快捷键 */
+        if ((kp & (KEYPAD_BIT_R2C0 | KEYPAD_BIT_R2C2)) ==
+            (KEYPAD_BIT_R2C0 | KEYPAD_BIT_R2C2)) {
+            s_exit_requested = true;
+        }
+
         /* Walnut 的高性能入口：双指令取 + 链式执行 */
         gb_run_frame_dualfetch(&s_gb);
         flush_pending_dma();
