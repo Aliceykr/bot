@@ -1,6 +1,7 @@
 #include "game_runtime.h"
 #include "rom_loader.h"
 #include "gb_emu.h"
+#include "game_2048.h"
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -9,17 +10,30 @@
 
 #define TAG "GAME_RT"
 
+/* 内置游戏（非 ROM）使用的特殊 rom_name 前缀。
+ * ROM 列表传入这些名字时不走 SPIFFS 加载，直接调对应的内置游戏。 */
+#define BUILTIN_2048_NAME "__builtin_2048"
+
 static volatile bool s_exit_requested = false;
 
 void game_runtime_request_exit(void)
 {
     s_exit_requested = true;
     gb_emu_request_exit();
+    game_2048_request_exit();
 }
 
 void game_runtime_run(const char *rom_name)
 {
     s_exit_requested = false;
+
+    /* 内置游戏分派：不走 SPIFFS，直接跑对应的实现。
+     * 以后加新内置游戏（推箱子、贪吃蛇等）只需要在此处加分支。 */
+    if (rom_name && strcmp(rom_name, BUILTIN_2048_NAME) == 0) {
+        ESP_LOGI(TAG, "启动内置 2048");
+        game_2048_run();
+        return;
+    }
 
     /* 先显示一个加载画面 */
     LCD_Fill(0, 0, LCD_W, LCD_H, 0x0000);

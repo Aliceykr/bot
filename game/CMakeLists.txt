@@ -5,6 +5,7 @@ idf_component_register(
         "gb_emu.c"
         "gb_audio.c"
         "minigb_apu.c"
+        "game_2048.c"
     INCLUDE_DIRS
         "."
         "../user"
