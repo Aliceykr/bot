@@ -10,6 +10,9 @@
 
 /* 长按退出时长 */
 #define EXIT_HOLD_MS  800
+/* 消抖：要求连续 DEBOUNCE_N 次扫描一致才接受状态变化
+ * 每次 2ms，N=5 → 12ms 窗口，可过滤绝大多数机械抖动 */
+#define DEBOUNCE_N    5
 
 /* 引脚定义：与 keypad.h 中的布局一致 */
 static const gpio_num_t s_row_pins[3] = { GPIO_NUM_1, GPIO_NUM_2, GPIO_NUM_14 };
@@ -69,15 +72,22 @@ static void keypad_task(void *arg)
     (void)arg;
     uint16_t last = 0;
     uint16_t last_reported = 0;
+    int debounce_cnt = 0;
     uint32_t exit_hold_ms = 0;
     static char buf[128];
     while (1) {
         uint16_t cur = scan_once();
         if (cur == last) {
-            /* 菜单模式下 bits 强制返回 0，确保游戏外按键不会影响业务 */
+            if (debounce_cnt < DEBOUNCE_N) debounce_cnt++;
+        } else {
+            debounce_cnt = 0;
+        }
+        last = cur;
+
+        /* 连续 DEBOUNCE_N 次一致才接受新状态 */
+        if (debounce_cnt >= DEBOUNCE_N) {
             s_stable_bits = s_game_mode ? cur : 0;
 
-            /* 只有游戏模式才打日志 + 检测长按退出 */
             if (s_game_mode) {
                 if (cur != last_reported) {
                     static const char *const names[9] = {
@@ -100,11 +110,10 @@ static void keypad_task(void *arg)
                     last_reported = cur;
                 }
 
-                /* R1C1 长按 800ms → 退出标志
-                 * 必须是"只按着中间键"，其它键同按不计入（防误触）*/
+                /* R1C1 长按 800ms → 退出标志 */
                 if (cur == KEYPAD_BIT_R1C1) {
-                    exit_hold_ms += 2;  /* 每轮 2ms */
-                    if (exit_hold_ms == EXIT_HOLD_MS) {
+                    exit_hold_ms += 2;
+                    if (exit_hold_ms >= EXIT_HOLD_MS) {
                         ESP_LOGW(TAG, "中间键长按 %u ms，触发退出", (unsigned)EXIT_HOLD_MS);
                         s_exit_request = true;
                     }
@@ -112,12 +121,10 @@ static void keypad_task(void *arg)
                     exit_hold_ms = 0;
                 }
             } else {
-                /* 菜单模式下重置计数 */
                 exit_hold_ms = 0;
                 last_reported = 0;
             }
         }
-        last = cur;
         vTaskDelay(pdMS_TO_TICKS(2));
     }
 }

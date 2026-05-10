@@ -641,6 +641,11 @@ static lv_obj_t *sr_cmd_result_lbl  = NULL;
 static lv_obj_t *sr_cmd_status_lbl  = NULL;
 static lv_obj_t *sr_cmd_btn         = NULL;
 static bool sr_cmd_active = false;
+/* 进入 SR 界面前 WiFi 是否活跃：退出时据此决定是否 resume。
+ * ESP-SR 模型 + AFE pipeline 占用大量内部 DRAM，与 WiFi 驱动共存会让
+ * esp_timer_create 等内部 DRAM 分配失败 → abort 重启。懒加载边界：进入
+ * 前暂停 WiFi，退出后恢复。 */
+static bool sr_wifi_was_active = false;
 
 typedef struct {
     bool detected;
@@ -736,6 +741,14 @@ static void sr_cmd_back_cb(lv_event_t *e)
     sr_cmd_btn = NULL;
     /* 退出语音命令界面时释放 ESP-SR 资源，归还 DRAM */
     esp_sr_deinit();
+
+    /* 如果进入前 WiFi 是活跃的，这里恢复，保持体验一致 */
+    if (sr_wifi_was_active) {
+        ESP_LOGI("SR_CMD", "恢复 WiFi 连接");
+        wifi_resume_after_game();
+        sr_wifi_was_active = false;
+    }
+
     lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
     indev_set_group(group);
 }
@@ -769,8 +782,25 @@ static void show_ble_screen(void)
 
 static void show_sr_cmd_screen(void)
 {
+    /* ESP-SR 和 WiFi 驱动共存会让内部 DRAM 紧张，esp_timer_create 会
+     * ESP_ERR_NO_MEM 崩溃。进入前先暂停 WiFi，退出时恢复。 */
+    wifi_status_t wst = wifi_get_status();
+    sr_wifi_was_active = (wst == WIFI_STATUS_CONNECTED ||
+                          wst == WIFI_STATUS_CONNECTING ||
+                          wst == WIFI_STATUS_RECONNECTING);
+    if (sr_wifi_was_active) {
+        ESP_LOGI("SR_CMD", "WiFi 活跃，先挂起以释放 DRAM");
+        wifi_suspend_for_game();
+        vTaskDelay(pdMS_TO_TICKS(300));  /* 等 WiFi buffer 归还 */
+    }
+
     /* 懒加载 ESP-SR：仅在进入此界面时初始化，退出时释放 */
     if (!esp_sr_init()) {
+        /* init 失败了，把 WiFi 状态还原 */
+        if (sr_wifi_was_active) {
+            wifi_resume_after_game();
+            sr_wifi_was_active = false;
+        }
         create_result_dialog("ESP-SR 初始化失败\n检查 model 分区", 0xff0000);
         return;
     }
