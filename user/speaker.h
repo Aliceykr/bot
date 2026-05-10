@@ -40,4 +40,13 @@ void speaker_init(void);
  */
 int speaker_play(const int16_t *pcm, size_t len_bytes);
 
+/**
+ * @brief 丢弃 RingBuffer 中所有待播 PCM，立即静音
+ *
+ * 场景：退出游戏 / 切换界面 / 用户取消等。
+ * 不调用此函数时，模式切换后残留的旧音频还会播出 1-2 秒（ring 里 64KB 缓冲）。
+ * 本函数不停止 I2S 通道，spk_tx_task 清空后会自然进入"静音填充"状态。
+ */
+void speaker_flush(void);
+
 #endif /* __SPEAKER_H */

@@ -6,6 +6,9 @@
 #include "driver/i2s_std.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/ringbuf.h"
+#include "freertos/semphr.h"
+#include <string.h>
 
 #include "esp_afe_sr_models.h"
 #include "esp_afe_sr_iface.h"
@@ -30,6 +33,41 @@ static esp_sr_result_cb_t s_on_result = NULL;
 static i2s_chan_handle_t s_sr_rx_chan = NULL;
 static TaskHandle_t s_feed_task   = NULL;
 static TaskHandle_t s_detect_task = NULL;
+
+/* 任务退出同步锁：保护 s_read_task / s_feed_task / s_detect_task 句柄。
+ * 任务自删退出序列必须是"锁内清句柄 → 锁外 vTaskDelete(NULL)"，
+ * stop 路径硬杀也必须在锁内读 + 立刻 vTaskDelete(handle) + 清 NULL，
+ * 避免两者交叉时 stop 对已释放的 TCB 二次 delete 导致崩溃。 */
+static SemaphoreHandle_t s_task_mutex = NULL;
+
+/* ================================================================
+ * I2S → AFE 环形缓冲（PSRAM）
+ *
+ * 架构：三个角色解耦
+ *   读取任务（sr_read_task, Core 0）：持续从 I2S 读 32bit stereo，
+ *       转 16bit mono 写入 ringbuf。I2S 短暂错误可自恢复不退出。
+ *   feed 任务（sr_feed_task, Core 0）：从 ringbuf 取一块喂给 AFE。
+ *   detect 任务（sr_detect_task, Core 1）：AFE fetch + MultiNet detect。
+ *
+ * Ring buffer 作用：
+ *   - I2S 读速率偶发抖动时不会让 AFE 饿死
+ *   - 识别 ISR 里不能等 I2S 读，分离出来更平稳
+ *   - 大小够 ~500ms 音频（16kHz×16bit = 32KB/s × 0.5s = 16KB）。
+ *     ESP-SR 推理一帧 32ms，偶尔被游戏/WiFi 抢占 200ms 不会丢音
+ *
+ * 长时间运行的关键：
+ *   - 任何一个任务遇到错误必须自恢复，不能直接退出
+ *   - detect 任务永远循环，TIMEOUT/DETECTED 后都 clean 继续
+ * ================================================================ */
+#define RING_BUF_BYTES  (16 * 1024)
+static RingbufHandle_t s_pcm_ring = NULL;
+static TaskHandle_t    s_read_task = NULL;
+/* AFE 需要的每帧样本数；在 start 时填充以便所有任务共享 */
+static int s_afe_chunk_samples = 0;
+static int s_afe_nch = 1;
+
+static inline void sr_task_lock(void)   { if (s_task_mutex) xSemaphoreTake(s_task_mutex, portMAX_DELAY); }
+static inline void sr_task_unlock(void) { if (s_task_mutex) xSemaphoreGive(s_task_mutex); }
 
 /* ================================================================
  * I2S 管理（ESP-SR 专属 16bit mono，区别于 asr.c 的 32bit stereo）
@@ -67,106 +105,215 @@ static void sr_i2s_deinit(void)
 }
 
 /* ================================================================
- * feed 任务：读 I2S → 转 16bit mono（INMP441 仍出 32bit stereo）
- *           → 喂给 AFE
- * 绑 Core 0，优先级 6
+ * read 任务（Core 0）：I2S → 转 16bit mono → 写入 ring buffer
+ *
+ * 设计准则（长时间运行关键）：
+ *   - 任何 I2S read 错误都不退出，只记日志继续循环
+ *   - ring buffer 满时丢弃最早数据（xRingbufferSend 失败就跳过）
+ *   - 只在 s_listening=false 时才 break 退出
  * ================================================================ */
-static void sr_feed_task(void *arg)
+static void sr_read_task(void *arg)
 {
-    int afe_chunk = s_afe_handle->get_feed_chunksize(s_afe_data);
-    int afe_nch   = s_afe_handle->get_feed_channel_num(s_afe_data);
-
-    /* I2S 读缓冲：INMP441 需要 32bit stereo 读取，每批取 afe_chunk 个 mono 样本
-     * → 需要 afe_chunk 个 stereo 对 = afe_chunk * 2 个 int32_t */
-    int32_t *i2s_buf = heap_caps_malloc(afe_chunk * 2 * sizeof(int32_t), MALLOC_CAP_SPIRAM);
-    /* AFE feed 缓冲：afe_nch 通道 × afe_chunk 样本 × 2 字节 */
-    int16_t *afe_buf = malloc(afe_chunk * afe_nch * sizeof(int16_t));
-    if (!i2s_buf || !afe_buf) {
-        ESP_LOGE(TAG, "feed 任务缓冲分配失败");
-        free(i2s_buf); free(afe_buf);
-        s_listening = false;
-        vTaskDelete(NULL);
-        return;
+    (void)arg;
+    /* I2S 一次读 320ms 音频：INMP441 32bit stereo = 1 对 8 字节。
+     * 16kHz × 0.02s(一帧) × 8B = ~2.5KB 每 20ms 读一次。
+     * 缓冲开 4KB，读 512 对 stereo（= 16kHz × 32ms）。*/
+    const int I2S_PAIRS_PER_READ = 512;
+    int32_t *i2s_buf = heap_caps_malloc(I2S_PAIRS_PER_READ * 2 * sizeof(int32_t),
+                                         MALLOC_CAP_SPIRAM);
+    int16_t *mono_buf = heap_caps_malloc(I2S_PAIRS_PER_READ * sizeof(int16_t),
+                                          MALLOC_CAP_SPIRAM);
+    if (!i2s_buf || !mono_buf) {
+        ESP_LOGE(TAG, "read 任务缓冲分配失败");
+        goto read_exit;
     }
 
-    ESP_LOGI(TAG, "feed 任务启动, chunk=%d, nch=%d", afe_chunk, afe_nch);
+    ESP_LOGI(TAG, "read 任务启动, pairs_per_read=%d", I2S_PAIRS_PER_READ);
 
+    int err_count = 0;
     while (s_listening) {
         size_t bytes_read = 0;
         esp_err_t err = i2s_channel_read(s_sr_rx_chan, i2s_buf,
-                                          afe_chunk * 2 * sizeof(int32_t),
+                                          I2S_PAIRS_PER_READ * 2 * sizeof(int32_t),
                                           &bytes_read, pdMS_TO_TICKS(100));
-        if (err != ESP_OK || bytes_read == 0) continue;
         if (!s_listening) break;
 
-        int stereo_pairs = bytes_read / (2 * sizeof(int32_t));
-        int mono_samples = stereo_pairs < afe_chunk ? stereo_pairs : afe_chunk;
+        if (err != ESP_OK) {
+            if (++err_count < 5 || (err_count % 50) == 0) {
+                ESP_LOGW(TAG, "I2S read 失败: err=%d count=%d", err, err_count);
+            }
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        if (bytes_read == 0) continue;
+        err_count = 0;
 
-        /* 32bit stereo → 16bit mono（左声道，INMP441 L/R=GND） */
-        for (int i = 0; i < mono_samples; i++) {
-            int32_t raw = i2s_buf[i * 2];       /* 左声道 */
-            int32_t val = (raw >> 16) * 3;      /* 取高 16bit，放大 3x */
+        int pairs = bytes_read / (2 * sizeof(int32_t));
+        /* 32bit stereo → 16bit mono（左声道，INMP441 L/R=GND）*/
+        for (int i = 0; i < pairs; i++) {
+            int32_t raw = i2s_buf[i * 2];
+            int32_t val = (raw >> 16) * 3;
             if (val >  32767) val =  32767;
             if (val < -32768) val = -32768;
-            afe_buf[i] = (int16_t)val;
+            mono_buf[i] = (int16_t)val;
         }
 
-        /* 如果 AFE 需要多通道（如 "MR" 格式），ref 通道填 0 */
-        if (afe_nch > 1) {
-            for (int i = 0; i < mono_samples; i++) {
-                for (int ch = 1; ch < afe_nch; ch++) {
-                    afe_buf[i * afe_nch + ch] = 0;
-                }
+        /* 写入 ring buffer。满了等 10ms，仍满就丢这块（NoSplit）*/
+        BaseType_t sent = xRingbufferSend(s_pcm_ring, mono_buf,
+                                           pairs * sizeof(int16_t),
+                                           pdMS_TO_TICKS(10));
+        if (sent != pdTRUE) {
+            /* ring buffer 满：feed 任务处理不过来。通常是 detect 卡死或被抢占。
+             * 不阻塞，直接丢帧，保证 I2S 不堆积 */
+            static uint32_t drop_count = 0;
+            if ((++drop_count % 50) == 0) {
+                ESP_LOGW(TAG, "ring buffer 满，丢帧 #%u", (unsigned)drop_count);
             }
         }
-
-        s_afe_handle->feed(s_afe_data, afe_buf);
     }
 
-    free(i2s_buf);
-    free(afe_buf);
-    ESP_LOGI(TAG, "feed 任务退出");
+read_exit:
+    if (i2s_buf)  heap_caps_free(i2s_buf);
+    if (mono_buf) heap_caps_free(mono_buf);
+    ESP_LOGI(TAG, "read 任务退出");
+    sr_task_lock();
+    s_read_task = NULL;  /* 锁内清：stop 路径硬杀看不到悬空句柄 */
+    sr_task_unlock();
     vTaskDelete(NULL);
 }
 
 /* ================================================================
- * detect 任务：AFE fetch → MultiNet detect → 回调结果
- * 绑 Core 1，优先级 5
+ * feed 任务（Core 0）：从 ring buffer 取一帧 AFE 大小的数据喂给 AFE
+ *
+ * AFE 需要固定 chunk 大小（来自 get_feed_chunksize）。ring buffer 里
+ * 数据是可变长度 write，这里凑齐 chunk 再 feed。
+ *
+ * 长时间运行：
+ *   - AFE feed 本身是非阻塞的，不会失败
+ *   - 如果 ring buffer 空太久说明 read 任务挂了，持续重试
+ * ================================================================ */
+static void sr_feed_task(void *arg)
+{
+    (void)arg;
+    int chunk_samples = s_afe_chunk_samples;
+    int nch = s_afe_nch;
+
+    /* AFE 输入缓冲：nch 通道 × chunk 样本 × 2 字节 */
+    int16_t *afe_buf = heap_caps_malloc(chunk_samples * nch * sizeof(int16_t),
+                                         MALLOC_CAP_INTERNAL);
+    /* 累积缓冲：从 ringbuf 可能一次拿到不足 chunk，累积到够再 feed */
+    int16_t *accum = heap_caps_malloc(chunk_samples * sizeof(int16_t),
+                                       MALLOC_CAP_INTERNAL);
+    if (!afe_buf || !accum) {
+        ESP_LOGE(TAG, "feed 任务缓冲分配失败");
+        goto feed_exit;
+    }
+
+    ESP_LOGI(TAG, "feed 任务启动, chunk=%d, nch=%d", chunk_samples, nch);
+
+    int accum_pos = 0;  /* 当前累积的 mono 样本数（0..chunk_samples）*/
+    while (s_listening) {
+        /* 从 ring 取数据，最多等 100ms；取不到不退出，继续轮询 */
+        size_t got = 0;
+        int16_t *item = (int16_t *)xRingbufferReceive(s_pcm_ring, &got,
+                                                        pdMS_TO_TICKS(100));
+        if (!s_listening) {
+            if (item) vRingbufferReturnItem(s_pcm_ring, item);
+            break;
+        }
+        if (!item || got == 0) continue;
+
+        int items_samples = got / sizeof(int16_t);
+        int src_pos = 0;
+        /* 拷进 accum，满一个 chunk 就 feed 一次，循环直到 item 消费完 */
+        while (src_pos < items_samples) {
+            int to_copy = chunk_samples - accum_pos;
+            int available = items_samples - src_pos;
+            int n = to_copy < available ? to_copy : available;
+            memcpy(accum + accum_pos, item + src_pos, n * sizeof(int16_t));
+            accum_pos += n;
+            src_pos += n;
+
+            if (accum_pos == chunk_samples) {
+                /* 填充到 AFE 多通道布局（当前单麦，nch=1 时直接复制）*/
+                if (nch == 1) {
+                    memcpy(afe_buf, accum, chunk_samples * sizeof(int16_t));
+                } else {
+                    for (int i = 0; i < chunk_samples; i++) {
+                        afe_buf[i * nch] = accum[i];
+                        for (int ch = 1; ch < nch; ch++) {
+                            afe_buf[i * nch + ch] = 0;
+                        }
+                    }
+                }
+                s_afe_handle->feed(s_afe_data, afe_buf);
+                accum_pos = 0;
+            }
+        }
+        vRingbufferReturnItem(s_pcm_ring, item);
+    }
+
+feed_exit:
+    if (afe_buf) heap_caps_free(afe_buf);
+    if (accum)   heap_caps_free(accum);
+    ESP_LOGI(TAG, "feed 任务退出");
+    sr_task_lock();
+    s_feed_task = NULL;
+    sr_task_unlock();
+    vTaskDelete(NULL);
+}
+
+/* ================================================================
+ * detect 任务（Core 1）：AFE fetch → MultiNet detect → 回调结果
+ *
+ * 长时间运行：
+ *   - DETECTED：回调通知 UI → clean → 继续监听下一个命令
+ *   - TIMEOUT：clean 后继续（不再退出任务，ESP-SR 会不断给 TIMEOUT）
+ *   - AFE fetch 失败：短暂等待后重试（可能是 feed 暂时断了）
  * ================================================================ */
 static void sr_detect_task(void *arg)
 {
-    int afe_chunk = s_afe_handle->get_fetch_chunksize(s_afe_data);
-    int mn_chunk  = s_multinet->get_samp_chunksize(s_mn_data);
-    ESP_LOGI(TAG, "detect 任务启动, afe_chunk=%d, mn_chunk=%d", afe_chunk, mn_chunk);
+    (void)arg;
+    int mn_chunk = s_multinet->get_samp_chunksize(s_mn_data);
+    ESP_LOGI(TAG, "detect 任务启动, mn_chunk=%d", mn_chunk);
 
+    int fetch_err_count = 0;
     while (s_listening) {
         afe_fetch_result_t *res = s_afe_handle->fetch(s_afe_data);
-        if (!res || res->ret_value == ESP_FAIL) {
-            ESP_LOGW(TAG, "AFE fetch 失败");
-            break;
-        }
         if (!s_listening) break;
+
+        if (!res || res->ret_value == ESP_FAIL) {
+            if (++fetch_err_count < 5 || (fetch_err_count % 100) == 0) {
+                ESP_LOGW(TAG, "AFE fetch 失败 count=%d", fetch_err_count);
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        fetch_err_count = 0;
 
         esp_mn_state_t state = s_multinet->detect(s_mn_data, res->data);
 
         if (state == ESP_MN_STATE_DETECTED) {
             esp_mn_results_t *mn_res = s_multinet->get_results(s_mn_data);
-            if (s_on_result && mn_res->num > 0) {
+            if (s_on_result && mn_res && mn_res->num > 0) {
                 ESP_LOGI(TAG, "识别到命令: id=%d, str=%s, prob=%.2f",
                          mn_res->command_id[0], mn_res->string, mn_res->prob[0]);
                 s_on_result(mn_res->command_id[0], mn_res->string, mn_res->prob[0]);
             }
+            /* 重置 MultiNet 状态，继续监听下一个命令 */
             s_multinet->clean(s_mn_data);
         } else if (state == ESP_MN_STATE_TIMEOUT) {
-            ESP_LOGI(TAG, "命令识别超时");
-            if (s_on_result) {
-                s_on_result(-1, NULL, 0);
-            }
-            break;
+            /* 持续监听场景下 TIMEOUT 是常态（VAD 判断一句话结束）
+             * 静默 clean 继续，不通知 UI，不退出任务 */
+            s_multinet->clean(s_mn_data);
         }
+        /* 其他状态（ESP_MN_STATE_DETECTING / IDLE）不做处理，继续 fetch */
     }
 
     ESP_LOGI(TAG, "detect 任务退出");
+    sr_task_lock();
+    s_detect_task = NULL;
+    sr_task_unlock();
     vTaskDelete(NULL);
 }
 
@@ -176,10 +323,41 @@ static void sr_detect_task(void *arg)
 
 static bool s_sr_initialized = false;
 
+/* 释放 ESP-SR 资源（内部通用）：用于 init 失败回滚和 deinit 主路径。
+ * 单线程安全（外部调用者要保证 s_listening=false）。*/
+static void sr_free_resources(void)
+{
+    if (s_multinet && s_mn_data) {
+        s_multinet->destroy(s_mn_data);
+        s_mn_data = NULL;
+    }
+    s_multinet = NULL;
+
+    if (s_afe_handle && s_afe_data) {
+        s_afe_handle->destroy(s_afe_data);
+        s_afe_data = NULL;
+    }
+    s_afe_handle = NULL;
+
+    if (s_models) {
+        esp_srmodel_deinit(s_models);
+        s_models = NULL;
+    }
+}
+
 bool esp_sr_init(void)
 {
     /* 幂等：已初始化直接返回 */
     if (s_sr_initialized) return true;
+
+    /* 创建任务同步锁（跨 init/deinit 周期复用）*/
+    if (!s_task_mutex) {
+        s_task_mutex = xSemaphoreCreateMutex();
+        if (!s_task_mutex) {
+            ESP_LOGE(TAG, "task mutex 创建失败");
+            return false;
+        }
+    }
 
     ESP_LOGI(TAG, "初始化 ESP-SR...");
 
@@ -187,14 +365,14 @@ bool esp_sr_init(void)
     s_models = esp_srmodel_init("model");
     if (!s_models) {
         ESP_LOGE(TAG, "模型分区加载失败，请检查 partitions.csv 和 srmodels.bin");
-        return false;
+        goto init_fail;
     }
 
     /* 2. 找到 MultiNet7 CN 模型 */
     char *mn_name = esp_srmodel_filter(s_models, ESP_MN_PREFIX, ESP_MN_CHINESE);
     if (!mn_name) {
         ESP_LOGE(TAG, "未找到中文 MultiNet 模型");
-        return false;
+        goto init_fail;
     }
     ESP_LOGI(TAG, "MultiNet 模型: %s", mn_name);
 
@@ -202,7 +380,7 @@ bool esp_sr_init(void)
     afe_config_t *afe_cfg = afe_config_init("M", s_models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
     if (!afe_cfg) {
         ESP_LOGE(TAG, "AFE 配置创建失败");
-        return false;
+        goto init_fail;
     }
     afe_cfg->wakenet_init = false;      /* 不需要唤醒词 */
     afe_cfg->vad_init     = true;
@@ -215,25 +393,25 @@ bool esp_sr_init(void)
     if (!s_afe_handle) {
         ESP_LOGE(TAG, "AFE handle 创建失败");
         afe_config_free(afe_cfg);
-        return false;
+        goto init_fail;
     }
     s_afe_data = s_afe_handle->create_from_config(afe_cfg);
     afe_config_free(afe_cfg);
     if (!s_afe_data) {
         ESP_LOGE(TAG, "AFE 实例创建失败");
-        return false;
+        goto init_fail;
     }
 
     /* 4. 创建 MultiNet */
     s_multinet = esp_mn_handle_from_name(mn_name);
     if (!s_multinet) {
         ESP_LOGE(TAG, "MultiNet handle 创建失败");
-        return false;
+        goto init_fail;
     }
-    s_mn_data = s_multinet->create(mn_name, 6000);   /* 6 秒超时 */
+    s_mn_data = s_multinet->create(mn_name, 60000);   /* 60 秒超时：持续监听场景下延长，减少 TIMEOUT 清理频率 */
     if (!s_mn_data) {
         ESP_LOGE(TAG, "MultiNet 实例创建失败");
-        return false;
+        goto init_fail;
     }
 
     /* 5. 注册命令词（MultiNet7 要求拼音格式，空格分隔音节） */
@@ -259,6 +437,13 @@ bool esp_sr_init(void)
     ESP_LOGI(TAG, "PSRAM 剩余: %lu KB", (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
     s_sr_initialized = true;
     return true;
+
+init_fail:
+    /* 统一失败回滚：无论卡在哪一步，已分配的 s_models/s_afe_handle/s_afe_data/
+     * s_multinet/s_mn_data 都会被 sr_free_resources 释放干净，不留泄漏。
+     * 下次 esp_sr_init() 可以干净重试。 */
+    sr_free_resources();
+    return false;
 }
 
 bool esp_sr_start_listening(esp_sr_result_cb_t on_result)
@@ -284,24 +469,55 @@ bool esp_sr_start_listening(esp_sr_result_cb_t on_result)
         return false;
     }
 
-    /* 重置 MultiNet 状态 */
-    s_multinet->clean(s_mn_data);
-
-    s_listening = true;
-
-    /* 创建 feed 和 detect 任务 */
-    BaseType_t r1 = xTaskCreatePinnedToCore(sr_feed_task, "sr_feed", 4096, NULL, 6, &s_feed_task, 0);
-    BaseType_t r2 = xTaskCreatePinnedToCore(sr_detect_task, "sr_detect", 6144, NULL, 5, &s_detect_task, 1);
-
-    if (r1 != pdPASS || r2 != pdPASS) {
-        ESP_LOGE(TAG, "任务创建失败 feed=%ld detect=%ld", (long)r1, (long)r2);
-        s_listening = false;
+    /* 创建环形缓冲（I2S ↔ AFE 解耦）。
+     * v5.1.2 的 xRingbufferCreate 只能从 DRAM 分配，但 16KB 对目前
+     * 剩余 DRAM（SR 启动后 ~77KB）可接受。等升级 IDF 5.2+ 可换成
+     * xRingbufferCreateWithCaps 放 PSRAM 进一步省内存 */
+    s_pcm_ring = xRingbufferCreate(RING_BUF_BYTES, RINGBUF_TYPE_NOSPLIT);
+    if (!s_pcm_ring) {
+        ESP_LOGE(TAG, "ring buffer 创建失败");
         sr_i2s_deinit();
         asr_mic_reinit();
         return false;
     }
 
-    ESP_LOGI(TAG, "开始监听命令词...");
+    /* 预取 AFE chunk/nch 给 feed 任务共享 */
+    s_afe_chunk_samples = s_afe_handle->get_feed_chunksize(s_afe_data);
+    s_afe_nch           = s_afe_handle->get_feed_channel_num(s_afe_data);
+
+    /* 重置 MultiNet 状态 */
+    s_multinet->clean(s_mn_data);
+
+    s_listening = true;
+
+    /* 三个任务（按优先级从高到低）：
+     *   read 任务 prio=6（I2S 读取最及时）
+     *   feed 任务 prio=5（凑 AFE chunk）
+     *   detect 任务 prio=5（推理，独占 Core 1）
+     * 栈开得稍大，方便长时间运行下的日志和缓冲 */
+    BaseType_t r0 = xTaskCreatePinnedToCore(sr_read_task, "sr_read", 4096,
+                                             NULL, 6, &s_read_task, 0);
+    BaseType_t r1 = xTaskCreatePinnedToCore(sr_feed_task, "sr_feed", 4096,
+                                             NULL, 5, &s_feed_task, 0);
+    BaseType_t r2 = xTaskCreatePinnedToCore(sr_detect_task, "sr_detect", 6144,
+                                             NULL, 5, &s_detect_task, 1);
+
+    if (r0 != pdPASS || r1 != pdPASS || r2 != pdPASS) {
+        ESP_LOGE(TAG, "任务创建失败 read=%ld feed=%ld detect=%ld",
+                 (long)r0, (long)r1, (long)r2);
+        s_listening = false;
+        /* 等已起来的任务退出后再清资源 */
+        vTaskDelay(pdMS_TO_TICKS(200));
+        if (s_pcm_ring) {
+            vRingbufferDelete(s_pcm_ring);
+            s_pcm_ring = NULL;
+        }
+        sr_i2s_deinit();
+        asr_mic_reinit();
+        return false;
+    }
+
+    ESP_LOGI(TAG, "开始监听命令词（持续模式）...");
     return true;
 }
 
@@ -311,22 +527,40 @@ void esp_sr_stop_listening(void)
     s_listening = false;
     s_on_result = NULL;
 
-    /* 先等 feed 任务退出（I2S read 最多阻塞 100ms，循环检查确保它真正结束） */
-    for (int i = 0; i < 20 && s_feed_task != NULL; i++) {
-        eTaskState st = eTaskGetState(s_feed_task);
-        if (st == eDeleted || st == eInvalid) { s_feed_task = NULL; break; }
+    /* 等三个任务检测到 s_listening=false 后退出。
+     * read 任务最多阻塞在 i2s_read 100ms；feed 任务阻塞在 ringbuf recv 100ms；
+     * detect 任务可能在 MultiNet 推理中（<500ms）。给 2 秒总容差。*/
+    const int total_wait_steps = 40;  /* 40 × 50ms = 2s */
+    for (int i = 0; i < total_wait_steps; i++) {
+        sr_task_lock();
+        bool all_gone = (s_read_task == NULL) &&
+                        (s_feed_task == NULL) &&
+                        (s_detect_task == NULL);
+        sr_task_unlock();
+        if (all_gone) break;
         vTaskDelay(pdMS_TO_TICKS(50));
     }
-    s_feed_task = NULL;
 
-    /* detect 任务依赖 feed 产出的数据。feed 停了后 fetch 会很快返回失败。
-     * 最多等 2 秒（detect 可能在做 MultiNet 推理） */
-    for (int i = 0; i < 40 && s_detect_task != NULL; i++) {
-        eTaskState st = eTaskGetState(s_detect_task);
-        if (st == eDeleted || st == eInvalid) { s_detect_task = NULL; break; }
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
+    /* 如果还有任务没退出，硬杀（极少发生）。
+     * 在锁内完成"读句柄 + delete + 清 NULL"三步，与任务自退出（锁内清 NULL）
+     * 互斥，避免两者交叉时 stop 对已释放 TCB 二次 delete。*/
+    sr_task_lock();
+    TaskHandle_t to_kill[3] = { s_read_task, s_feed_task, s_detect_task };
+    s_read_task = NULL;
+    s_feed_task = NULL;
     s_detect_task = NULL;
+    sr_task_unlock();
+    for (int i = 0; i < 3; i++) {
+        if (to_kill[i]) {
+            ESP_LOGW(TAG, "硬杀未退出的任务 %p", to_kill[i]);
+            vTaskDelete(to_kill[i]);
+        }
+    }
+
+    if (s_pcm_ring) {
+        vRingbufferDelete(s_pcm_ring);
+        s_pcm_ring = NULL;
+    }
 
     /* 任务已退出，安全释放 I2S */
     sr_i2s_deinit();
@@ -351,25 +585,8 @@ void esp_sr_deinit(void)
 
     ESP_LOGI(TAG, "释放 ESP-SR 资源...");
 
-    /* 释放 MultiNet 实例 */
-    if (s_multinet && s_mn_data) {
-        s_multinet->destroy(s_mn_data);
-        s_mn_data = NULL;
-    }
-    s_multinet = NULL;
-
-    /* 释放 AFE 实例 */
-    if (s_afe_handle && s_afe_data) {
-        s_afe_handle->destroy(s_afe_data);
-        s_afe_data = NULL;
-    }
-    s_afe_handle = NULL;
-
-    /* 释放模型列表 */
-    if (s_models) {
-        esp_srmodel_deinit(s_models);
-        s_models = NULL;
-    }
+    /* 统一走内部清理：和 init 失败回滚共用代码 */
+    sr_free_resources();
 
     s_sr_initialized = false;
     ESP_LOGI(TAG, "ESP-SR 资源已释放, 内部 RAM 剩余: %lu KB",

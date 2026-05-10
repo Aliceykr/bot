@@ -438,6 +438,17 @@ static void chat_back_btn_cb(lv_event_t *e)
     // 清空对话记录
     memset(chat_log, 0, sizeof(chat_log));
     chat_fetching = false;
+
+    /* 排空 chat_result_queue：用户退出时后台 chat_fetch_task 可能还没完成，
+     * 如果不清空，下次进入聊天后定时器会先消费这条"上一轮的残留回复"，
+     * 显示顺序错乱（新问题下面先出现上一轮的答案）。 */
+    if (chat_result_queue) {
+        chat_result_t drop;
+        while (xQueueReceive(chat_result_queue, &drop, 0) == pdTRUE) {
+            /* 直接丢弃，不处理 */
+        }
+    }
+
     chat_log_label = NULL;
     chat_input = NULL;
     chat_keyboard = NULL;
@@ -626,9 +637,20 @@ static void asr_back_cb(lv_event_t *e)
     asr_result_label = NULL;
     asr_status_label = NULL;
     asr_btn = NULL;
-    /* asr_llm_result_queue 保留复用，不删不置 NULL。
-     * 下次进入界面时 if(!asr_llm_result_queue) 不会重建，避免旧 queue 泄漏。
-     * 残留的未消费消息会在下次 timer 里被 xQueueReceive 消费掉。 */
+
+    /* 排空两个 result queue：用户退出时后台 asr_recognize_task / asr_llm_task
+     * 可能还没跑完，如果不清空，下次进入界面会先消费上一轮的残留结果，
+     * 显示给用户看到错乱的"上次提问的回答"。
+     * queue 本身保留不删（复用避免重建），只清空其中的未消费消息。 */
+    if (asr_result_queue) {
+        asr_task_result_t drop;
+        while (xQueueReceive(asr_result_queue, &drop, 0) == pdTRUE) { }
+    }
+    if (asr_llm_result_queue) {
+        chat_result_t drop;
+        while (xQueueReceive(asr_llm_result_queue, &drop, 0) == pdTRUE) { }
+    }
+
     lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
     indev_set_group(group);
 }
@@ -671,7 +693,13 @@ static void sr_cmd_result_cb(int id, const char *text, float prob)
     }
 }
 
-/* LVGL timer 轮询识别结果 */
+/* LVGL timer 轮询识别结果
+ *
+ * 持续监听模式下：
+ *   - 收到命令词（res.detected=true）→ 显示结果，监听**继续**，不停不重启
+ *   - ESP-SR 现在不再上报 TIMEOUT 结果（detect 任务内部静默 clean 了），
+ *     所以不会误判为"超时结束"
+ *   - 用户手动点"停止识别"按钮才真正停下来 */
 static void sr_cmd_timer_cb(lv_timer_t *t)
 {
     if (!sr_cmd_scr || !lv_obj_is_valid(sr_cmd_scr)) {
@@ -683,21 +711,12 @@ static void sr_cmd_timer_cb(lv_timer_t *t)
     sr_cmd_ui_result_t res;
     if (xQueueReceive(sr_cmd_result_queue, &res, 0) != pdTRUE) return;
 
-    sr_cmd_active = false;
-    lv_obj_set_style_bg_color(sr_cmd_btn, lv_color_hex(0x16213e), 0);
-    lv_obj_t *btn_lbl = lv_obj_get_child(sr_cmd_btn, 0);
-    if (btn_lbl) lv_label_set_text(btn_lbl, "开始识别");
-
     if (res.detected) {
         lv_label_set_text_fmt(sr_cmd_result_lbl, "识别: %s\n置信度: %.0f%%",
                               res.command_str, res.probability * 100);
-        lv_label_set_text(sr_cmd_status_lbl, "识别成功");
-    } else {
-        lv_label_set_text(sr_cmd_result_lbl, "未识别到命令");
-        lv_label_set_text(sr_cmd_status_lbl, "超时");
+        lv_label_set_text(sr_cmd_status_lbl, "识别成功，继续监听...");
     }
-
-    esp_sr_stop_listening();
+    /* 不关闭 listener，UI 保持"停止识别"按钮状态 */
 }
 
 static void sr_cmd_btn_cb(lv_event_t *e)
@@ -729,24 +748,53 @@ static void sr_cmd_btn_cb(lv_event_t *e)
     }
 }
 
+/* 后台任务：执行 ESP-SR 关闭 + 可选的 WiFi 恢复。
+ * sr_cmd_back_cb 里调 esp_sr_stop_listening/deinit 最长阻塞 2 秒，
+ * 如果在 LVGL 线程里做会冻结动画/输入。独立任务跑保证 UI 流畅。 */
+typedef struct {
+    bool resume_wifi;
+} sr_teardown_arg_t;
+
+static void sr_teardown_task(void *arg)
+{
+    sr_teardown_arg_t *a = (sr_teardown_arg_t *)arg;
+    bool resume_wifi = a ? a->resume_wifi : false;
+    if (a) free(a);
+
+    esp_sr_deinit();  /* 内部如在监听会先 stop_listening，最长 ~2 秒 */
+
+    if (resume_wifi) {
+        ESP_LOGI("SR_CMD", "恢复 WiFi 连接");
+        wifi_resume_after_game();
+    }
+    vTaskDelete(NULL);
+}
+
 static void sr_cmd_back_cb(lv_event_t *e)
 {
     if (sr_cmd_active) {
-        esp_sr_stop_listening();
+        /* 不在这里阻塞调 stop_listening，交给后台 teardown 任务 */
         sr_cmd_active = false;
     }
     sr_cmd_scr = NULL;
     sr_cmd_result_lbl = NULL;
     sr_cmd_status_lbl = NULL;
     sr_cmd_btn = NULL;
-    /* 退出语音命令界面时释放 ESP-SR 资源，归还 DRAM */
-    esp_sr_deinit();
 
-    /* 如果进入前 WiFi 是活跃的，这里恢复，保持体验一致 */
-    if (sr_wifi_was_active) {
-        ESP_LOGI("SR_CMD", "恢复 WiFi 连接");
-        wifi_resume_after_game();
+    /* 后台做重活：esp_sr_deinit + wifi_resume_after_game
+     * LVGL 线程直接切屏，不卡顿。*/
+    sr_teardown_arg_t *arg = malloc(sizeof(sr_teardown_arg_t));
+    if (arg) {
+        arg->resume_wifi = sr_wifi_was_active;
         sr_wifi_was_active = false;
+        xTaskCreate(sr_teardown_task, "sr_td", 4096, arg, 3, NULL);
+    } else {
+        /* malloc 失败时 fallback 同步做，至少不丢释放 */
+        esp_sr_deinit();
+        if (sr_wifi_was_active) {
+            wifi_resume_after_game();
+            sr_wifi_was_active = false;
+        }
     }
 
     lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
@@ -1058,7 +1106,8 @@ static void wifi_connect_task(void *arg)
 }
 
 /* 启动 WiFi 连接流程（弹 spinner + 起后台任务）。
- * 被 WiFi 菜单项和蓝牙配网回调共用，避免重复逻辑。
+ * 仅由蓝牙配网回调调用：BLE 收到凭据 → deinit BLE → 调本函数连 WiFi。
+ * （菜单里已去掉独立的"WiFi 连接"入口，配网后自动触发是唯一入口）
  * 必须在 LVGL 上下文调用（创建 UI 对象不是线程安全的），
  * 非 LVGL 调用方用 lv_async_call 投递过来。 */
 static void start_wifi_connection_flow(void)
@@ -1352,8 +1401,10 @@ static void list_event_cb(lv_event_t *e)
     lv_obj_t *label = lv_obj_get_child(btn, 1);
     const char *txt = lv_label_get_text(label);
 
-    if (strstr(txt, "WiFi")) {
-        start_wifi_connection_flow();
+    if (strstr(txt, "环境监测")) {
+        /* TODO: 接入 DHT22 / WS2812 等传感器，显示温湿度/光照等环境数据。
+         * 占位：先弹提示窗。 */
+        create_result_dialog("环境监测\n功能开发中", 0x00cfff);
     } else if (strstr(txt, "天气")) {
         /* 天气依赖 HTTP API，必须联网 */
         if (wifi_get_status() != WIFI_STATUS_CONNECTED) {
@@ -1407,7 +1458,7 @@ void my_demo(void)
     lv_obj_set_style_radius(list, 4, 0);
 
     static const char *icons[] = {
-        LV_SYMBOL_WIFI,
+        LV_SYMBOL_CHARGE,      /* 环境监测：温湿度传感器数据 */
         LV_SYMBOL_EYE_OPEN,
         LV_SYMBOL_PLAY,        /* 游戏：用 PLAY 图标 */
         LV_SYMBOL_CALL,
@@ -1416,7 +1467,7 @@ void my_demo(void)
         LV_SYMBOL_BLUETOOTH,   /* 蓝牙配网 */
     };
     static const char *labels[] = {
-        "WiFi 连接",
+        "环境监测",
         "天气与日期",
         "游戏",
         "聊天助手",

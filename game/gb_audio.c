@@ -101,10 +101,14 @@ void gb_audio_init(void)
 
 void gb_audio_deinit(void)
 {
-    /* 销毁 APU 任务和信号量，彻底释放 ram。
-     * 先删任务（停止消费信号量），再删信号量，防止 APU 任务持有的
-     * 信号量被销毁后仍然访问。任务删除是同步的，vTaskDelete 后立即
-     * 从调度器摘除。*/
+    /* 退出游戏时音频清理顺序严格：
+     *   1. 删 APU 任务：停止往 speaker 推新 PCM
+     *   2. 删信号量：防止悬空使用
+     *   3. speaker_flush：把 ring buffer 里积的最多 2 秒游戏音频丢掉
+     *      否则 spk_tx_task 会继续播这些残留数据，退出后还能听见最后
+     *      一两秒的游戏声音，体验非常突兀。
+     *
+     * 任务删除是同步的，vTaskDelete 后立即从调度器摘除。 */
     if (s_apu_task) {
         vTaskDelete(s_apu_task);
         s_apu_task = NULL;
@@ -113,6 +117,9 @@ void gb_audio_deinit(void)
         vSemaphoreDelete(s_frame_signal);
         s_frame_signal = NULL;
     }
+
+    /* 清空 speaker ring buffer，立刻静音。 */
+    speaker_flush();
 }
 
 /* 主线程调：通知 APU 任务"该合成一帧了"。几乎零开销。 */

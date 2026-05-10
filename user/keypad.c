@@ -74,6 +74,9 @@ static void keypad_task(void *arg)
     uint16_t last_reported = 0;
     int debounce_cnt = 0;
     uint32_t exit_hold_ms = 0;
+    /* exit_latched：本次按下周期内已经触发过退出请求。
+     * 只在用户松开中间键后清零，避免"消费者 consume 后用户还按着"时重复触发。 */
+    bool exit_latched = false;
     static char buf[128];
     while (1) {
         uint16_t cur = scan_once();
@@ -110,18 +113,24 @@ static void keypad_task(void *arg)
                     last_reported = cur;
                 }
 
-                /* R1C1 长按 800ms → 退出标志 */
+                /* R1C1 长按 800ms → 退出标志（只触发一次）
+                 * 用 exit_latched 本地锁存：本次按住周期内只触发一次，
+                 * 消费者 consume 后不会因为用户还按着导致重复触发。
+                 * 松开中间键（else 分支）清零 exit_hold_ms 和 latched，下次长按重新生效。 */
                 if (cur == KEYPAD_BIT_R1C1) {
                     exit_hold_ms += 2;
-                    if (exit_hold_ms >= EXIT_HOLD_MS) {
+                    if (exit_hold_ms >= EXIT_HOLD_MS && !exit_latched) {
                         ESP_LOGW(TAG, "中间键长按 %u ms，触发退出", (unsigned)EXIT_HOLD_MS);
                         s_exit_request = true;
+                        exit_latched = true;
                     }
                 } else {
                     exit_hold_ms = 0;
+                    exit_latched = false;
                 }
             } else {
                 exit_hold_ms = 0;
+                exit_latched = false;
                 last_reported = 0;
             }
         }
