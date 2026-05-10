@@ -3,6 +3,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -31,6 +32,14 @@ static bool s_has_connected_once = false;  /* 至少连接成功过一次（用�
 /* 动态凭据（蓝牙配网写入，wifi_connect 使用） */
 static char s_ssid[33]     = WIFI_SSID;
 static char s_password[65] = WIFI_PASSWORD;
+
+/* 状态互斥锁：保护 s_status / s_user_stopped / s_ip_str 等在事件回调、
+ * 守护任务、公开 API 之间的并发读写。
+ * 在 wifi_connect（首次调用）中创建，消除 lazy-init 竞态窗口。 */
+static SemaphoreHandle_t s_wifi_mutex = NULL;
+
+#define WIFI_LOCK()   do { if (s_wifi_mutex) xSemaphoreTake(s_wifi_mutex, portMAX_DELAY); } while(0)
+#define WIFI_UNLOCK() do { if (s_wifi_mutex) xSemaphoreGive(s_wifi_mutex); } while(0)
 
 /* 守护任务：运行期断线时指数退避重连，永不放弃 */
 static TaskHandle_t s_guardian_handle = NULL;
@@ -116,10 +125,12 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "正在连接 WiFi...");
 
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        WIFI_LOCK();
         if (s_user_stopped) {
             /* 用户主动断开，不重连 */
             s_status = WIFI_STATUS_DISCONNECTED;
             memcpy(s_ip_str, "0.0.0.0", 8);
+            WIFI_UNLOCK();
             return;
         }
 
@@ -130,17 +141,20 @@ static void event_handler(void *arg, esp_event_base_t event_base,
             if (s_retry_count < WIFI_MAX_RETRY) {
                 s_retry_count++;
                 s_status = WIFI_STATUS_CONNECTING;
+                WIFI_UNLOCK();
                 ESP_LOGW(TAG, "首次连接失败，第 %d/%d 次重连...",
                          s_retry_count, WIFI_MAX_RETRY);
                 esp_wifi_connect();
             } else {
                 s_status = WIFI_STATUS_FAILED;
+                WIFI_UNLOCK();
                 ESP_LOGE(TAG, "首次连接失败：已重试 %d 次", WIFI_MAX_RETRY);
                 xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
             }
         } else {
             /* 运行期断线：交给守护任务指数退避重连 */
             s_status = WIFI_STATUS_RECONNECTING;
+            WIFI_UNLOCK();
             ESP_LOGW(TAG, "运行期断线，通知守护任务重连");
             if (s_guardian_handle) {
                 xTaskNotify(s_guardian_handle, GUARDIAN_NOTIFY_DISCONNECT, eSetBits);
@@ -149,11 +163,13 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        WIFI_LOCK();
         snprintf(s_ip_str, sizeof(s_ip_str), IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_count = 0;
         s_backoff_idx = 0;
         s_status = WIFI_STATUS_CONNECTED;
         s_has_connected_once = true;
+        WIFI_UNLOCK();
         ESP_LOGI(TAG, "WiFi 已连接，IP: %s", s_ip_str);
 
         /* 首次连接成功后启动守护任务 */
@@ -172,6 +188,8 @@ static void event_handler(void *arg, esp_event_base_t event_base,
  * ================================================================ */
 bool wifi_connect(void)
 {
+    /* 首次调用时创建 mutex，消除 lazy-init 竞态 */
+    if (!s_wifi_mutex) s_wifi_mutex = xSemaphoreCreateMutex();
     /* 初始化 NVS（已在 app_main 做过一次，此处幂等重复调用是安全的：
      * nvs_flash_init 第二次起会直接返回 ESP_OK 不做动作）*/
     esp_err_t ret = nvs_flash_init();
@@ -200,8 +218,10 @@ bool wifi_connect(void)
                 .threshold.authmode = WIFI_AUTH_WPA_PSK,
             },
         };
-        strncpy((char *)wifi_config.sta.ssid, s_ssid, sizeof(wifi_config.sta.ssid) - 1);
-        strncpy((char *)wifi_config.sta.password, s_password, sizeof(wifi_config.sta.password) - 1);
+        memcpy(wifi_config.sta.ssid, s_ssid, sizeof(wifi_config.sta.ssid));
+        wifi_config.sta.ssid[sizeof(wifi_config.sta.ssid) - 1] = '\0';
+        memcpy(wifi_config.sta.password, s_password, sizeof(wifi_config.sta.password));
+        wifi_config.sta.password[sizeof(wifi_config.sta.password) - 1] = '\0';
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
         s_initialized = true;
@@ -245,15 +265,20 @@ bool wifi_connect(void)
 
 void wifi_disconnect(void)
 {
+    WIFI_LOCK();
     s_user_stopped = true;
+    WIFI_UNLOCK();
     esp_wifi_disconnect();
     esp_wifi_stop();
+    WIFI_LOCK();
     s_status = WIFI_STATUS_DISCONNECTED;
     memcpy(s_ip_str, "0.0.0.0", 8);
+    WIFI_UNLOCK();
 }
 
 wifi_status_t wifi_get_status(void)
 {
+    /* 单字段读取，volatile 语义足够，不加锁避免高频调用开销 */
     return s_status;
 }
 
@@ -269,20 +294,25 @@ const char *wifi_get_ip(void)
 
 void wifi_suspend_for_game(void)
 {
-    /* 置 user_stopped 防止 DISCONNECTED 事件被守护任务当成异常重连 */
+    WIFI_LOCK();
     s_user_stopped = true;
+    WIFI_UNLOCK();
     esp_wifi_disconnect();
     esp_wifi_stop();
+    WIFI_LOCK();
     s_status = WIFI_STATUS_DISCONNECTED;
     memcpy(s_ip_str, "0.0.0.0", 8);
+    WIFI_UNLOCK();
     ESP_LOGI(TAG, "WiFi 已为游戏暂停");
 }
 
 void wifi_resume_after_game(void)
 {
-    if (!s_initialized) return;  /* 从未连过 WiFi，跳过 */
+    if (!s_initialized) return;
+    WIFI_LOCK();
     s_user_stopped = false;
     s_backoff_idx = 0;
+    WIFI_UNLOCK();
     esp_err_t err = esp_wifi_start();
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "wifi_resume: esp_wifi_start 返回 %d", err);
@@ -294,17 +324,17 @@ void wifi_resume_after_game(void)
 void wifi_set_credentials(const char *ssid, const char *password)
 {
     if (!ssid || !password) return;
-    strncpy(s_ssid, ssid, sizeof(s_ssid) - 1);
-    s_ssid[sizeof(s_ssid) - 1] = '\0';
-    strncpy(s_password, password, sizeof(s_password) - 1);
-    s_password[sizeof(s_password) - 1] = '\0';
+    snprintf(s_ssid, sizeof(s_ssid), "%s", ssid);
+    snprintf(s_password, sizeof(s_password), "%s", password);
     ESP_LOGI(TAG, "凭据已更新: SSID=%s", s_ssid);
 
     /* 如果 WiFi 已初始化，立即更新驱动配置 */
     if (s_initialized) {
         wifi_config_t cfg = { .sta = { .threshold.authmode = WIFI_AUTH_WPA_PSK } };
-        strncpy((char *)cfg.sta.ssid, s_ssid, sizeof(cfg.sta.ssid) - 1);
-        strncpy((char *)cfg.sta.password, s_password, sizeof(cfg.sta.password) - 1);
+        memcpy(cfg.sta.ssid, s_ssid, sizeof(cfg.sta.ssid));
+        cfg.sta.ssid[sizeof(cfg.sta.ssid) - 1] = '\0';
+        memcpy(cfg.sta.password, s_password, sizeof(cfg.sta.password));
+        cfg.sta.password[sizeof(cfg.sta.password) - 1] = '\0';
         esp_wifi_set_config(WIFI_IF_STA, &cfg);
     }
 }

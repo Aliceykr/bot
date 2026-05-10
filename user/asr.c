@@ -28,6 +28,8 @@ static i2s_chan_handle_t s_rx_chan = NULL;
  * 常驻，通过 s_rec_active 标志控制启停，不录音时阻塞等通知 */
 static TaskHandle_t   s_rec_task   = NULL;
 static volatile bool  s_rec_active = false;
+/* 调用 asr_record_stop 的任务句柄，录音任务停止后通知它 */
+static TaskHandle_t   s_stop_waiter = NULL;
 
 // ================================================================
 // HTTP 响应缓冲（PSRAM 动态扩容）
@@ -41,11 +43,9 @@ static size_t  s_http_cap = 0;
 static size_t  s_http_len = 0;
 static bool    s_http_overflow = false;
 
-/* 互斥锁：保护 s_http_buf（识别路径），录音任务独立不受影响 */
+/* 互斥锁：保护 s_http_buf（识别路径），录音任务独立不受影响。
+ * 在 asr_mic_init 中提前创建，消除首次并发窗口。 */
 static SemaphoreHandle_t s_recog_mutex = NULL;
-static void ensure_recog_mutex(void) {
-    if (!s_recog_mutex) s_recog_mutex = xSemaphoreCreateMutex();
-}
 
 /* 前向声明：asr_mic_init 需要创建该任务 */
 static void asr_rec_task(void *arg);
@@ -123,6 +123,9 @@ void asr_mic_init(void)
     i2s_channel_init_std_mode(s_rx_chan, &std_cfg);
     ESP_LOGI(TAG, "I2S 初始化完成 SCK=%d WS=%d SD=%d", MIC_SCK_PIN, MIC_WS_PIN, MIC_SD_PIN);
 
+    /* 提前创建识别互斥锁，消除 lazy-init 竞态窗口 */
+    if (!s_recog_mutex) s_recog_mutex = xSemaphoreCreateMutex();
+
     /* 启动常驻录音任务。优先级 5：略高于 LVGL 任务(4)保证 I2S 及时读取，
      * 低于 encoder_task(6) 避免挤掉高频输入 */
     if (!s_rec_task) {
@@ -142,6 +145,11 @@ static void asr_rec_task(void *arg)
     static int32_t tmp[1024];  /* STEREO: 512 对样本。static 避免栈膨胀 */
     while (1) {
         if (!s_rec_active) {
+            /* 通知 stop 调用者（如果有人在等） */
+            if (s_stop_waiter) {
+                xTaskNotifyGive(s_stop_waiter);
+                s_stop_waiter = NULL;
+            }
             /* 空闲：阻塞等 start 唤醒 */
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
             continue;
@@ -204,9 +212,12 @@ uint32_t asr_record_stop(void)
     if (!s_recording) return 0;
     s_recording  = false;
     s_rec_active = false;
-    /* 等录音任务完成当前 i2s_channel_read（最多 100ms）后再 disable。
-     * 简单 sleep 150ms 足以确保任务退出 read 循环，不会撞到 disable 期间的读取。*/
-    vTaskDelay(pdMS_TO_TICKS(150));
+    /* 设置当前任务为 stop 等待者，录音任务退出循环后会 notify */
+    s_stop_waiter = xTaskGetCurrentTaskHandle();
+    /* 等录音任务确认停止：任务检测到 s_rec_active=false 后会发通知。
+     * 最多等 200ms（i2s_channel_read 超时 100ms + 余量），
+     * 超时也继续 disable，不会死锁。 */
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
     if (s_rx_chan) i2s_channel_disable(s_rx_chan);
 
     uint32_t pos   = s_rec_pos;
@@ -272,7 +283,6 @@ void asr_mic_reinit(void)
 // ================================================================
 bool asr_recognize(uint32_t audio_len_bytes, asr_result_t *out)
 {
-    ensure_recog_mutex();
     if (s_recog_mutex) xSemaphoreTake(s_recog_mutex, portMAX_DELAY);
 
     bool ret = false;

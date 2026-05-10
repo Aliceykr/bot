@@ -128,7 +128,7 @@ static void gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_
 
         esp_bt_uuid_t rx_uuid = { .len = ESP_UUID_LEN_16, .uuid.uuid16 = CHR_RX_UUID };
         esp_ble_gatts_add_char(s_service_handle, &rx_uuid,
-                               ESP_GATT_PERM_WRITE,
+                               ESP_GATT_PERM_WRITE_ENCRYPTED,
                                ESP_GATT_CHAR_PROP_BIT_WRITE, NULL, NULL);
 
         esp_bt_uuid_t tx_uuid = { .len = ESP_UUID_LEN_16, .uuid.uuid16 = CHR_TX_UUID };
@@ -230,8 +230,7 @@ bool ble_prov_init(void)
         return false;
     }
 
-    esp_bluedroid_config_t bluedroid_cfg = BT_BLUEDROID_INIT_CONFIG_DEFAULT();
-    ret = esp_bluedroid_init_with_cfg(&bluedroid_cfg);
+    ret = esp_bluedroid_init();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Bluedroid 初始化失败: %s", esp_err_to_name(ret));
         return false;

@@ -621,7 +621,9 @@ static void asr_back_cb(lv_event_t *e)
     asr_result_label = NULL;
     asr_status_label = NULL;
     asr_btn = NULL;
-    asr_llm_result_queue = NULL;  /* 置空指针，避免 use-after-free，下次进入界面时重建 */
+    /* asr_llm_result_queue 保留复用，不删不置 NULL。
+     * 下次进入界面时 if(!asr_llm_result_queue) 不会重建，避免旧 queue 泄漏。
+     * 残留的未消费消息会在下次 timer 里被 xQueueReceive 消费掉。 */
     lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
     indev_set_group(group);
 }
