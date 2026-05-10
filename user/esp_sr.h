@@ -7,8 +7,13 @@
 typedef void (*esp_sr_result_cb_t)(int command_id, const char *command_text, float probability);
 
 /* 初始化 ESP-SR：加载模型、创建 AFE（WakeNet 禁用）+ MultiNet7 CN、注册命令词。
- * 在 app_main 中调用一次。返回 true 表示模型加载成功。 */
+ * 懒加载：仅在进入语音命令界面时调用，不在 app_main 常驻。
+ * 返回 true 表示模型加载成功。重复调用幂等（已初始化直接返回 true）。 */
 bool esp_sr_init(void);
+
+/* 释放 ESP-SR 所有资源（AFE + MultiNet + 模型列表），归还 DRAM。
+ * 退出语音命令界面时调用。未初始化时调用无副作用。 */
+void esp_sr_deinit(void);
 
 /* 启动命令词识别（按键触发）。
  * 内部：asr_mic_deinit() → 创建 ESP-SR 专属 I2S_NUM_0 → 启动 feed/detect 任务。

@@ -174,8 +174,13 @@ static void sr_detect_task(void *arg)
  * 公共 API
  * ================================================================ */
 
+static bool s_sr_initialized = false;
+
 bool esp_sr_init(void)
 {
+    /* 幂等：已初始化直接返回 */
+    if (s_sr_initialized) return true;
+
     ESP_LOGI(TAG, "初始化 ESP-SR...");
 
     /* 1. 加载模型列表 */
@@ -231,20 +236,20 @@ bool esp_sr_init(void)
         return false;
     }
 
-    /* 5. 注册命令词 */
+    /* 5. 注册命令词（MultiNet7 要求拼音格式，空格分隔音节） */
     esp_mn_commands_alloc(s_multinet, s_mn_data);
 
-    esp_mn_commands_add(1,  "返回");
-    esp_mn_commands_add(2,  "确认");
-    esp_mn_commands_add(3,  "取消");
-    esp_mn_commands_add(10, "连接网络");
-    esp_mn_commands_add(11, "查看天气");
-    esp_mn_commands_add(12, "打开游戏");
-    esp_mn_commands_add(13, "打开聊天");
-    esp_mn_commands_add(14, "语音助手");
-    esp_mn_commands_add(20, "退出游戏");
-    esp_mn_commands_add(30, "调大音量");
-    esp_mn_commands_add(31, "调小音量");
+    esp_mn_commands_add(1,  "fan hui");
+    esp_mn_commands_add(2,  "que ren");
+    esp_mn_commands_add(3,  "qu xiao");
+    esp_mn_commands_add(10, "lian jie wang luo");
+    esp_mn_commands_add(11, "cha kan tian qi");
+    esp_mn_commands_add(12, "da kai you xi");
+    esp_mn_commands_add(13, "da kai liao tian");
+    esp_mn_commands_add(14, "yu yin zhu shou");
+    esp_mn_commands_add(20, "tui chu you xi");
+    esp_mn_commands_add(30, "tiao da yin liang");
+    esp_mn_commands_add(31, "tiao xiao yin liang");
 
     esp_mn_commands_update();
     s_multinet->print_active_speech_commands(s_mn_data);
@@ -252,6 +257,7 @@ bool esp_sr_init(void)
     ESP_LOGI(TAG, "ESP-SR 初始化完成");
     ESP_LOGI(TAG, "内部 RAM 剩余: %lu KB", (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
     ESP_LOGI(TAG, "PSRAM 剩余: %lu KB", (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+    s_sr_initialized = true;
     return true;
 }
 
@@ -332,4 +338,40 @@ void esp_sr_stop_listening(void)
 bool esp_sr_is_listening(void)
 {
     return s_listening;
+}
+
+void esp_sr_deinit(void)
+{
+    if (!s_sr_initialized) return;
+
+    /* 如果正在监听，先停止 */
+    if (s_listening) {
+        esp_sr_stop_listening();
+    }
+
+    ESP_LOGI(TAG, "释放 ESP-SR 资源...");
+
+    /* 释放 MultiNet 实例 */
+    if (s_multinet && s_mn_data) {
+        s_multinet->destroy(s_mn_data);
+        s_mn_data = NULL;
+    }
+    s_multinet = NULL;
+
+    /* 释放 AFE 实例 */
+    if (s_afe_handle && s_afe_data) {
+        s_afe_handle->destroy(s_afe_data);
+        s_afe_data = NULL;
+    }
+    s_afe_handle = NULL;
+
+    /* 释放模型列表 */
+    if (s_models) {
+        esp_srmodel_deinit(s_models);
+        s_models = NULL;
+    }
+
+    s_sr_initialized = false;
+    ESP_LOGI(TAG, "ESP-SR 资源已释放, 内部 RAM 剩余: %lu KB",
+             (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
 }

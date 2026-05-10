@@ -37,12 +37,16 @@ static void chat_back_btn_cb(lv_event_t *e);
 static void close_btn_cb(lv_event_t *e);
 static void show_game_screen(void);
 static void game_back_btn_cb(lv_event_t *e);
+static void ble_cred_cb(const char *ssid, const char *password);
 
 /* 全局 UI 对象 */
 static lv_obj_t *list;
 static lv_group_t *group;
 static lv_obj_t *wifi_spinner_cont    = NULL;  /* WiFi 加载弹窗容器 */
 static lv_obj_t *weather_spinner_cont = NULL;  /* 天气加载弹窗容器 */
+/* 蓝牙结果弹窗句柄：WiFi 连接流程启动前会自动关闭它，
+ * 避免"蓝牙已开启"弹窗还卡在屏上时 WiFi spinner 叠上来看不见 */
+static lv_obj_t *ble_result_dialog    = NULL;
 static TaskHandle_t wifi_task_handle = NULL;
 
 // 通用：屏幕删除时释放关联的 lv_group
@@ -132,6 +136,7 @@ static lv_obj_t *create_result_dialog(const char *text, uint32_t text_color)
     lv_obj_t *lbl = lv_label_create(mbox);
     lv_label_set_text(lbl, text);
     lv_obj_set_style_text_color(lbl, lv_color_hex(text_color), 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_simhei_16, 0);
     lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
 
     lv_obj_t *ok_btn = lv_button_create(mbox);
@@ -729,6 +734,8 @@ static void sr_cmd_back_cb(lv_event_t *e)
     sr_cmd_result_lbl = NULL;
     sr_cmd_status_lbl = NULL;
     sr_cmd_btn = NULL;
+    /* 退出语音命令界面时释放 ESP-SR 资源，归还 DRAM */
+    esp_sr_deinit();
     lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
     indev_set_group(group);
 }
@@ -741,18 +748,33 @@ static void show_ble_screen(void)
 {
     if (ble_prov_is_active()) {
         ble_prov_stop();
-        create_result_dialog(LV_SYMBOL_BLUETOOTH " 蓝牙已关闭", 0x888888);
+        ble_prov_deinit();
+        ble_result_dialog = create_result_dialog("蓝牙已关闭", 0x888888);
+        return;
+    }
+
+    if (!ble_prov_init()) {
+        ble_prov_deinit();
+        ble_result_dialog = create_result_dialog("蓝牙初始化失败", 0xff0000);
+        return;
+    }
+    ble_prov_set_cred_cb(ble_cred_cb);
+    if (ble_prov_start(NULL)) {
+        ble_result_dialog = create_result_dialog("蓝牙已开启\n设备: ESP32-Bot", 0x1E90FF);
     } else {
-        if (ble_prov_start(NULL)) {
-            create_result_dialog(LV_SYMBOL_BLUETOOTH " 蓝牙已开启\n设备: ESP32-Bot", 0x1E90FF);
-        } else {
-            create_result_dialog(LV_SYMBOL_CLOSE " 蓝牙启动失败", 0xff0000);
-        }
+        ble_prov_deinit();
+        ble_result_dialog = create_result_dialog("蓝牙广播失败", 0xff0000);
     }
 }
 
 static void show_sr_cmd_screen(void)
 {
+    /* 懒加载 ESP-SR：仅在进入此界面时初始化，退出时释放 */
+    if (!esp_sr_init()) {
+        create_result_dialog("ESP-SR 初始化失败\n检查 model 分区", 0xff0000);
+        return;
+    }
+
     sr_cmd_scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(sr_cmd_scr, lv_color_hex(0x0f3460), 0);
     lv_obj_set_style_pad_all(sr_cmd_scr, 0, 0);
@@ -990,6 +1012,53 @@ static void wifi_connect_task(void *arg)
     psram_task_exit();
 }
 
+/* 启动 WiFi 连接流程（弹 spinner + 起后台任务）。
+ * 被 WiFi 菜单项和蓝牙配网回调共用，避免重复逻辑。
+ * 必须在 LVGL 上下文调用（创建 UI 对象不是线程安全的），
+ * 非 LVGL 调用方用 lv_async_call 投递过来。 */
+static void start_wifi_connection_flow(void)
+{
+    if (wifi_connecting) return;
+
+    /* 如果屏幕上还留着蓝牙结果弹窗（用户没手动点 OK），先关掉再弹 WiFi spinner，
+     * 避免两层弹窗堆叠看不清。lv_obj_is_valid 保护：
+     * 用户如果已经手动关过，句柄指向已释放的对象，直接跳过 */
+    if (ble_result_dialog && lv_obj_is_valid(ble_result_dialog)) {
+        lv_obj_delete(ble_result_dialog);
+    }
+    ble_result_dialog = NULL;
+
+    wifi_connecting = true;
+    wifi_spinner_cont = create_loading_dialog("WiFi Connecting...", cancel_btn_cb);
+    xTaskCreatePSRAM(wifi_connect_task, "wifi_task", 6144, NULL, 3, &wifi_task_handle);
+}
+
+/* 蓝牙配网回调：BLE 收到凭据后触发（运行在 timer service task）。
+ * 不直接碰 LVGL，投递到 LVGL 线程；真正的"deinit BLE + 连 WiFi"
+ * 由另一个后台任务完成，避免在 timer 里阻塞。 */
+static void ble_cred_apply_task(void *arg)
+{
+    (void)arg;
+    /* 让 BLE notify("凭据已收到") 有时间送达手机，再关蓝牙 */
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    ESP_LOGI("BLE_CRED", "deinit BLE, 释放 DRAM 给 WiFi...");
+    ble_prov_deinit();
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    /* 回到 LVGL 线程启动 WiFi 连接（走标准流程：spinner + 结果弹窗） */
+    lv_async_call((lv_async_cb_t)start_wifi_connection_flow, NULL);
+    vTaskDelete(NULL);
+}
+
+static void ble_cred_cb(const char *ssid, const char *password)
+{
+    (void)ssid; (void)password;  /* 已经在 wifi_set_credentials 里存好了 */
+    ESP_LOGI("BLE_CRED", "收到凭据，启动 deinit+WiFi 流程");
+    /* 独立任务跑：不阻塞 timer service task，也不自删 */
+    xTaskCreate(ble_cred_apply_task, "ble_apply", 4096, NULL, 4, NULL);
+}
+
 static void close_btn_cb(lv_event_t *e)
 {
     lv_obj_t *mbox = lv_event_get_user_data(e);
@@ -1058,17 +1127,16 @@ static void game_task_exited_cb(void *user_data)
     keypad_set_game_mode(false);
     lv_port_indev_set_menu_mode(true);
 
-    /* 恢复 LVGL 显示输出，然后强制整屏重绘覆盖游戏期间画面 */
-    lv_port_disp_resume();
+    /* disp 已在 game_run_task 退出前先 resume，这里只做强制整屏重绘，
+     * 覆盖游戏期间残留画面 */
     lv_obj_invalidate(lv_screen_active());
     /* 回到菜单 */
     lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
     indev_set_group(group);
 
-    /* 游戏结束后恢复 WiFi 和蓝牙（仅恢复游戏前活跃的服务） */
-    ESP_LOGI("GAME", "游戏退出，恢复 WiFi/蓝牙");
+    /* 游戏结束后恢复 WiFi（BLE 不自动恢复，用户需要时从菜单手动开启） */
+    ESP_LOGI("GAME", "游戏退出，恢复 WiFi");
     wifi_resume_after_game();
-    ble_prov_resume();
 }
 
 /* 游戏运行任务：阻塞调用 game_runtime_run，退出后通知 LVGL */
@@ -1080,7 +1148,14 @@ static void game_run_task(void *arg)
     ESP_LOGI("GAME_TASK", "runtime returned");
     free(rom_name);
     s_game_task = NULL;
-    /* 把恢复逻辑投递到 LVGL 线程执行 */
+
+    /* 先恢复 LVGL 显示再投 async：
+     * 主循环里 if(disp_suspended) vTaskDelay(100) continue 会跳过 lv_timer_handler，
+     * 而 lv_async_call 的回调必须由 lv_timer_handler 调度。如果不在这里 resume，
+     * async 回调永远不会执行——游戏虽已退出但菜单始终不回来（卡黑屏）。 */
+    lv_port_disp_resume();
+
+    /* 把剩余恢复逻辑投递到 LVGL 线程执行（UI 操作必须在 LVGL 上下文）*/
     lv_async_call(game_task_exited_cb, NULL);
     vTaskDelete(NULL);
 }
@@ -1122,8 +1197,11 @@ static void rom_item_cb(lv_event_t *e)
         /* 等 WiFi 内部清理 buffer，一般 100-200ms 就够 */
         vTaskDelay(pdMS_TO_TICKS(300));
     }
-    /* 蓝牙也需要暂停，腾出 BLE 栈内存 */
-    ble_prov_suspend();
+    /* 蓝牙也需要暂停，完全释放 Bluedroid 栈腾出 DRAM */
+    if (ble_prov_is_active()) {
+        ble_prov_stop();
+    }
+    ble_prov_deinit();
 
     ESP_LOGI("ROM_CB", "creating task, DRAM free=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
@@ -1230,10 +1308,7 @@ static void list_event_cb(lv_event_t *e)
     const char *txt = lv_label_get_text(label);
 
     if (strstr(txt, "WiFi")) {
-        if (wifi_connecting) return;
-        wifi_connecting = true;
-        wifi_spinner_cont = create_loading_dialog("WiFi Connecting...", cancel_btn_cb);
-        xTaskCreatePSRAM(wifi_connect_task, "wifi_task", 6144, NULL, 3, &wifi_task_handle);
+        start_wifi_connection_flow();
     } else if (strstr(txt, "天气")) {
         if (weather_fetching) return;
         weather_fetching = true;

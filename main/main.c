@@ -14,8 +14,6 @@
 #include "keypad.h"
 #include "rom_loader.h"
 #include "psram_task.h"
-#include "esp_sr.h"
-#include "ble_prov.h"
 
 static void lvgl_tick_task(void *arg)
 {
@@ -67,8 +65,10 @@ void app_main(void)
     psram_task_init();
 
     speaker_init();
-    esp_sr_init();
-    ble_prov_init();
+    /* ESP-SR 不再常驻：进入"语音命令"界面时懒加载 esp_sr_init()，
+     * 退出时 esp_sr_deinit() 释放 DRAM。节省 ~60-80KB 内部 RAM。 */
+    /* BLE 也不再常驻：进入"蓝牙"菜单时才 ble_prov_init()，
+     * 关闭时 ble_prov_deinit() 释放 Bluedroid 栈。节省 ~50-60KB DRAM。 */
     LCD_Init();
 
     /* 矩阵键盘：GB 模拟器运行时用作 8 键输入，菜单期间也会扫描但不拦截事件 */

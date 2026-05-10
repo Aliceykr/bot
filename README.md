@@ -97,11 +97,11 @@ bot/
 │   ├── speaker.c / speaker.h     # MAX98357A I2S 音频输出 + RingBuffer 播放队列
 │   ├── tts.c / tts.h             # 百度语音合成 API（流式 PCM 播放）
 │   ├── weather.c / weather.h     # 天气 HTTP 查询与解析
-│   ├── wifi.c / wifi.h           # WiFi STA 连接 + 守护任务（断线重连）+ 动态凭据
+│   ├── wifi.c / wifi.h           # WiFi STA 连接 + 守护任务（断线重连）+ mutex 线程安全
 │   ├── sntp_time.c / sntp_time.h # SNTP 网络时间同步（阿里云 NTP）
 │   ├── health.c / health.h       # 堆内存健康监控（60s 周期打印水位）
 │   ├── esp_sr.c / esp_sr.h       # ESP-SR 离线中文命令词识别（AFE + MultiNet7）
-│   ├── ble_prov.c / ble_prov.h   # BLE GATT 蓝牙配网（WiFi SSID/password 推送）
+│   ├── ble_prov.c / ble_prov.h   # BLE GATT 蓝牙配网（加密写入 + WiFi SSID/password 推送）
 │   ├── keypad.c / keypad.h       # 3x3 矩阵键盘扫描（游戏控制）
 │   └── lv_font_simhei_16.c       # 思黑体 16px LVGL 中文字体
 ├── game/
@@ -153,6 +153,7 @@ bot/
 
 - MiniGB APU 模拟全部 4 个 GB 声道（方波x2 + 波形 + 噪声）
 - 每帧合成 ~268 个 stereo 样本（16kHz），合并为 mono 推入 speaker RingBuffer
+- APU 在独立任务/Core 0 运行，主仿真在 Core 1，真正并行不占帧预算
 - 与游戏模拟器同步运行，非阻塞输出（缓冲满时丢帧保仿真帧率）
 
 ### 4. 语音助手（在线）
@@ -186,6 +187,7 @@ MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 - 手机 BLE 扫描连接 "ESP32-Bot"
 - 发送 "SSID_名称 password_密码" 即可自动连接 WiFi
 - 连接结果通过 BLE Notify 返回手机
+- RX characteristic 使用加密写入（`ESP_GATT_PERM_WRITE_ENCRYPTED`），要求配对
 - 游戏时自动暂停 BLE，退出后恢复
 
 ### 7. WiFi 守护
@@ -194,6 +196,7 @@ MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 - 运行期断线：常驻守护任务自动重连，指数退避（5s → 5min）
 - 用户主动断开：停止守护，不自动重连
 - 支持动态凭据设置（BLE 配网写入）
+- 所有状态变量由 mutex 保护，确保事件回调、守护任务、公开 API 之间的线程安全
 
 ---
 
@@ -204,23 +207,23 @@ MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 | 任务名 | 优先级 | 栈大小 | 说明 |
 |--------|--------|--------|------|
 | `lv_tick` | 5 | 2048 B | LVGL 时钟（5ms tick） |
-| `lv_task` | 4 | 32768 B (PSRAM) | LVGL 渲染 + flush |
+| `lv_task` | 4 | 16384 B (DRAM) | LVGL 渲染 + flush |
 | `enc_task` | 6 | 2048 B | SW 按键状态机（5ms 轮询） |
 | `spk_tx` | 3 | 4096 B | RingBuffer → I2S DMA 播放 |
 | `asr_rec` | 5 | 2048 B | I2S 录音常驻任务 |
-| `wifi_task` | 3 | 4096 B | WiFi 连接 + NTP 同步（一次性） |
+| `wifi_task` | 3 | 6144 B (PSRAM) | WiFi 连接 + NTP 同步（一次性） |
 | `wifi_guard` | 4 | 3072 B | 断线重连守护（常驻） |
-| `weather_task` | 3 | 16384 B | 天气查询（一次性） |
-| `chat_task` | 3 | 16384 B | LLM 请求（一次性） |
-| `asr_task` | 3 | 16384 B | ASR 识别（一次性） |
-| `asr_llm` | 3 | 16384 B | ASR → LLM → TTS（一次性） |
-| `game_run` | 10 | 8192 B | GB 模拟器主循环 |
-| `exit_watch` | 4 | 2048 B | 长按退出监视 |
-| `health` | 1 | 2048 B | 堆内存监控（60s 周期） |
-| `psram_cleaner` | 1 | 2048 B | 回收 PSRAM 任务栈和 TCB |
+| `weather_task` | 3 | 16384 B (PSRAM) | 天气查询（一次性） |
+| `chat_task` | 3 | 16384 B (PSRAM) | LLM 请求（一次性） |
+| `asr_task` | 3 | 16384 B (PSRAM) | ASR 识别（一次性） |
+| `asr_llm` | 3 | 16384 B (PSRAM) | ASR → LLM → TTS（一次性） |
+| `game_run` | 10 | 12288 B (DRAM) | GB 模拟器主循环（Core 1） |
+| `apu_task` | 5 | 4096 B | GB APU 音频合成（Core 0） |
+| `psram_cleaner` | 2 | 3072 B | 回收 PSRAM 任务栈和 TCB |
 | `esp_sr_feed` | 6 | 4096 B | ESP-SR AFE 音频喂入（Core 0） |
-| `esp_sr_detect` | 5 | 8192 B | ESP-SR MultiNet 命令检测（Core 1） |
-| `keypad_scan` | 5 | 2048 B | 按键矩阵扫描（2ms 周期） |
+| `esp_sr_detect` | 5 | 8192 B (估计) | ESP-SR MultiNet 命令检测（Core 1） |
+| `kpad_task` | 6 | 4096 B | 按键矩阵扫描（2ms 周期） |
+| `health` | 1 | 2048 B | 堆内存监控（60s 周期） |
 
 ### PSRAM 任务创建
 
@@ -231,7 +234,9 @@ MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 - LVGL 对象操作均在 `lv_task` 单线程执行
 - 后台任务通过 FreeRTOS Queue 传递结果，`lv_timer` 回调轮询队列更新 UI
 - `speaker_play()` 使用 RingBuffer 非阻塞写入，TTS/GB 音频可直接调用
+- WiFi 模块状态变量（status / user_stopped / ip_str）由 mutex 保护，事件回调、守护任务、公开 API 之间安全并发
 - HTTP 响应缓冲由各模块 mutex 保护
+- 录音任务启停使用 `ulTaskNotifyTake` 确认同步，避免 I2S 时序冲突
 
 ### LCD 刷新机制
 
@@ -347,6 +352,7 @@ idf.py -p COM5 -b 2000000 flash
 - **编码器导航**：旋转 = 移动焦点，按键 = 确认。弹窗弹出时焦点自动切到弹窗 group
 - **ESP32-S3 蓝牙限制**：仅支持 BLE，不支持 Classic BT（A2DP 不可用）
 - **游戏模式**：进入游戏自动暂停 WiFi + BLE，退出后仅恢复进入前活跃的服务
+- **任务栈分配**：涉及 SPIFFS/flash IO 的任务（LVGL、游戏）使用内部 DRAM 栈；纯 HTTP/cJSON 任务使用 PSRAM 栈
 
 ---
 
@@ -354,8 +360,8 @@ idf.py -p COM5 -b 2000000 flash
 
 | 类别 | 行数 |
 |------|------|
-| 纯手写代码 | ~5,200 行 |
-| 字体数据（lv_font_simhei_16 + lcdfont）| ~385,000 行 |
+| 纯手写代码 | ~6,100 行 |
+| 字体数据（lv_font_simhei_16 + lcdfont）| ~384,000 行 |
 | 模拟器库（walnut_cgb.h + minigb_apu.c）| ~10,500 行 |
 | LVGL 库 | 未计入 |
 

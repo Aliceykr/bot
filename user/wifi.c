@@ -7,6 +7,7 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "lwip/ip4_addr.h"
 
@@ -204,7 +205,16 @@ bool wifi_connect(void)
         esp_netif_create_default_wifi_sta();
 
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+        /* 不用 ESP_ERROR_CHECK：内部 DRAM 不足时 esp_wifi_init 会返回 ESP_ERR_NO_MEM，
+         * 原本 abort 导致整机重启。改成返回 false 让上层 UI 提示"WiFi 启动失败"。 */
+        esp_err_t wifi_init_err = esp_wifi_init(&cfg);
+        if (wifi_init_err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_wifi_init 失败: %s (DRAM free=%u)",
+                     esp_err_to_name(wifi_init_err),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+            s_status = WIFI_STATUS_FAILED;
+            return false;
+        }
 
         esp_event_handler_instance_t instance_any_id;
         esp_event_handler_instance_t instance_got_ip;

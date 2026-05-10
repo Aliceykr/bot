@@ -23,23 +23,41 @@ static volatile bool     s_game_mode   = false;
 static volatile bool     s_exit_request = false;
 static bool s_inited = false;
 
-/* 扫描一轮：逐行驱动低电平，读 3 个列电平，拼成 9 位位图。 */
+/* 扫描一轮：逐行驱动低电平，读 3 个列电平，拼成 9 位位图。
+ *
+ * 之前只 5us 稳定时间 + 单次采样，列会读到上一轮残留低电平，
+ * 表现为按一个键报三个同列键。修复：
+ *   1) 行切换后给 100us 让 GPIO 完全恢复（内部上拉 ~45kΩ × 列 PCB 电容）
+ *   2) 列电平投票：连续 3 次读都是 0 才算按下，任何一次读到 1 就判未按
+ *      这样能过滤瞬时串扰和慢沿带来的伪低电平 */
 static inline uint16_t scan_once(void)
 {
     uint16_t bits = 0;
     for (int r = 0; r < 3; r++) {
+        /* 先把所有行设为输入（高阻 + 上拉），确保没有遗留的驱动低 */
+        for (int r2 = 0; r2 < 3; r2++) {
+            gpio_set_direction(s_row_pins[r2], GPIO_MODE_INPUT);
+        }
+        /* 只驱动当前行为低 */
         gpio_set_direction(s_row_pins[r], GPIO_MODE_OUTPUT);
         gpio_set_level(s_row_pins[r], 0);
-        for (int r2 = 0; r2 < 3; r2++) {
-            if (r2 != r) gpio_set_direction(s_row_pins[r2], GPIO_MODE_INPUT);
-        }
-        esp_rom_delay_us(5);
+
+        /* 100us 稳定时间：覆盖 GPIO 切换 + 列线上拉充电时间 */
+        esp_rom_delay_us(100);
+
         for (int c = 0; c < 3; c++) {
-            if (gpio_get_level(s_col_pins[c]) == 0) {
+            /* 3 次投票：全 0 才算按下 */
+            int lo_votes = 0;
+            for (int v = 0; v < 3; v++) {
+                if (gpio_get_level(s_col_pins[c]) == 0) lo_votes++;
+                esp_rom_delay_us(10);
+            }
+            if (lo_votes == 3) {
                 bits |= (1U << (r * 3 + c));
             }
         }
     }
+    /* 扫描结束后全部设为输入，避免下一轮进入前还有行在驱低 */
     for (int r = 0; r < 3; r++) {
         gpio_set_direction(s_row_pins[r], GPIO_MODE_INPUT);
     }
