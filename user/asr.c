@@ -1,6 +1,7 @@
 #include "asr.h"
 #include "asr_config.h"
 #include "baidu_token.h"
+#include "wifi.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -287,6 +288,16 @@ bool asr_recognize(uint32_t audio_len_bytes, asr_result_t *out)
 
     bool ret = false;
     memset(out, 0, sizeof(*out));
+
+    /* WiFi 守卫：百度 API 必须联网。WiFi 未连接时 lwIP tcpip 队列无效，
+     * 直接发请求会 panic（assert failed: Invalid mbox）。提前检查并给明确错误。*/
+    wifi_status_t wst = wifi_get_status();
+    if (wst != WIFI_STATUS_CONNECTED) {
+        ESP_LOGE(TAG, "WiFi 未连接 (status=%d)，无法识别", (int)wst);
+        snprintf(out->error_msg, sizeof(out->error_msg), "请先连接 WiFi");
+        goto out;
+    }
+
     if (!s_rec_buf || audio_len_bytes == 0) {
         snprintf(out->error_msg, sizeof(out->error_msg), "No audio");
         goto out;

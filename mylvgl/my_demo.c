@@ -876,6 +876,14 @@ static void show_sr_cmd_screen(void)
 
 static void show_asr_screen(void)
 {
+    /* 语音助手依赖百度在线 ASR/LLM/TTS，必须联网。
+     * 未连 WiFi 时入口就拦截，否则后续 HTTP 请求会因 lwIP 未就绪 panic。 */
+    wifi_status_t wst = wifi_get_status();
+    if (wst != WIFI_STATUS_CONNECTED) {
+        create_result_dialog("请先连接 WiFi\n语音助手需要联网", 0xffaa00);
+        return;
+    }
+
     if (!asr_result_queue)
         asr_result_queue = xQueueCreate(2, sizeof(asr_task_result_t));
 
@@ -944,6 +952,13 @@ static void show_asr_screen(void)
 
 static void show_chat_screen(void)
 {
+    /* 聊天助手依赖在线大模型 API，必须联网 */
+    wifi_status_t wst = wifi_get_status();
+    if (wst != WIFI_STATUS_CONNECTED) {
+        create_result_dialog("请先连接 WiFi\n聊天需要联网", 0xffaa00);
+        return;
+    }
+
     if (!chat_result_queue)
         chat_result_queue = xQueueCreate(2, sizeof(chat_result_t));
 
@@ -1340,6 +1355,11 @@ static void list_event_cb(lv_event_t *e)
     if (strstr(txt, "WiFi")) {
         start_wifi_connection_flow();
     } else if (strstr(txt, "天气")) {
+        /* 天气依赖 HTTP API，必须联网 */
+        if (wifi_get_status() != WIFI_STATUS_CONNECTED) {
+            create_result_dialog("请先连接 WiFi\n天气查询需要联网", 0xffaa00);
+            return;
+        }
         if (weather_fetching) return;
         weather_fetching = true;
         weather_spinner_cont = create_loading_dialog("Fetching Weather...", weather_cancel_btn_cb);

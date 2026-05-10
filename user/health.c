@@ -31,6 +31,7 @@ static void health_task(void *arg)
 
 void health_monitor_start(void)
 {
-    /* 低优先级 1，2KB 栈足够（只调内置 API 和 ESP_LOG）*/
-    xTaskCreate(health_task, "health", 2048, NULL, 1, NULL);
+    /* 低优先级 1。栈 3KB：ESP_LOGI 格式化多个 %u + 任务切换上下文，
+     * 原来 2KB 在高并发（ESP-SR/WiFi/BLE 并发时）会栈溢出崩溃。 */
+    xTaskCreate(health_task, "health", 3072, NULL, 1, NULL);
 }
