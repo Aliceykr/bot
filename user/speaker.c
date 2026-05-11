@@ -1,120 +1,148 @@
 #include "speaker.h"
 #include <string.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/ringbuf.h"
+#include "freertos/semphr.h"
 #include "driver/i2s_std.h"
 #include "esp_log.h"
 
 #define TAG             "SPEAKER"
 
-/* 播放 RingBuffer 大小：64 KB ≈ 2 秒缓冲（16kHz 16bit mono）*/
+/* ================================================================
+ * 参考 esp32_1_hybrid 工程的音频配置：
+ *   - 硬件 MONO 槽位（不再软件 stereo 展开）
+ *   - DMA 自动清零：驱动喂不到数据时 DMA 描述符自动填 0
+ *   - 播放前做字节尾对齐 + 轻度高通（DC block）
+ *
+ * 老版本杂音来源：
+ *   1. 按字节送入 ring 时，HTTP chunked 给出奇数字节就会导致 16bit 样本
+ *      错位 1 字节，从此整段 PCM 全部变成雪花白噪声
+ *   2. 每 20ms 主动灌 32 字节静音 + 新数据到来时做 32 样本淡入 → 突发
+ *      数据下反复出现 "静音—淡入" 循环，听感像周期性咔哒/颤抖
+ *   3. 软件 stereo 展开放大一倍数据量，ring 饿得更快，上一条更明显
+ *   4. MAX98357A 自带直流偏置，没有 HPF 时低信号底噪会被放大
+ * ================================================================ */
+
+/* 播放 RingBuffer：64KB ≈ 2 秒缓冲（16kHz 16bit mono）*/
 #define SPK_RINGBUF_SIZE    (64 * 1024)
 
-/* 每次从 RingBuffer 取出并写入 I2S 的最大字节数 */
-#define SPK_TX_CHUNK        512
+/* tx 任务每次取出并写入 I2S 的最大字节数 */
+#define SPK_TX_CHUNK        1024
 
-/* 播放任务栈：4KB。之前 2KB 在高采样率 + stereo 展开时会溢出
- * （stereo_buf 512 × 2 字节 + I2S 写入调用栈 + ESP_LOG 栈）*/
 #define SPK_TASK_STACK      4096
 #define SPK_TASK_PRIO       3
 
-/* ================================================================
- * 模块内部状态（全部 static，不暴露到外部）
- * ================================================================ */
-static i2s_chan_handle_t  s_tx_chan   = NULL;
-static RingbufHandle_t    s_ringbuf  = NULL;
+/* DMA：与参考工程对齐，8 x 256 帧 = ~128ms 缓冲 @16kHz */
+#define DMA_DESC_NUM        8
+#define DMA_FRAME_NUM       256
+
+/* DC-block 高通：y[n] = x[n] - x[n-1] + a * y[n-1]，a=0.995
+ * 截止 ≈ (1-a)*fs/(2π) ≈ 12.7Hz @ 16kHz，可听段零衰减，只砍直流 */
+#define HP_COEF             0.995f
+
+/* 首次播放 / flush 后再次开播 时的线性淡入长度（样本）
+ * 64 samples @16kHz = 4ms，足够消爆破，人耳感知不到 */
+#define FADE_SAMPLES        64
+
+/* speaker_play 内部处理缓冲 */
+#define PROC_BATCH          64
 
 /* ================================================================
- * 播放任务：从 RingBuffer 取数据，通过 I2S DMA 输出到 MAX98357A
- *
- * i2s_channel_write 底层使用 DMA 传输，CPU 仅需将数据复制到
- * DMA buffer，实际搬运由 DMA 控制器完成，不占用 CPU 忙等。
- *
- * 噪声消除策略：
- *   - RingBuffer 空 → 每 20ms 主动写一小段静音，保持 DMA 输出稳定零电平
- *     防止 MAX98357A 在长时间无数据时出现 DC 漂移/爆破
- *   - 从"静默 → 有音频"切换时，前 32 样本做线性淡入，避免幅度突变爆音
+ * 模块内部状态
+ * ================================================================ */
+static i2s_chan_handle_t  s_tx_chan   = NULL;
+static RingbufHandle_t    s_ringbuf   = NULL;
+static SemaphoreHandle_t  s_play_mtx  = NULL;   /* 保护 HPF / tail / fade 状态 */
+
+/* 字节尾：上一次 speaker_play 输入字节数是奇数时，保留的最后一个字节，
+ * 下次拼上首字节组成完整 16bit 采样，防止跨包字节错位 */
+static uint8_t  s_pcm_tail       = 0;
+static bool     s_pcm_tail_valid = false;
+
+/* DC-block HPF 状态 */
+static float    s_hp_x1          = 0.0f;
+static float    s_hp_y1          = 0.0f;
+
+/* 线性淡入：init / flush 后归零，前 FADE_SAMPLES 个样本按 (i+1)/N 递增 */
+static uint16_t s_fade_count     = 0;
+
+/* ================================================================
+ * 单样本处理：HPF + 淡入 + 饱和
+ * 调用方需持有 s_play_mtx
+ * ================================================================ */
+static inline int16_t process_sample(int16_t x)
+{
+    float xf = (float)x;
+    float y  = xf - s_hp_x1 + HP_COEF * s_hp_y1;
+    s_hp_x1 = xf;
+    s_hp_y1 = y;
+
+    int32_t yi = (int32_t)y;
+
+    if (s_fade_count < FADE_SAMPLES) {
+        yi = yi * (int32_t)(s_fade_count + 1) / (int32_t)FADE_SAMPLES;
+        s_fade_count++;
+    }
+
+    if (yi >  32767) yi =  32767;
+    if (yi < -32768) yi = -32768;
+    return (int16_t)yi;
+}
+
+/* ================================================================
+ * 播放任务：从 ring 取出数据，直接用硬件 MONO 写 I2S
+ * ring 空时不做任何动作，DMA 由驱动的 auto_clear 自动输出零电平
  * ================================================================ */
 static void spk_tx_task(void *arg)
 {
     (void)arg;
-    /* 判断当前是否处于"刚从静音恢复"状态：
-     * true = 上一轮没收到数据（在播静音），下次拿到数据要做淡入 */
-    bool need_fade_in = true;
-    /* 静音 fill buffer：16 样本 stereo = 64 字节，够维持 ring 不饿死 */
-    static const int16_t silence_pad[32] = { 0 };  /* 16 L+R 对 */
-
     for (;;) {
         size_t recv_size = 0;
         void *item = xRingbufferReceiveUpTo(
-            s_ringbuf, &recv_size, pdMS_TO_TICKS(20), SPK_TX_CHUNK);
+            s_ringbuf, &recv_size, pdMS_TO_TICKS(50), SPK_TX_CHUNK);
 
         if (item == NULL) {
-            /* RingBuffer 空：灌一小段静音保持 DMA 稳定。
-             * 下次真正收到数据时会走 fade-in 分支。*/
-            size_t w = 0;
-            i2s_channel_write(s_tx_chan, silence_pad, sizeof(silence_pad),
-                              &w, pdMS_TO_TICKS(50));
-            need_fade_in = true;
+            /* ring 空：什么都不做，DMA 由 auto_clear 负责输出零电平 */
             continue;
-        }
-
-        /* mono PCM → stereo：每个 int16 样本复制为左右各一份，
-         * MAX98357A L/R 接 GND 取左声道。 */
-        int16_t *src = (int16_t *)item;
-        size_t n_samples = recv_size / sizeof(int16_t);
-        /* stereo_buf 需容纳 n_samples * 2 个 int16 */
-        static int16_t stereo_buf[SPK_TX_CHUNK];
-        _Static_assert(sizeof(stereo_buf) >= (size_t)SPK_TX_CHUNK * 2,
-                       "stereo_buf too small for SPK_TX_CHUNK worth of stereo samples");
-        for (size_t i = 0; i < n_samples; i++) {
-            stereo_buf[i * 2]     = src[i];  /* L */
-            stereo_buf[i * 2 + 1] = src[i];  /* R */
-        }
-
-        /* 从静音 → 有音频的瞬间，前 32 样本做线性淡入，避免爆音。
-         * 典型场景：语音助手回答 / 游戏 APU 开场 / TTS 播报首帧。
-         * 32 样本 @16kHz = 2ms，人耳几乎察觉不到但足以消除爆破声。 */
-        if (need_fade_in) {
-            size_t fade_samples = n_samples < 32 ? n_samples : 32;
-            for (size_t i = 0; i < fade_samples; i++) {
-                int32_t gain = (int32_t)(i + 1);  /* 1..fade_samples */
-                stereo_buf[i * 2]     = (int16_t)((int32_t)stereo_buf[i * 2]     * gain / (int32_t)fade_samples);
-                stereo_buf[i * 2 + 1] = (int16_t)((int32_t)stereo_buf[i * 2 + 1] * gain / (int32_t)fade_samples);
-            }
-            need_fade_in = false;
         }
 
         size_t bytes_written = 0;
         esp_err_t err = i2s_channel_write(
-            s_tx_chan, stereo_buf, n_samples * 2 * sizeof(int16_t),
-            &bytes_written, pdMS_TO_TICKS(100));
+            s_tx_chan, item, recv_size, &bytes_written, pdMS_TO_TICKS(200));
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "i2s_channel_write 失败: %d", err);
         }
 
-        /* 无论写入是否成功，必须归还 item，防止 RingBuffer 泄漏 */
         vRingbufferReturnItem(s_ringbuf, item);
     }
 }
 
 /* ================================================================
- * 公开接口
+ * 初始化
  * ================================================================ */
-
 void speaker_init(void)
 {
-    /* --- 创建播放 RingBuffer（字节模式，内部 SRAM）--- */
+    s_play_mtx = xSemaphoreCreateMutex();
+    if (!s_play_mtx) {
+        ESP_LOGE(TAG, "mutex 创建失败");
+        return;
+    }
+
     s_ringbuf = xRingbufferCreate(SPK_RINGBUF_SIZE, RINGBUF_TYPE_BYTEBUF);
     if (!s_ringbuf) {
         ESP_LOGE(TAG, "RingBuffer 创建失败");
         return;
     }
 
-    /* --- 初始化 I2S_NUM_1 TX 通道 --- */
+    /* I2S channel 配置：开启 auto_clear，DMA 饿死时自动喂 0 */
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
-    esp_err_t err = i2s_new_channel(&chan_cfg, &s_tx_chan, NULL);  /* TX only，rx=NULL */
+    chan_cfg.dma_desc_num  = DMA_DESC_NUM;
+    chan_cfg.dma_frame_num = DMA_FRAME_NUM;
+    chan_cfg.auto_clear    = true;    /* 关键：DMA 未喂到数据时硬件自动填 0 */
+
+    esp_err_t err = i2s_new_channel(&chan_cfg, &s_tx_chan, NULL);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "i2s_new_channel 失败: %d", err);
         vRingbufferDelete(s_ringbuf);
@@ -122,14 +150,13 @@ void speaker_init(void)
         return;
     }
 
-    /* --- 配置标准 I2S（Philips）模式 ---
-     * STEREO 模式：左右声道填入相同的 mono 样本。
-     * MAX98357A 的 L/R 引脚决定取哪个声道（接 GND 取左声道）。
-     * 16bit 位宽匹配 PC 端发来的 int16_t PCM 格式。 */
+    /* 标准 I2S (Philips) + 硬件 MONO
+     * 默认 slot_mask = I2S_STD_SLOT_LEFT，配合 MAX98357A SD 接 3.3V
+     * （>1.4V = Left only mode），每个 mono 样本只写一次即可。 */
     i2s_std_config_t std_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(SPK_SAMPLE_RATE),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-                        I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+                        I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = SPK_BCLK_PIN,
@@ -164,20 +191,7 @@ void speaker_init(void)
         return;
     }
 
-    /* === 开机静音预热：消除首播噪音 ===
-     * 问题根因：I2S enable 后 DMA buffer 里可能是未初始化的残留数据，
-     * 首次有真实音频到达前这些残留会被播出去 → 前半秒爆破/噪声。
-     * 修复：主动灌入 200ms 静音（0 值 PCM），强制 DMA 清零所有 ring 中的 buffer，
-     * MAX98357A 在稳定的零信号上锁定 DC offset，后续播放就不会炸响。
-     * 200ms 对应 16kHz stereo 16bit = 12800 字节，分批写入避免栈上大 buffer。 */
-    static const int16_t silence[512] = { 0 };  /* 512 个 int16 = 1024 字节一次 */
-    const int silence_rounds = 16000 / 512 / 5;  /* ~200ms @ 16kHz stereo */
-    for (int i = 0; i < silence_rounds; i++) {
-        size_t w = 0;
-        i2s_channel_write(s_tx_chan, silence, sizeof(silence), &w, pdMS_TO_TICKS(100));
-    }
-
-    /* --- 启动播放任务 --- */
+    /* 启动播放任务 */
     BaseType_t ret = xTaskCreate(
         spk_tx_task, "spk_tx", SPK_TASK_STACK, NULL, SPK_TASK_PRIO, NULL);
     if (ret != pdPASS) {
@@ -190,38 +204,120 @@ void speaker_init(void)
         return;
     }
 
-    ESP_LOGI(TAG, "I2S TX 初始化完成 BCLK=%d LRCK=%d DOUT=%d",
+    ESP_LOGI(TAG, "I2S TX 初始化完成 (MONO, auto_clear) BCLK=%d LRCK=%d DOUT=%d",
              SPK_BCLK_PIN, SPK_LRCK_PIN, SPK_DOUT_PIN);
 }
 
+/* ================================================================
+ * 推入 PCM：按字节入口，内部按 16bit 样本对齐，跨包保留尾字节
+ *
+ * 返回值：本次"消费掉"的输入字节数（≤ len_bytes）
+ *   - 成功写入 ring 的部分
+ *   - 加上 1 字节被保留到下一次的 tail（从调用方视角也算消费了）
+ * 若 ring 空间不够，返回 0，调用方重试（当前数据原样保留）
+ * ================================================================ */
 int speaker_play(const int16_t *pcm, size_t len_bytes)
 {
     if (!s_ringbuf || !pcm || len_bytes == 0) return 0;
+    if (!s_play_mtx) return 0;
 
-    /* timeout=0：非阻塞，缓冲满时静默丢弃，保证调用方实时性 */
-    BaseType_t ret = xRingbufferSend(s_ringbuf, pcm, len_bytes, 0);
-    return (ret == pdTRUE) ? (int)len_bytes : 0;
+    xSemaphoreTake(s_play_mtx, portMAX_DELAY);
+
+    const uint8_t *bytes = (const uint8_t *)pcm;
+    size_t bytes_left = len_bytes;
+
+    /* 计算要写入 ring 的字节数，提前判断空间
+     * - 若有 tail_valid：合并出 1 个样本 → 2 字节
+     * - 剩余 (bytes_left - 1) 字节中 ((bytes_left-1) & ~1) 字节是完整样本，
+     *   按原样处理后写入 ring（每 2 字节 → 1 个 int16 → 2 字节输出）
+     * - 最后可能有 1 个奇数字节保留到下次 */
+    bool will_consume_tail = (s_pcm_tail_valid && bytes_left >= 1);
+    size_t input_after_tail = bytes_left - (will_consume_tail ? 1 : 0);
+    size_t full_samples_in  = input_after_tail / 2;  /* 完整样本数（来自输入）*/
+    size_t ring_bytes_need  = (will_consume_tail ? 2 : 0) + full_samples_in * 2;
+
+    size_t free_size = xRingbufferGetCurFreeSize(s_ringbuf);
+    if (free_size < ring_bytes_need) {
+        /* 空间不足：调用方重试，不改状态 */
+        xSemaphoreGive(s_play_mtx);
+        return 0;
+    }
+
+    size_t consumed = 0;
+    int16_t proc[PROC_BATCH];
+    size_t  proc_n = 0;
+
+    /* 刷 proc 到 ring；空间已提前预留，portMAX_DELAY 会立即成功 */
+    #define FLUSH_PROC() do {                                                  \
+        if (proc_n > 0) {                                                      \
+            xRingbufferSend(s_ringbuf, proc,                                   \
+                            proc_n * sizeof(int16_t), portMAX_DELAY);          \
+            proc_n = 0;                                                        \
+        }                                                                      \
+    } while (0)
+
+    /* 1) 合并上次遗留的 tail 字节 */
+    if (will_consume_tail) {
+        int16_t s = (int16_t)((uint16_t)s_pcm_tail |
+                              ((uint16_t)bytes[0] << 8));
+        proc[proc_n++] = process_sample(s);
+        s_pcm_tail_valid = false;
+        bytes      += 1;
+        bytes_left -= 1;
+        consumed   += 1;
+    }
+
+    /* 2) 按 2 字节一个样本处理剩余字节 */
+    while (bytes_left >= 2) {
+        int16_t s = (int16_t)((uint16_t)bytes[0] |
+                              ((uint16_t)bytes[1] << 8));
+        proc[proc_n++] = process_sample(s);
+        bytes      += 2;
+        bytes_left -= 2;
+        consumed   += 2;
+
+        if (proc_n >= PROC_BATCH) {
+            FLUSH_PROC();
+        }
+    }
+
+    FLUSH_PROC();
+
+    /* 3) 末尾若剩 1 个奇数字节，保留到下一次 */
+    if (bytes_left == 1) {
+        s_pcm_tail       = bytes[0];
+        s_pcm_tail_valid = true;
+        consumed += 1;
+    }
+
+    #undef FLUSH_PROC
+
+    xSemaphoreGive(s_play_mtx);
+    return (int)consumed;
 }
 
-/* 丢弃 ring buffer 所有待播数据。
- *
- * 用途：游戏退出、界面切换时立即静音，防止残留音频继续播 1-2 秒。
- * 不动 I2S 通道，也不停任务：spk_tx_task 看到 ring 空后会自动走
- * 静音填充分支（每 20ms 写一小段 0），保证 MAX98357A 输出稳定零电平。
- *
- * 实现：循环 receive + return 把所有 item 消费掉。byte mode ringbuf 的
- * xRingbufferReceive 是非阻塞取一个 item；用 timeout=0 空了立刻返回 NULL。 */
+/* ================================================================
+ * 丢弃所有待播数据，并复位播放状态
+ * spk_tx_task 看到 ring 空后不再 i2s_write，auto_clear 输出零电平
+ * ================================================================ */
 void speaker_flush(void)
 {
     if (!s_ringbuf) return;
+    if (s_play_mtx) xSemaphoreTake(s_play_mtx, portMAX_DELAY);
+
     size_t n = 0;
     while (1) {
         void *item = xRingbufferReceive(s_ringbuf, &n, 0);
         if (!item) break;
         vRingbufferReturnItem(s_ringbuf, item);
     }
-}
 
-/* ================================================================
- * A2DP 蓝牙音箱：让出/恢复 I2S_NUM_1（保留，未来可用）
- * ================================================================ */
+    /* 复位字节对齐 / HPF / 淡入状态，确保下一段音频干净起播 */
+    s_pcm_tail       = 0;
+    s_pcm_tail_valid = false;
+    s_hp_x1          = 0.0f;
+    s_hp_y1          = 0.0f;
+    s_fade_count     = 0;
+
+    if (s_play_mtx) xSemaphoreGive(s_play_mtx);
+}
