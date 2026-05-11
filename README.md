@@ -94,7 +94,7 @@ bot/
 │   ├── model.c / model.h         # LLM 聊天（OpenAI 兼容 REST API）
 │   ├── model_config.h            # API Key / URL / 模型名（已 gitignore）
 │   ├── model_config.h.example    # 配置模板
-│   ├── speaker.c / speaker.h     # MAX98357A I2S 音频输出 + RingBuffer 播放队列
+│   ├── speaker.c / speaker.h     # MAX98357A I2S 音频输出 + RingBuffer + DC-block HPF + 字节尾对齐
 │   ├── tts.c / tts.h             # 百度语音合成 API（流式 PCM 播放）
 │   ├── weather.c / weather.h     # 天气 HTTP 查询与解析
 │   ├── wifi.c / wifi.h           # WiFi STA 连接 + 守护任务（断线重连）+ mutex 线程安全
@@ -106,7 +106,7 @@ bot/
 │   └── lv_font_simhei_16.c       # 思黑体 16px LVGL 中文字体
 ├── game/
 │   ├── gb_emu.c / gb_emu.h       # Game Boy 模拟器集成（Walnut-CGB / Peanut-GB）
-│   ├── gb_audio.c / gb_audio.h   # GB 音频：MiniGB APU → stereo→mono → speaker
+│   ├── gb_audio.c / gb_audio.h   # GB 音频：MiniGB APU → mono → speaker RingBuffer
 │   ├── minigb_apu.c              # MiniGB APU 音频处理单元（第三方）
 │   ├── game_runtime.c / .h       # 游戏生命周期管理（加载/运行/退出）
 │   ├── rom_loader.c / .h         # SPIFFS ROM 扫描与加载
@@ -151,7 +151,7 @@ bot/
 ### 3. Game Boy 音频
 
 - MiniGB APU 模拟全部 4 个 GB 声道（方波x2 + 波形 + 噪声）
-- 每帧合成 ~268 个 stereo 样本（16kHz），合并为 mono 推入 speaker RingBuffer
+- 每帧合成 ~268 个 stereo 样本（16kHz），合并为 mono 推入 speaker RingBuffer，硬件 I2S MONO 槽输出
 - APU 在独立任务/Core 0 运行，主仿真在 Core 1，真正并行不占帧预算
 - 与游戏模拟器同步运行，非阻塞输出（缓冲满时丢帧保仿真帧率）
 
@@ -235,7 +235,7 @@ MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 
 - LVGL 对象操作均在 `lv_task` 单线程执行
 - 后台任务通过 FreeRTOS Queue 传递结果，`lv_timer` 回调轮询队列更新 UI
-- `speaker_play()` 使用 RingBuffer 非阻塞写入，TTS/GB 音频可直接调用
+- `speaker_play()` 使用 RingBuffer 非阻塞写入，TTS/GB 音频可直接调用；内部 mutex 保护 HPF / 字节尾 / 淡入状态，多生产者并发安全
 - WiFi 模块状态变量（status / user_stopped / ip_str）由 mutex 保护，事件回调、守护任务、公开 API 之间安全并发
 - BLE 模块核心状态（s_active / s_status_cb / RX 缓冲 / deinit 门锁）由模块级 mutex 保护，NimBLE host 任务、timer service、worker、LVGL 任务之间安全并发
 - HTTP 响应缓冲由各模块 mutex 保护
@@ -353,6 +353,7 @@ idf.py -p COM5 -b 2000000 flash
 - **凭证安全**：`asr_config.h` 和 `model_config.h` 含 API Key，已加入 `.gitignore`
 - **PSRAM 必须选 Octal Mode**：录音缓冲、ROM 数据、HTTP 响应均分配于 PSRAM
 - **I2S 资源分配**：I2S_NUM_0 = 麦克风（RX），I2S_NUM_1 = 扬声器（TX），互不干扰
+- **扬声器 I2S 配置**：硬件 MONO 槽（非软件 stereo 展开）、DMA `auto_clear=true` 饿死时自动输出零电平、播放前字节尾对齐防雪花噪声、一阶 DC-block HPF（a=0.995, ~13Hz）+ 4ms 淡入防爆破
 - **I2S_NUM_0 共享**：在线 ASR 和离线 ESP-SR 通过 deinit/reinit 共享 I2S_NUM_0
 - **LCD SPI 时钟**：80 MHz，PARTIAL 模式异步 DMA 刷新
 - **编码器导航**：旋转 = 移动焦点，按键 = 确认。弹窗弹出时焦点自动切到弹窗 group
