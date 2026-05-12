@@ -1,0 +1,19 @@
+#ifndef __BEMFA_CONFIG_H
+#define __BEMFA_CONFIG_H
+
+/* 巴法云 API 私钥（uid / openID）
+ *
+ * 获取方法：
+ *   1. 注册 https://cloud.bemfa.com/
+ *   2. 登录控制台 → 个人中心 → 复制"私钥"
+ *
+ * 安全提示：
+ *   - 私钥等同账号密码，不要提交到 git（本项目 bemfa_config.h 已 .gitignore）
+ *   - 本文件是模板，复制为 bemfa_config.h 后填入真实值再 build
+ *   - 如果误贴到公开渠道（聊天 / github），立即去控制台重置私钥 */
+#define BEMFA_UID    "your_private_key_here"
+
+/* TCP 设备云类型固定为 3；MQTT 是 1。当前只支持 TCP 设备云 */
+#define BEMFA_TYPE   3
+
+#endif

@@ -15,6 +15,7 @@
 #include "rom_loader.h"
 #include "psram_task.h"
 #include "sdcard.h"
+#include "bemfa.h"
 
 static void lvgl_tick_task(void *arg)
 {
@@ -67,6 +68,8 @@ void app_main(void)
     psram_task_init();
 
     speaker_init();
+    /* 巴法云模块一次性 init：创建内部 mutex，避免首次并发调用竞态（C1）*/
+    bemfa_init();
     /* ESP-SR 不再常驻：进入"语音命令"界面时懒加载 esp_sr_init()，
      * 退出时 esp_sr_deinit() 释放 DRAM。节省 ~60-80KB 内部 RAM。 */
     /* BLE 也不再常驻：进入"蓝牙"菜单时才 ble_prov_init()，

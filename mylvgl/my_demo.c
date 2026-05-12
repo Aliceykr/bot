@@ -26,6 +26,7 @@
 #include "psram_task.h"
 #include "music.h"
 #include "speaker.h"
+#include "bemfa.h"
 
 /* 业务临时任务（weather / chat / asr / tts）均为一次性任务，末尾调
  * vTaskDelete(NULL) 后由 IDLE 自动回收栈和 TCB，必须使用 xTaskCreate
@@ -42,6 +43,7 @@ static void game_back_btn_cb(lv_event_t *e);
 static void ble_cred_cb(const char *ssid, const char *password);
 static void show_music_screen(void);
 static void show_volume_screen(void);
+static void show_bemfa_screen(void);
 
 /* 全局 UI 对象 */
 static lv_obj_t *list;
@@ -1770,6 +1772,359 @@ static void show_volume_screen(void)
     lv_screen_load_anim(vol_scr, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
 }
 
+// ================================================================
+// 智能设备界面（巴法云 TCP 设备云）
+//
+// 流程：
+//   1. 进入界面 → 显示 "加载中..." spinner
+//   2. 后台任务 PSRAM 栈 bemfa_list_task 调 bemfa_list_devices（阻塞 HTTPS）
+//   3. 结果投进 queue，UI 定时 timer 消费 queue，绘制设备列表
+//   4. 每个设备是一个 list button，显示"名称  [on/off]"
+//   5. 点击 → 后台 bemfa_toggle_task 调 bemfa_toggle
+//   6. toggle 成功后再跑一次后台 list 刷新 UI
+//
+// 前提：
+//   WiFi 必须已连接，未连提示"请先连接 WiFi"
+// ================================================================
+
+#define BEMFA_DEVICE_TAG  "BEMFA_UI"
+
+static lv_obj_t    *bemfa_scr         = NULL;
+static lv_obj_t    *bemfa_list        = NULL;
+static lv_obj_t    *bemfa_spinner     = NULL;
+static lv_obj_t    *bemfa_status_lbl  = NULL;
+static lv_timer_t  *bemfa_poll_timer  = NULL;
+static QueueHandle_t bemfa_list_queue  = NULL;   /* bemfa_device_t 数组投递 */
+static QueueHandle_t bemfa_toggle_queue = NULL;  /* bool 结果投递 */
+static lv_group_t  *bemfa_group       = NULL;
+
+/* 后台任务与 LVGL 线程的同步（H1 防护）：
+ *   bemfa_scr_delete_cb 置 active=false 并持锁删除 queue
+ *   后台任务完成时锁内检查 active：
+ *     active=true  → 把结果塞进 queue
+ *     active=false → 屏幕已退出，直接丢弃（否则 xQueueSend 会对已释放队列操作崩溃）
+ * 锁同时保护 bemfa_list_queue / bemfa_toggle_queue 指针，避免 TOCTOU */
+static SemaphoreHandle_t bemfa_ui_mtx        = NULL;
+static volatile bool     bemfa_screen_active = false;
+
+static inline void bemfa_ui_lock(void)
+{
+    if (!bemfa_ui_mtx) bemfa_ui_mtx = xSemaphoreCreateMutex();
+    if (bemfa_ui_mtx) xSemaphoreTake(bemfa_ui_mtx, portMAX_DELAY);
+}
+static inline void bemfa_ui_unlock(void)
+{
+    if (bemfa_ui_mtx) xSemaphoreGive(bemfa_ui_mtx);
+}
+
+/* 列表数据（PSRAM 动态分配）*/
+typedef struct {
+    bool    ok;
+    int     count;
+    bemfa_device_t devices[BEMFA_MAX_DEVICES];
+} bemfa_list_result_t;
+
+/* 后台列表拉取任务 */
+static void bemfa_list_task(void *arg)
+{
+    (void)arg;
+    bemfa_list_result_t *r = heap_caps_malloc(sizeof(*r), MALLOC_CAP_SPIRAM);
+    if (!r) { vTaskDelete(NULL); return; }
+    memset(r, 0, sizeof(*r));
+
+    r->ok = bemfa_list_devices(r->devices, &r->count);
+
+    /* 投递 queue 前锁内检查屏幕是否还在。否则屏幕已退出的情况下
+     * xQueueSend 会操作已删除 queue → 崩溃（H1）。 */
+    bemfa_ui_lock();
+    bool delivered = false;
+    if (bemfa_screen_active && bemfa_list_queue) {
+        if (xQueueSend(bemfa_list_queue, &r, 0) == pdTRUE) {
+            delivered = true;
+        }
+    }
+    bemfa_ui_unlock();
+
+    if (!delivered) heap_caps_free(r);
+    vTaskDelete(NULL);
+}
+
+/* 后台 toggle 任务 */
+typedef struct {
+    char topic[BEMFA_MAX_TOPIC_LEN];
+    char current_msg[BEMFA_MAX_MSG_LEN];
+} bemfa_toggle_args_t;
+
+static void bemfa_toggle_task(void *arg)
+{
+    bemfa_toggle_args_t *a = (bemfa_toggle_args_t *)arg;
+    char new_msg[8];
+    bool ok = bemfa_toggle(a->topic, a->current_msg, new_msg, sizeof(new_msg));
+    free(a);
+
+    /* 跟 list_task 同样的 H1 防护 */
+    bemfa_ui_lock();
+    if (bemfa_screen_active && bemfa_toggle_queue) {
+        xQueueSend(bemfa_toggle_queue, &ok, 0);
+    }
+    bemfa_ui_unlock();
+    vTaskDelete(NULL);
+}
+
+/* 启动后台 list 拉取（spinner 状态显示）*/
+static void bemfa_kick_refresh(void)
+{
+    if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
+        lv_label_set_text(bemfa_status_lbl, "加载中...");
+    }
+    BaseType_t r = xTaskCreatePSRAM(bemfa_list_task, "bemfa_list", 8192, NULL, 3, NULL);
+    if (r != pdPASS) {
+        ESP_LOGE(BEMFA_DEVICE_TAG, "bemfa_list_task 创建失败");
+        if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
+            lv_label_set_text(bemfa_status_lbl, "内存不足，请重试");
+        }
+    }
+}
+
+/* 销毁当前列表条目（保留 "返回" 按钮）*/
+static void bemfa_clear_list(void)
+{
+    if (!bemfa_list || !lv_obj_is_valid(bemfa_list)) return;
+    /* list 的第 0 个子是"返回"，从第 1 个开始删 */
+    uint32_t n = lv_obj_get_child_count(bemfa_list);
+    while (n > 1) {
+        lv_obj_t *child = lv_obj_get_child(bemfa_list, 1);
+        if (!child) break;
+        if (bemfa_group) lv_group_remove_obj(child);
+        lv_obj_delete(child);
+        n--;
+    }
+}
+
+static void bemfa_device_click_cb(lv_event_t *e);
+
+/* 释放挂在列表按钮 user_data 上的 bemfa_toggle_args_t，LV_EVENT_DELETE 触发 */
+static void bemfa_btn_args_free_cb(lv_event_t *e)
+{
+    bemfa_toggle_args_t *args = (bemfa_toggle_args_t *)lv_event_get_user_data(e);
+    if (args) free(args);
+}
+
+/* 把设备列表渲染到 LVGL */
+static void bemfa_render_list(const bemfa_device_t *list, int count)
+{
+    bemfa_clear_list();
+
+    if (count == 0) {
+        lv_obj_t *empty = lv_list_add_text(bemfa_list, "(未创建任何设备)");
+        lv_obj_set_style_text_color(empty, lv_color_hex(0x888888), 0);
+        lv_obj_set_style_text_font(empty, &lv_font_simhei_16, 0);
+        return;
+    }
+
+    for (int i = 0; i < count; ++i) {
+        const bemfa_device_t *d = &list[i];
+        char label[BEMFA_MAX_NAME_LEN + 24];
+        const char *state = (d->msg[0]) ? d->msg : "-";
+        snprintf(label, sizeof(label), "%s  [%s]", d->name, state);
+
+        lv_obj_t *btn = lv_list_add_button(bemfa_list, LV_SYMBOL_HOME, label);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0x16213e), 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0xe94560), LV_STATE_FOCUSED);
+        lv_obj_set_style_text_color(btn, lv_color_hex(0xffffff), 0);
+        lv_obj_t *txt_lbl = lv_obj_get_child(btn, 1);
+        if (txt_lbl) lv_obj_set_style_text_font(txt_lbl, &lv_font_simhei_16, 0);
+
+        /* user_data：我们需要 topic + current_msg 两个，分配一个小结构，
+         * 由 LV_EVENT_DELETE 释放避免泄漏 */
+        bemfa_toggle_args_t *args = malloc(sizeof(*args));
+        if (args) {
+            memset(args, 0, sizeof(*args));
+            strncpy(args->topic, d->topic, sizeof(args->topic) - 1);
+            strncpy(args->current_msg, d->msg, sizeof(args->current_msg) - 1);
+            lv_obj_add_event_cb(btn, bemfa_device_click_cb, LV_EVENT_CLICKED, args);
+            /* 给 btn 挂 DELETE 回调，按钮销毁（切屏 / 刷新列表）时释放 args */
+            lv_obj_add_event_cb(btn, bemfa_btn_args_free_cb, LV_EVENT_DELETE, args);
+        }
+
+        if (bemfa_group) lv_group_add_obj(bemfa_group, btn);
+    }
+}
+
+/* 定时轮询：检查后台任务结果是否到达 */
+static void bemfa_poll_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (!bemfa_scr || !lv_obj_is_valid(bemfa_scr)) return;
+
+    /* 1) list 结果 */
+    bemfa_list_result_t *r = NULL;
+    if (bemfa_list_queue && xQueueReceive(bemfa_list_queue, &r, 0) == pdTRUE && r) {
+        if (r->ok) {
+            bemfa_render_list(r->devices, r->count);
+            if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "共 %d 个设备", r->count);
+                lv_label_set_text(bemfa_status_lbl, buf);
+            }
+        } else {
+            if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
+                lv_label_set_text(bemfa_status_lbl, "加载失败，请重试");
+            }
+        }
+        heap_caps_free(r);
+    }
+
+    /* 2) toggle 结果 */
+    bool ok;
+    if (bemfa_toggle_queue && xQueueReceive(bemfa_toggle_queue, &ok, 0) == pdTRUE) {
+        if (ok) {
+            /* toggle 成功 → 刷新列表展示新状态 */
+            bemfa_kick_refresh();
+        } else {
+            if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
+                lv_label_set_text(bemfa_status_lbl, "切换失败");
+            }
+        }
+    }
+}
+
+/* 点击设备条目 → 异步 toggle */
+static void bemfa_device_click_cb(lv_event_t *e)
+{
+    const bemfa_toggle_args_t *src = (const bemfa_toggle_args_t *)lv_event_get_user_data(e);
+    if (!src || !src->topic[0]) return;
+
+    /* 拷贝一份给任务用，原 args 跟 LVGL 对象生命周期绑定 */
+    bemfa_toggle_args_t *dup = malloc(sizeof(*dup));
+    if (!dup) return;
+    memcpy(dup, src, sizeof(*dup));
+
+    if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
+        lv_label_set_text(bemfa_status_lbl, "切换中...");
+    }
+    BaseType_t r = xTaskCreatePSRAM(bemfa_toggle_task, "bemfa_toggle", 8192, dup, 3, NULL);
+    if (r != pdPASS) {
+        ESP_LOGE(BEMFA_DEVICE_TAG, "bemfa_toggle_task 创建失败");
+        free(dup);
+        if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
+            lv_label_set_text(bemfa_status_lbl, "内存不足，请重试");
+        }
+    }
+}
+
+static void bemfa_back_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    /* UI 清理放 LV_EVENT_DELETE 回调里，这里只负责切屏 */
+    lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
+    indev_set_group(group);
+}
+
+static void bemfa_scr_delete_cb(lv_event_t *e)
+{
+    (void)e;
+    /* 先取锁原子地置 inactive + 抓走 queue 句柄。
+     * 锁后的时刻起，任何后台任务投递尝试都会因 active=false 放弃，
+     * 不会再访问即将删除的 queue（H1 核心防护）。*/
+    bemfa_ui_lock();
+    bemfa_screen_active = false;
+    QueueHandle_t lq = bemfa_list_queue;
+    QueueHandle_t tq = bemfa_toggle_queue;
+    bemfa_list_queue   = NULL;
+    bemfa_toggle_queue = NULL;
+    bemfa_ui_unlock();
+
+    if (bemfa_poll_timer) {
+        lv_timer_delete(bemfa_poll_timer);
+        bemfa_poll_timer = NULL;
+    }
+
+    /* drain + delete。此时后台任务不会再投递新消息，安全销毁。*/
+    if (lq) {
+        bemfa_list_result_t *r = NULL;
+        while (xQueueReceive(lq, &r, 0) == pdTRUE) {
+            if (r) heap_caps_free(r);
+        }
+        vQueueDelete(lq);
+    }
+    if (tq) {
+        vQueueDelete(tq);
+    }
+    if (bemfa_group) {
+        lv_group_delete(bemfa_group);
+        bemfa_group = NULL;
+    }
+    bemfa_scr        = NULL;
+    bemfa_list       = NULL;
+    bemfa_spinner    = NULL;
+    bemfa_status_lbl = NULL;
+}
+
+static void show_bemfa_screen(void)
+{
+    if (wifi_get_status() != WIFI_STATUS_CONNECTED) {
+        create_result_dialog("请先连接 WiFi\n智能设备需要联网", 0xffaa00);
+        return;
+    }
+
+    bemfa_scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(bemfa_scr, lv_color_hex(0x1a1a2e), 0);
+
+    /* 标题 */
+    lv_obj_t *title = lv_label_create(bemfa_scr);
+    lv_label_set_text(title, "智能设备");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xe94560), 0);
+    lv_obj_set_style_text_font(title, &lv_font_simhei_16, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    /* 底部状态条 */
+    bemfa_status_lbl = lv_label_create(bemfa_scr);
+    lv_obj_set_width(bemfa_status_lbl, LCD_W - 16);
+    lv_label_set_long_mode(bemfa_status_lbl, LV_LABEL_LONG_DOT);
+    lv_label_set_text(bemfa_status_lbl, "加载中...");
+    lv_obj_set_style_text_color(bemfa_status_lbl, lv_color_hex(0xcccccc), 0);
+    lv_obj_set_style_text_font(bemfa_status_lbl, &lv_font_simhei_16, 0);
+    lv_obj_align(bemfa_status_lbl, LV_ALIGN_BOTTOM_MID, 0, -8);
+
+    /* 列表区 */
+    bemfa_list = lv_list_create(bemfa_scr);
+    lv_obj_set_size(bemfa_list, LCD_W - 10, LCD_H - 90);
+    lv_obj_align(bemfa_list, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_set_style_bg_color(bemfa_list, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_border_width(bemfa_list, 0, 0);
+    lv_obj_set_style_radius(bemfa_list, 4, 0);
+
+    bemfa_group = lv_group_create();
+
+    /* 返回按钮（固定第一项）*/
+    lv_obj_t *back_btn = lv_list_add_button(bemfa_list, LV_SYMBOL_LEFT, "返回");
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0xe94560), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(back_btn, lv_color_hex(0xffffff), 0);
+    lv_obj_t *back_txt_lbl = lv_obj_get_child(back_btn, 1);
+    if (back_txt_lbl) lv_obj_set_style_text_font(back_txt_lbl, &lv_font_simhei_16, 0);
+    lv_obj_add_event_cb(back_btn, bemfa_back_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_group_add_obj(bemfa_group, back_btn);
+
+    /* 创建 queue + 定时轮询 timer */
+    bemfa_list_queue   = xQueueCreate(2, sizeof(bemfa_list_result_t *));
+    bemfa_toggle_queue = xQueueCreate(4, sizeof(bool));
+    bemfa_poll_timer   = lv_timer_create(bemfa_poll_tick, 200, NULL);
+
+    indev_set_group(bemfa_group);
+    lv_obj_add_event_cb(bemfa_scr, bemfa_scr_delete_cb, LV_EVENT_DELETE, NULL);
+
+    /* 标记屏幕活跃：这之后后台任务完成时可以投递 queue */
+    bemfa_ui_lock();
+    bemfa_screen_active = true;
+    bemfa_ui_unlock();
+
+    /* 切屏完成后启动后台拉取 */
+    lv_screen_load_anim(bemfa_scr, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+    bemfa_kick_refresh();
+}
+
 static void list_event_cb(lv_event_t *e)
 {
     lv_obj_t *btn = lv_event_get_target(e);
@@ -1803,6 +2158,8 @@ static void list_event_cb(lv_event_t *e)
         show_music_screen();
     } else if (strstr(txt, "音量")) {
         show_volume_screen();
+    } else if (strstr(txt, "智能设备")) {
+        show_bemfa_screen();
     } else if (strstr(txt, "游戏")) {
         show_game_screen();
     }
@@ -1847,6 +2204,7 @@ void my_demo(void)
         LV_SYMBOL_BLUETOOTH,   /* 蓝牙配网 */
         LV_SYMBOL_SD_CARD,     /* 音乐：SD 卡 WAV 播放 */
         LV_SYMBOL_VOLUME_MAX,  /* 音量调节 */
+        LV_SYMBOL_HOME,        /* 智能设备（巴法云）*/
     };
     static const char *labels[] = {
         "环境监测",
@@ -1858,11 +2216,12 @@ void my_demo(void)
         "蓝牙",
         "音乐",
         "音量",
+        "智能设备",
     };
 
     group = lv_group_create();
 
-    for (int i = 0; i < 9; i++) {
+    for (int i = 0; i < 10; i++) {
         lv_obj_t *btn = lv_list_add_button(list, icons[i], labels[i]);
         lv_obj_set_style_bg_color(btn, lv_color_hex(0x16213e), 0);
         lv_obj_set_style_bg_color(btn, lv_color_hex(0xe94560), LV_STATE_FOCUSED);
