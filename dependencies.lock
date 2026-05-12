@@ -54,7 +54,7 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 5.1.2
+    version: 5.4.3
 direct_dependencies:
 - espressif/esp-sr
 - idf
