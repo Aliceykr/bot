@@ -1,53 +1,44 @@
 #include "rom_loader.h"
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include "esp_log.h"
-#include "esp_spiffs.h"
 #include "esp_heap_caps.h"
+#include "sdcard.h"
 
 #define TAG "ROM_LOADER"
 
-#define SPIFFS_BASE      "/spiffs"
-#define ROM_DIR          "/spiffs/roms"
-#define SPIFFS_LABEL     "storage"   /* 对应 partitions.csv 里 spiffs 的 Name */
+/* ROM 现在全部从 SD 卡读取：/sdcard/roms/ 下的 .gb / .gbc 文件
+ *
+ * 以前的 SPIFFS 方案已废弃，storage 分区从 partitions.csv 删除，app0/app1
+ * 各扩到 6.5MB。
+ *
+ * rom_loader_init 名字保留以兼容 main.c 调用处，但现在仅做一次日志；
+ * SD 卡由 main.c 的 sdcard_mount() 统一挂载。*/
+#define ROM_DIR          SDCARD_MOUNT_POINT "/rom"
 
-static bool s_mounted = false;
+static bool s_logged_once = false;
 
 bool rom_loader_init(void)
 {
-    if (s_mounted) return true;
-
-    esp_vfs_spiffs_conf_t conf = {
-        .base_path       = SPIFFS_BASE,
-        .partition_label = NULL,   /* 留 NULL 按类型 spiffs 找第一个分区 */
-        .max_files       = 4,
-        .format_if_mount_failed = false,
-    };
-
-    esp_err_t err = esp_vfs_spiffs_register(&conf);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SPIFFS 挂载失败: %s", esp_err_to_name(err));
-        return false;
+    if (!s_logged_once) {
+        s_logged_once = true;
+        if (sdcard_is_mounted()) {
+            ESP_LOGI(TAG, "ROM 源: %s", ROM_DIR);
+        } else {
+            ESP_LOGW(TAG, "SD 卡未挂载，ROM 功能不可用");
+        }
     }
-
-    size_t total = 0, used = 0;
-    if (esp_spiffs_info(NULL, &total, &used) == ESP_OK) {
-        ESP_LOGI(TAG, "SPIFFS: %u / %u bytes used", (unsigned)used, (unsigned)total);
-    }
-
-    /* 确保 roms 目录存在（SPIFFS 不支持真正的目录层级，但路径前缀过滤有效）*/
-    s_mounted = true;
-    return true;
+    return sdcard_is_mounted();
 }
 
 static bool has_gb_ext(const char *name)
 {
     size_t len = strlen(name);
     if (len < 4) return false;
-    const char *ext = name + len - 3;
-    if (strcasecmp(ext, ".gb") == 0) return true;
+    if (strcasecmp(name + len - 3, ".gb") == 0) return true;
     if (len >= 5 && strcasecmp(name + len - 4, ".gbc") == 0) return true;
     return false;
 }
@@ -57,30 +48,27 @@ bool rom_loader_scan(rom_entry_t *list, int *count)
     if (!list || !count) return false;
     *count = 0;
 
-    if (!rom_loader_init()) return false;
-
-    /* SPIFFS 是扁平的，但支持路径前缀查找。opendir ROM_DIR 可能返回所有
-     * 以 "/roms/" 开头的文件。为了兼容性，尝试 ROM_DIR 失败则扫 SPIFFS_BASE。*/
-    DIR *d = opendir(ROM_DIR);
-    const char *scan_path = ROM_DIR;
-    if (!d) {
-        d = opendir(SPIFFS_BASE);
-        scan_path = SPIFFS_BASE;
+    if (!sdcard_is_mounted()) {
+        ESP_LOGW(TAG, "scan: SD 卡未挂载");
+        return false;
     }
+
+    DIR *d = opendir(ROM_DIR);
     if (!d) {
-        ESP_LOGW(TAG, "无法打开 %s", scan_path);
-        return true;  /* 不是错误，只是没有 ROM */
+        /* 用户可能还没建 roms 目录，这不是错误，返回空列表 */
+        ESP_LOGW(TAG, "%s 不存在，请在 SD 卡上创建 roms/ 目录", ROM_DIR);
+        return true;
     }
 
     struct dirent *de;
     while ((de = readdir(d)) != NULL && *count < ROM_MAX_COUNT) {
+        if (de->d_type == DT_DIR) continue;
         if (!has_gb_ext(de->d_name)) continue;
 
         /* 构造完整路径以 stat 取文件大小
-         * d_name 理论最大 NAME_MAX=255，scan_path 固定路径 < 32，
-         * 故 320 字节缓冲足以容纳最坏情况 */
+         * d_name 最大 NAME_MAX=255，路径前缀 < 32 字节，320 足够 */
         char full[320];
-        snprintf(full, sizeof(full), "%s/%s", scan_path, de->d_name);
+        snprintf(full, sizeof(full), "%s/%s", ROM_DIR, de->d_name);
         struct stat st;
         size_t fsize = 0;
         if (stat(full, &st) == 0) fsize = (size_t)st.st_size;
@@ -100,19 +88,16 @@ bool rom_loader_scan(rom_entry_t *list, int *count)
 void *rom_loader_read(const char *name, size_t *size)
 {
     if (!name || !size) return NULL;
-    if (!rom_loader_init()) return NULL;
+    if (!sdcard_is_mounted()) {
+        ESP_LOGE(TAG, "read: SD 卡未挂载");
+        return NULL;
+    }
 
-    /* 依次尝试 ROM_DIR/name 和 SPIFFS_BASE/name
-     * 路径缓冲 320 字节足以容纳最长 d_name (255) + 前缀 */
     char path[320];
     snprintf(path, sizeof(path), "%s/%s", ROM_DIR, name);
     FILE *fp = fopen(path, "rb");
     if (!fp) {
-        snprintf(path, sizeof(path), "%s/%s", SPIFFS_BASE, name);
-        fp = fopen(path, "rb");
-    }
-    if (!fp) {
-        ESP_LOGE(TAG, "打开 ROM 失败: %s", name);
+        ESP_LOGE(TAG, "打开 ROM 失败: %s", path);
         return NULL;
     }
 
@@ -133,7 +118,7 @@ void *rom_loader_read(const char *name, size_t *size)
         return NULL;
     }
 
-    /* 分块读取（fread 大块在 SPIFFS 上稳定性好过一次性全读）*/
+    /* 分块读取：4KB 对 FATFS 是较好的平衡点 */
     size_t total = 0;
     const size_t chunk = 4096;
     uint8_t *p = (uint8_t *)buf;

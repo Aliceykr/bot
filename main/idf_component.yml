@@ -2,3 +2,10 @@
 dependencies:
   idf: ">=5.1.0"
   espressif/esp-sr: "^2.0.0"
+
+  # Helix MP3 解码器（fixed-point，RAM 占用最小）
+  # - 解码 context ~5KB 堆
+  # - 每帧输出 PCM 2304 样本 × 2 通道 × 2 字节 = 9KB（我们只取单声道 4.6KB）
+  # 选这个而非 minimp3（~16KB）/esp_audio_codec（~20KB）是因为 DRAM 紧张，
+  # BLE / WiFi / LVGL 已经占掉大部分内部 RAM。
+  chmorgan/esp-libhelix-mp3: "^1.0.1"

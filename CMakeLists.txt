@@ -10,8 +10,17 @@ set(EXTRA_COMPONENT_DIRS
 )
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+
+# 告诉 GCC 源码文件是 UTF-8 编码（Windows 上 GCC 默认按系统代码页 GBK
+# 解析，会把 UTF-8 中文注释里的高字节当成 stray 字符报错 Werror=comment）。
+# 必须在 project() 之前调用，否则只对项目最后一个 add_executable 生效。
+# -finput-charset=UTF-8  输入源文件字符集
+# -fexec-charset=UTF-8   字符串字面量在目标机器上的字符集（保持 UTF-8）
+idf_build_set_property(COMPILE_OPTIONS
+    "-finput-charset=UTF-8;-fexec-charset=UTF-8"
+    APPEND)
+
 project(bot)
 
-# 把 spiffs_image/ 目录打包成 SPIFFS 镜像，烧录到名为 "storage" 的分区
-# 使用命令: idf.py flash storage-flash  （或 idf.py flash 同时烧代码和存储）
-spiffs_create_partition_image(storage spiffs_image FLASH_IN_PROJECT)
+# ROM 和音乐文件从 SD 卡读取，不再打包 SPIFFS 镜像。
+# 原来的 spiffs_image/ 目录只作为参考样例保留，不再参与构建。

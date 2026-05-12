@@ -24,6 +24,8 @@
 #include "lv_port_indev.h"
 #include "keypad.h"
 #include "psram_task.h"
+#include "music.h"
+#include "speaker.h"
 
 /* 业务临时任务（weather / chat / asr / tts）均为一次性任务，末尾调
  * vTaskDelete(NULL) 后由 IDLE 自动回收栈和 TCB，必须使用 xTaskCreate
@@ -38,6 +40,8 @@ static void close_btn_cb(lv_event_t *e);
 static void show_game_screen(void);
 static void game_back_btn_cb(lv_event_t *e);
 static void ble_cred_cb(const char *ssid, const char *password);
+static void show_music_screen(void);
+static void show_volume_screen(void);
 
 /* 全局 UI 对象 */
 static lv_obj_t *list;
@@ -1394,6 +1398,362 @@ static void show_game_screen(void)
     lv_screen_load_anim(scr, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
 }
 
+// ================================================================
+// 音乐界面：SD 卡 WAV 播放
+//
+// 设计：
+//   单屏模式 — 列表在主体区，底部一个状态条显示"正在播放: xxx"。
+//   交互：
+//     旋转编码器         → 在列表项之间移动焦点
+//     按编码器键        → 点击当前列表项 = 切换播放/停止该曲
+//   进/退：
+//     列表左上角 "←返回" 按钮（焦点可到达，按编码器键触发）
+//
+// 不暂停 WiFi / BLE，不关 LVGL，只是前台播放 WAV。
+// 退出音乐屏幕时自动 stop 当前播放。
+// ================================================================
+
+static lv_obj_t    *music_scr        = NULL;
+static lv_obj_t    *music_list       = NULL;
+static lv_obj_t    *music_status_lbl = NULL;
+static lv_timer_t  *music_status_timer = NULL;
+static char         music_playing_name[96] = "";  /* 当前播放文件名（UI 用） */
+/* 扫描缓冲：music_entry_t * MUSIC_MAX_COUNT ≈ 4.8KB。
+ * 用函数内 PSRAM 堆分配代替 BSS 静态数组，退出时 free，省内部 DRAM。*/
+static music_entry_t *s_music_scan_buf = NULL;
+
+/* 状态条定时刷新：显示当前播放文件名和状态 */
+static void music_status_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (!music_status_lbl || !lv_obj_is_valid(music_status_lbl)) return;
+    music_state_t st = music_state();
+    const char *name = music_current_name();
+    if (st == MUSIC_STATE_PLAYING && name && name[0]) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), LV_SYMBOL_AUDIO " 正在播放: %s", name);
+        lv_label_set_text(music_status_lbl, buf);
+    } else if (st == MUSIC_STATE_PAUSED && name && name[0]) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), LV_SYMBOL_PAUSE " 已暂停: %s", name);
+        lv_label_set_text(music_status_lbl, buf);
+    } else {
+        lv_label_set_text(music_status_lbl, "空闲（旋转选曲，按键播放/停止）");
+    }
+}
+
+/* 异步播放请求：UI 线程调 music_play 同样会阻塞（内部 music_stop 要等 2s），
+ * 用一次性 task 投递，LVGL 线程立刻返回。
+ * path 是 strdup 出来的，任务自己 free。*/
+/* 一次性任务：异步调 music_stop 后自删。
+ * 背景：LVGL 线程直接调 music_stop 会阻塞最多 2s 等音乐任务退出，
+ * UI 明显卡顿。把 stop 放到另一个小任务做，UI 立即返回，stop 在后台执行。*/
+static void music_stop_task_cb(void *arg)
+{
+    (void)arg;
+    music_stop();
+    vTaskDelete(NULL);
+}
+
+static void music_play_task(void *arg)
+{
+    char *path = (char *)arg;
+    music_play(path);   /* music_play 内部再 strdup，所以我们的副本要释放 */
+    free(path);
+    vTaskDelete(NULL);
+}
+
+/* 屏幕销毁回调：无论哪条退出路径（back_btn / 未来手势 / 异常删除），
+ * 只要 music_scr 被 LVGL 删除就释放扫描缓冲。
+ * 跟 group_delete_cb 一样挂在 LV_EVENT_DELETE 上，LVGL 保证单线程调用。*/
+static void music_scan_buf_delete_cb(lv_event_t *e)
+{
+    (void)e;
+    if (s_music_scan_buf) {
+        heap_caps_free(s_music_scan_buf);
+        s_music_scan_buf = NULL;
+    }
+    /* 同时清零全局 UI 句柄，防止屏幕删除后其他回调（如 status_tick 已通过
+     * lv_obj_is_valid 做了兜底，但清 NULL 更保险）继续访问野指针 */
+    music_status_lbl = NULL;
+    music_list       = NULL;
+    music_scr        = NULL;
+    /* 状态 timer 理论上应该在 back_btn 里已经 delete，但保险起见再兜底一次：
+     * timer 指针在 back_btn 里会清为 NULL，若因异常路径没清，这里 delete。 */
+    if (music_status_timer) {
+        lv_timer_delete(music_status_timer);
+        music_status_timer = NULL;
+    }
+}
+
+static void music_back_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    /* 退出音乐屏幕。
+     *
+     * 实际的 UI 清理（timer / scan_buf / 全局句柄）放在
+     * music_scan_buf_delete_cb 里由 LVGL 的 LV_EVENT_DELETE 触发，
+     * 这样手势、异常退出等其他路径也能自动清理。
+     *
+     * 这里只做两件事：
+     *   1. 切回主菜单屏幕（lv_screen_load_anim auto_del=true 会触发老屏幕
+     *      的 LV_EVENT_DELETE → 清理回调被调）
+     *   2. 异步 stop 当前播放（LVGL 线程不能同步等 2s） */
+    if (music_state() != MUSIC_STATE_IDLE) {
+        BaseType_t r = xTaskCreate(music_stop_task_cb, "music_stop",
+                                   2048, NULL, 3, NULL);
+        if (r != pdPASS) {
+            ESP_LOGW("DEMO", "music_stop_task 创建失败，降级同步 stop");
+            music_stop();
+        }
+    }
+
+    lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
+    indev_set_group(group);
+}
+
+/* 点击列表项：
+ *   - 如果正在播放这首 → stop（异步）
+ *   - 否则（空闲 / 播放别的 / 暂停） → 切换到这首重新播（异步）
+ *
+ * 所有 music_stop / music_play 都走后台任务，LVGL 线程立即返回。
+ * music_play 内部会先 music_stop 旧任务，这段 2s 等待也在后台任务里做。 */
+static void music_item_click_cb(lv_event_t *e)
+{
+    lv_obj_t *btn = lv_event_get_target(e);
+    lv_obj_t *lbl = lv_obj_get_child(btn, 1);
+    if (!lbl) return;
+    const char *name = lv_label_get_text(lbl);
+    if (!name) return;
+
+    const char *cur = music_current_name();
+    if (music_state() != MUSIC_STATE_IDLE && cur && strcmp(cur, name) == 0) {
+        /* 同一首：异步停 */
+        BaseType_t r = xTaskCreate(music_stop_task_cb, "music_stop",
+                                   2048, NULL, 3, NULL);
+        if (r != pdPASS) {
+            ESP_LOGW("DEMO", "music_stop_task 创建失败，降级同步 stop");
+            music_stop();
+        }
+        return;
+    }
+
+    /* 切换到这首：异步播放。
+     * 路径用 strdup 放堆，music_play_task 结束时释放；
+     * music_play 内部会再 strdup 一份给 music_task 用，所以释放安全。 */
+    char path[128];
+    music_full_path(name, path, sizeof(path));
+    snprintf(music_playing_name, sizeof(music_playing_name), "%s", name);
+
+    char *path_dup = strdup(path);
+    if (!path_dup) {
+        ESP_LOGE("DEMO", "strdup 失败，降级同步 play");
+        music_play(path);
+        return;
+    }
+    BaseType_t r = xTaskCreate(music_play_task, "music_play",
+                               2048, path_dup, 3, NULL);
+    if (r != pdPASS) {
+        ESP_LOGW("DEMO", "music_play_task 创建失败，降级同步 play");
+        free(path_dup);
+        music_play(path);
+    }
+}
+
+static void show_music_screen(void)
+{
+    /* SD 卡挂载检查：没 SD 就弹窗 */
+    extern bool sdcard_is_mounted(void);
+    if (!sdcard_is_mounted()) {
+        create_result_dialog("未检测到 SD 卡\n请插卡后重启", 0xffaa00);
+        return;
+    }
+
+    /* 扫歌：用 PSRAM 动态分配代替 static BSS，省内部 DRAM */
+    if (!s_music_scan_buf) {
+        s_music_scan_buf = heap_caps_malloc(sizeof(music_entry_t) * MUSIC_MAX_COUNT,
+                                             MALLOC_CAP_SPIRAM);
+        if (!s_music_scan_buf) {
+            create_result_dialog("PSRAM 不足，无法扫描", 0xff0000);
+            return;
+        }
+    }
+    int count = 0;
+    if (!music_scan(s_music_scan_buf, &count)) {
+        create_result_dialog("扫描音乐失败", 0xff0000);
+        /* 扫描失败也释放缓冲，避免永久占用 */
+        heap_caps_free(s_music_scan_buf);
+        s_music_scan_buf = NULL;
+        return;
+    }
+
+    music_scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(music_scr, lv_color_hex(0x1a1a2e), 0);
+
+    /* 标题 */
+    lv_obj_t *title = lv_label_create(music_scr);
+    lv_label_set_text(title, "音乐 - SD 卡");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xe94560), 0);
+    lv_obj_set_style_text_font(title, &lv_font_simhei_16, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    /* 底部状态条 */
+    music_status_lbl = lv_label_create(music_scr);
+    lv_obj_set_width(music_status_lbl, LCD_W - 16);
+    lv_label_set_long_mode(music_status_lbl, LV_LABEL_LONG_DOT);
+    lv_label_set_text(music_status_lbl, "空闲（旋转选曲，按键播放/停止）");
+    lv_obj_set_style_text_color(music_status_lbl, lv_color_hex(0xcccccc), 0);
+    lv_obj_set_style_text_font(music_status_lbl, &lv_font_simhei_16, 0);
+    lv_obj_align(music_status_lbl, LV_ALIGN_BOTTOM_MID, 0, -8);
+
+    /* 列表区（留出底部状态条） */
+    music_list = lv_list_create(music_scr);
+    lv_obj_set_size(music_list, LCD_W - 10, LCD_H - 90);
+    lv_obj_align(music_list, LV_ALIGN_TOP_MID, 0, 34);
+    lv_obj_set_style_bg_color(music_list, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_border_width(music_list, 0, 0);
+    lv_obj_set_style_radius(music_list, 4, 0);
+
+    lv_group_t *mg = lv_group_create();
+
+    /* 返回按钮 */
+    lv_obj_t *back_btn = lv_list_add_button(music_list, LV_SYMBOL_LEFT, "返回");
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0xe94560), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(back_btn, lv_color_hex(0xffffff), 0);
+    lv_obj_t *back_txt_lbl = lv_obj_get_child(back_btn, 1);
+    if (back_txt_lbl) lv_obj_set_style_text_font(back_txt_lbl, &lv_font_simhei_16, 0);
+    lv_obj_add_event_cb(back_btn, music_back_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_group_add_obj(mg, back_btn);
+
+    if (count == 0) {
+        /* 空列表提示项（不能点击）*/
+        lv_obj_t *empty = lv_list_add_text(music_list, "(music/ 目录为空或无 WAV)");
+        lv_obj_set_style_text_color(empty, lv_color_hex(0x888888), 0);
+        lv_obj_set_style_text_font(empty, &lv_font_simhei_16, 0);
+    } else {
+        for (int i = 0; i < count; ++i) {
+            lv_obj_t *btn = lv_list_add_button(music_list, LV_SYMBOL_AUDIO, s_music_scan_buf[i].name);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x16213e), 0);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0xe94560), LV_STATE_FOCUSED);
+            lv_obj_set_style_text_color(btn, lv_color_hex(0xffffff), 0);
+            lv_obj_t *txt_lbl = lv_obj_get_child(btn, 1);
+            if (txt_lbl) lv_obj_set_style_text_font(txt_lbl, &lv_font_simhei_16, 0);
+            lv_obj_add_event_cb(btn, music_item_click_cb, LV_EVENT_CLICKED, NULL);
+            lv_group_add_obj(mg, btn);
+        }
+    }
+
+    indev_set_group(mg);
+    lv_obj_add_event_cb(music_scr, group_delete_cb, LV_EVENT_DELETE, mg);
+    /* 挂扫描缓冲释放回调：任何退出路径（包括未来加的手势、异常删除）都会触发 */
+    lv_obj_add_event_cb(music_scr, music_scan_buf_delete_cb, LV_EVENT_DELETE, NULL);
+
+    /* 状态刷新 timer：500ms 刷一次 */
+    music_status_timer = lv_timer_create(music_status_tick, 500, NULL);
+
+    lv_screen_load_anim(music_scr, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+}
+
+// ================================================================
+// 音量调节界面
+//
+// 单屏：一个水平 slider (0..100) + 中央百分比大号数字。
+// 交互：
+//   旋转编码器  → slider 值 ±5 / step（LVGL slider 默认编码器每格 1，但
+//                设成 step=5 让调整快一些）
+//   按编码器键  → 返回主菜单
+// ================================================================
+static lv_obj_t *vol_scr         = NULL;
+static lv_obj_t *vol_slider      = NULL;
+static lv_obj_t *vol_pct_label   = NULL;
+
+static void vol_slider_value_changed(lv_event_t *e)
+{
+    lv_obj_t *sl = lv_event_get_target(e);
+    int32_t v = lv_slider_get_value(sl);
+    /* 实时应用音量 + 更新百分比显示。NVS 写入由 speaker 内部完成。*/
+    speaker_set_volume((uint8_t)v);
+    if (vol_pct_label && lv_obj_is_valid(vol_pct_label)) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%ld %%", (long)v);
+        lv_label_set_text(vol_pct_label, buf);
+    }
+}
+
+/* "返回" 按钮 */
+static void vol_back_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    vol_slider    = NULL;
+    vol_pct_label = NULL;
+    vol_scr       = NULL;
+    lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
+    indev_set_group(group);
+}
+
+static void show_volume_screen(void)
+{
+    vol_scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(vol_scr, lv_color_hex(0x1a1a2e), 0);
+
+    /* 标题 */
+    lv_obj_t *title = lv_label_create(vol_scr);
+    lv_label_set_text(title, "音量调节");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xe94560), 0);
+    lv_obj_set_style_text_font(title, &lv_font_simhei_16, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    /* 中央大号百分比 */
+    vol_pct_label = lv_label_create(vol_scr);
+    uint8_t cur = speaker_get_volume();
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%u %%", (unsigned)cur);
+    lv_label_set_text(vol_pct_label, buf);
+    lv_obj_set_style_text_color(vol_pct_label, lv_color_hex(0xffffff), 0);
+    /* 用 Montserrat 内置大字号（纯数字 + %，不需要中文）。LVGL 9 里如果
+     * 没开 42 号字，退一档。*/
+    lv_obj_set_style_text_font(vol_pct_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(vol_pct_label, LV_ALIGN_CENTER, 0, -24);
+
+    /* 滑块 */
+    vol_slider = lv_slider_create(vol_scr);
+    lv_obj_set_width(vol_slider, LCD_W - 60);
+    lv_slider_set_range(vol_slider, 0, 100);
+    lv_slider_set_value(vol_slider, cur, LV_ANIM_OFF);
+    lv_obj_align(vol_slider, LV_ALIGN_CENTER, 0, 16);
+    lv_obj_set_style_bg_color(vol_slider, lv_color_hex(0x404060), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(vol_slider, lv_color_hex(0xe94560), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(vol_slider, lv_color_hex(0xe94560), LV_PART_KNOB);
+    lv_obj_add_event_cb(vol_slider, vol_slider_value_changed, LV_EVENT_VALUE_CHANGED, NULL);
+
+    /* 提示条 */
+    lv_obj_t *tip = lv_label_create(vol_scr);
+    lv_label_set_text(tip, "旋转：调节       按键：返回");
+    lv_obj_set_style_text_color(tip, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_font(tip, &lv_font_simhei_16, 0);
+    lv_obj_align(tip, LV_ALIGN_BOTTOM_MID, 0, -12);
+
+    /* 编码器 group：滑块 + 一个不可见的"返回触发器"，按键默认行为是切换
+     * slider 的 edit/focus 模式，LVGL 9 编码器单按一次先进入 edit 模式再次
+     * 按才退出 — 这导致用户"按一下就返回"的期望体验不同。为了让按键直接
+     * 返回，我们给 slider 单独处理 LV_EVENT_CLICKED 事件。*/
+    static bool vol_slider_edit_active = false;
+    (void)vol_slider_edit_active;  /* 静态状态由 lv_indev 管，这里不用手动管 */
+
+    lv_group_t *vg = lv_group_create();
+    lv_group_add_obj(vg, vol_slider);
+    /* slider 被按下时返回 */
+    lv_obj_add_event_cb(vol_slider, vol_back_btn_cb, LV_EVENT_CLICKED, NULL);
+    /* 默认让编码器直接在 slider 上调值（不进入 edit 模式） */
+    lv_group_set_editing(vg, true);
+
+    indev_set_group(vg);
+    lv_obj_add_event_cb(vol_scr, group_delete_cb, LV_EVENT_DELETE, vg);
+
+    lv_screen_load_anim(vol_scr, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+}
+
 static void list_event_cb(lv_event_t *e)
 {
     lv_obj_t *btn = lv_event_get_target(e);
@@ -1423,6 +1783,10 @@ static void list_event_cb(lv_event_t *e)
         show_sr_cmd_screen();
     } else if (strstr(txt, "蓝牙")) {
         show_ble_screen();
+    } else if (strstr(txt, "音乐")) {
+        show_music_screen();
+    } else if (strstr(txt, "音量")) {
+        show_volume_screen();
     } else if (strstr(txt, "游戏")) {
         show_game_screen();
     }
@@ -1465,6 +1829,8 @@ void my_demo(void)
         LV_SYMBOL_AUDIO,
         LV_SYMBOL_BELL,        /* 语音命令（ESP-SR 离线） */
         LV_SYMBOL_BLUETOOTH,   /* 蓝牙配网 */
+        LV_SYMBOL_SD_CARD,     /* 音乐：SD 卡 WAV 播放 */
+        LV_SYMBOL_VOLUME_MAX,  /* 音量调节 */
     };
     static const char *labels[] = {
         "环境监测",
@@ -1474,11 +1840,13 @@ void my_demo(void)
         "语音助手",
         "语音命令",
         "蓝牙",
+        "音乐",
+        "音量",
     };
 
     group = lv_group_create();
 
-    for (int i = 0; i < 7; i++) {
+    for (int i = 0; i < 9; i++) {
         lv_obj_t *btn = lv_list_add_button(list, icons[i], labels[i]);
         lv_obj_set_style_bg_color(btn, lv_color_hex(0x16213e), 0);
         lv_obj_set_style_bg_color(btn, lv_color_hex(0xe94560), LV_STATE_FOCUSED);

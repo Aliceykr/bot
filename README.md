@@ -1,6 +1,6 @@
 # Bot — ESP32-S3 AI 智能语音助手 & Game Boy 模拟器
 
-基于 ESP-IDF + LVGL 的 ESP32-S3 嵌入式项目，集成 WiFi、天气查询、AI 聊天、在线/离线语音识别、语音合成、Game Boy 游戏模拟器（含音频）、BLE 蓝牙配网、MicroSD 卡存储，配备 TFT LCD 图形界面与旋转编码器 + 按键矩阵交互。
+基于 ESP-IDF + LVGL 的 ESP32-S3 嵌入式项目，集成 WiFi、天气查询、AI 聊天、在线/离线语音识别、语音合成、Game Boy 游戏模拟器（含音频）、BLE 蓝牙配网、MicroSD 卡音乐播放器（WAV + MP3）、音量控制，配备 TFT LCD 图形界面与旋转编码器 + 按键矩阵交互。
 
 ---
 
@@ -92,9 +92,9 @@ bot/
 │   ├── main.c                    # 应用入口：初始化外设、创建 LVGL 任务
 │   ├── psram_task.c / .h         # PSRAM 栈任务创建工具（含自动回收 cleaner）
 │   ├── CMakeLists.txt            # 编译入口，列出所有源文件
-│   └── idf_component.yml        # IDF 组件依赖（esp-sr）
+│   └── idf_component.yml        # IDF 组件依赖（esp-sr、helix-mp3）
 ├── mylvgl/
-│   ├── my_demo.c                 # LVGL 主界面逻辑（菜单/天气/聊天/语音/游戏/BLE）
+│   ├── my_demo.c                 # LVGL 主界面逻辑（菜单/天气/聊天/语音/游戏/BLE/音乐/音量）
 │   ├── my_demo.h
 │   ├── lv_port_disp.c / .h       # LVGL 显示驱动（PARTIAL 双缓冲 + 异步 DMA）
 │   ├── lv_port_indev.c / .h      # LVGL 输入设备（PCNT 编码器）
@@ -108,7 +108,7 @@ bot/
 │   ├── model.c / model.h         # LLM 聊天（OpenAI 兼容 REST API）
 │   ├── model_config.h            # API Key / URL / 模型名（已 gitignore）
 │   ├── model_config.h.example    # 配置模板
-│   ├── speaker.c / speaker.h     # MAX98357A I2S 音频输出 + DC-block HPF + 字节尾对齐
+│   ├── speaker.c / speaker.h     # MAX98357A I2S 音频输出 + DC-block HPF + 音量 + 动态采样率
 │   ├── tts.c / tts.h             # 百度语音合成 API（流式 PCM 播放）
 │   ├── weather.c / weather.h     # 天气 HTTP 查询与解析
 │   ├── wifi.c / wifi.h           # WiFi STA 连接 + 守护任务 + mutex 线程安全
@@ -116,6 +116,7 @@ bot/
 │   ├── health.c / health.h       # 堆内存健康监控（60s 周期打印水位）
 │   ├── esp_sr.c / esp_sr.h       # ESP-SR 离线中文命令词识别（AFE + MultiNet7）
 │   ├── ble_prov.c / ble_prov.h   # NimBLE BLE 配网（HM-10 兼容 + mutex 线程安全）
+│   ├── music.c / music.h         # SD 卡音乐播放器（WAV + MP3/helix 解码）
 │   ├── keypad.c / keypad.h       # 3x3 矩阵键盘扫描（游戏控制）
 │   ├── sdcard.c / sdcard.h       # MicroSD 卡 SPI 模式驱动（FATFS 挂载/卸载）
 │   └── lv_font_simhei_16.c       # 思黑体 16px LVGL 中文字体
@@ -125,17 +126,15 @@ bot/
 │   ├── minigb_apu.c              # MiniGB APU 音频处理单元（第三方）
 │   ├── game_2048.c / game_2048.h # 2048 桌面游戏
 │   ├── game_runtime.c / .h       # 游戏生命周期管理（加载/运行/退出）
-│   ├── rom_loader.c / .h         # SPIFFS ROM 扫描与加载
+│   ├── rom_loader.c / .h         # SD 卡 ROM 扫描与加载（原 SPIFFS 已废弃）
 │   ├── walnut_cgb.h              # Walnut-CGB 模拟器核心（高性能，32位路径）
 │   ├── peanut_gb.h               # Peanut-GB 模拟器核心（原始 8 位，备用）
 │   └── CMakeLists.txt
-├── spiffs_image/
-│   └── roms/                     # 放置 .gb / .gbc ROM 文件
 ├── lvgl/                         # LVGL 9.x 源码
 ├── lv_conf.h                     # LVGL 配置
-├── partitions.csv                # 自定义分区表（6MB+5.5MB OTA + SPIFFS + model）
-├── sdkconfig.defaults            # 默认配置（含 ESP32-S3 / BLE / ESP-SR / WiFi 优化）
-└── CMakeLists.txt                # 顶层 CMake
+├── partitions.csv                # 自定义分区表（6.5MB 双 OTA + ESP-SR 模型）
+├── sdkconfig.defaults            # 默认配置（含 ESP32-S3 / BLE / ESP-SR / WiFi / FATFS 优化）
+└── CMakeLists.txt                # 顶层 CMake（UTF-8 编码 + 去掉 SPIFFS 打包）
 ```
 
 ---
@@ -146,13 +145,15 @@ bot/
 
 开机后显示功能列表，通过旋转编码器上下选择、按键确认：
 
-- **WiFi 连接** — 后台连接 WiFi，弹窗显示进度，成功后自动同步 NTP 时间
+- **环境监测** — 占位（开发中）
 - **天气与日期** — HTTP 拉取实时天气，展示温度、湿度、风力、实时时钟
-- **游戏** — 扫描 SPIFFS 中的 .gb/.gbc ROM 文件，选择运行 Game Boy 模拟器
+- **游戏** — 扫描 SD 卡 `/sdcard/rom/` 中的 .gb/.gbc ROM 文件，选择运行 Game Boy 模拟器
 - **聊天助手** — 屏幕键盘输入文字，调用 LLM API 获取回复，滚动对话记录
 - **语音助手** — 在线流程：录音 → 百度 ASR 识别 → LLM 回复 → 百度 TTS 合成播放
 - **语音命令** — 离线 ESP-SR 中文命令词识别（按钮触发，无需唤醒词）
 - **蓝牙** — 开启 BLE 广播，手机发送 "SSID_xxx password_xxx" 进行 WiFi 配网
+- **音乐** — 扫描 SD 卡 `/sdcard/music/` 下的 WAV / MP3 文件，选择播放（支持暂停/切歌）
+- **音量** — 滑块调节音量（0-100%），对数增益曲线，NVS 持久化，重启自动恢复
 
 ### 2. Game Boy 模拟器
 
@@ -160,7 +161,7 @@ bot/
 - 双取指链式架构 + 32 位 DMA 路径，专为 ESP32-S3 等 32 位 MCU 优化
 - GB 原生分辨率 160x144，1.5 倍缩放到 240x216
 - SPI 80MHz 异步 DMA 双行缓冲渲染
-- 小 ROM（<=256KB）自动复制到 DRAM 加速
+- ROM 从 SD 卡加载到 PSRAM（最大 4MB），小 ROM（<=256KB）自动复制到 DRAM 加速
 - 3x3 按键矩阵提供完整的 GB 控制输入（A/B/方向/START/SELECT/EXIT）
 - 进入游戏自动暂停 WiFi 和 BLE，退出后恢复进入前活跃的服务
 
@@ -224,10 +225,24 @@ MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 
 - 标准 POSIX API 读写文件（`fopen("/sdcard/xxx", "rb")`）
 - 支持 SDSC / SDHC 卡，自动检测容量
+- 支持中文长文件名（UTF-8 API + GBK 代码页 936）
 - 挂载/卸载安全，可重入
 - 与 LCD（SPI2_HOST）互不干扰
+- 存放 Game Boy ROM（`/sdcard/rom/`）和音乐文件（`/sdcard/music/`）
 
-### 9. 音频输出
+### 9. 音乐播放器
+
+SD 卡音乐播放，支持 WAV 和 MP3 格式：
+
+- **WAV 解码**：RIFF/PCM 16bit，8k-48k Hz，单/双声道自动降混为 mono
+- **MP3 解码**：基于 Helix 定点解码器（~5KB 工作内存，可放 PSRAM），自动跳过 ID3v2 tag
+- **动态采样率**：播放前切换 I2S 采样率匹配文件，播完后自动恢复 16kHz（TTS / GB 音频不受影响）
+- **播控**：播放/暂停/停止/切歌，后台解码任务，UI 不阻塞
+- **切歌安全**：所有 stop/play 操作通过后台任务异步执行，LVGL 线程零阻塞；music_stop 最多等 2 秒轮询确认旧任务退出
+- **错误容忍**：MP3 连续 32 帧解码失败自动放弃，防止垃圾数据把解码器推进非法状态
+- SD 卡目录：`/sdcard/music/`，支持中英文文件名
+
+### 10. 音频输出
 
 基于 MAX98357A I2S D 类功放：
 
@@ -237,6 +252,8 @@ MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 - 字节尾对齐：HTTP chunked 传输奇数字节时保留尾部，防止 16bit 样本错位
 - 线性淡入（64 样本 / 4ms）：首次播放或 flush 后恢复时消除爆音
 - `speaker_flush()`：清空 RingBuffer 实现立即静音（游戏退出 / 界面切换）
+- `speaker_set_sample_rate()`：动态切换 I2S 输出采样率（8k-48k Hz），通过 flush 协议确保旧速率数据播完再切，避免变调
+- **音量控制**：Q15 定点对数增益（0-100% → -60dB..0dB），volatile 原子写入无需持锁，NVS 持久化（500ms 防抖合并 slider 拖动写入）
 
 ---
 
@@ -259,6 +276,8 @@ MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 | `asr_llm` | 3 | 16384 B (PSRAM) | ASR → LLM → TTS（一次性） |
 | `game_run` | 10 | 12288 B (DRAM) | GB 模拟器主循环（Core 1） |
 | `apu_task` | 5 | 4096 B | GB APU 音频合成（Core 0） |
+| `music` | 4 | 12288 B (DRAM) | SD 卡音乐解码（WAV/MP3）播放（一次性） |
+| `music_stop` | 3 | 2048 B (DRAM) | 异步停止音乐播放（一次性） |
 | `psram_cleaner` | 2 | 3072 B | 回收 PSRAM 任务栈和 TCB |
 | `esp_sr_read` | 6 | 5120 B | ESP-SR I2S 读取 + 16→32bit 转换（Core 0） |
 | `esp_sr_feed` | 5 | 5120 B | ESP-SR AFE 音频喂入（Core 0） |
@@ -276,8 +295,11 @@ MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 - 后台任务通过 FreeRTOS Queue 传递结果，`lv_timer` 回调轮询队列更新 UI
 - `speaker_play()` 使用 RingBuffer 非阻塞写入，TTS/GB 音频可直接调用
 - HTTP 响应缓冲由各模块 mutex 保护，识别完成后主动释放 PSRAM
-- WiFi/BLE/ESP-SR 所有共享状态由各自模块级 mutex 保护
+- WiFi/BLE/ESP-SR/音乐 所有共享状态由各自模块级 mutex 保护
 - SPI 总线隔离：LCD 使用 SPI2_HOST，SD 卡使用 SPI3_HOST，互不干扰
+- `speaker_set_sample_rate()` 通过 flush 协议与 tx_task 协调，确保 ring 清空后再切换 I2S 时钟
+- `speaker_set_volume()` 使用 volatile + Q15 定点乘，无需持锁即可在播放路径上原子生效
+- 音乐切歌/停止通过后台一次性任务异步执行，避免阻塞 LVGL 线程
 
 ### LCD 刷新机制
 
@@ -298,7 +320,7 @@ PARTIAL 模式 + DRAM 双缓冲 + 异步 DMA：
 
 - ESP-IDF v5.4+（推荐 v5.4.3）
 - ESP32-S3 目标芯片
-- MicroSD 卡（FAT32 格式化，可选）
+- MicroSD 卡（FAT32 格式化，用于存放 ROM 和音乐文件）
 
 ### 步骤
 
@@ -319,9 +341,15 @@ cp user/model_config.h.example user/model_config.h
 编辑 `user/asr_config.h` 填入百度 AI 平台 API Key 和 Secret Key。
 编辑 `user/model_config.h` 填入 LLM API Key、接口 URL 和模型名称。
 
-**3. 放入 Game Boy ROM（可选）**
+**3. 准备 MicroSD 卡**
 
-将 .gb / .gbc 文件放入 `spiffs_image/roms/` 目录，构建时自动打包到 SPIFFS 分区。
+将 SD 卡格式化为 FAT32，创建以下目录结构：
+
+```
+/sdcard/
+├── rom/          # 放置 .gb / .gbc Game Boy ROM 文件
+└── music/        # 放置 .wav / .mp3 音乐文件（16bit PCM WAV 或 MP3）
+```
 
 **4. 编译、烧录**
 
@@ -350,17 +378,20 @@ idf.py -p COM5 -b 2000000 flash
 | Bluetooth LE | NimBLE | 比 Bluedroid 节省 ~40KB DRAM，仅外设角色 |
 | BT/WiFi 共存 | 启用 | BLE + WiFi 同时活跃时必需 |
 | ESP-SR | MultiNet7 CN | 离线中文命令词 + NSNet2 降噪 + VADNet1 |
+| FATFS 长文件名 | 启用（堆分配） | 支持中文文件名（UTF-8 API + GBK 代码页 936） |
 | FreeRTOS HZ | 1000 | 1ms tick 精度 |
 
 ### 分区表（partitions.csv）
 
 | 分区 | 大小 | 用途 |
 |------|------|------|
-| app0 | 6 MB | OTA 分区 0 |
-| app1 | 5.5 MB | OTA 分区 1 |
-| storage | ~1.5 MB | SPIFFS 文件系统（ROM 等） |
-| model | 3 MB | ESP-SR 模型数据 |
-| nvs | 20 KB | WiFi 凭证等持久数据 |
+| app0 | 6.5 MB | OTA 分区 0 |
+| app1 | 6.5 MB | OTA 分区 1 |
+| model | 3 MB | ESP-SR 模型数据（SPIFFS 子类型） |
+| nvs | 20 KB | WiFi 凭证、音量设置等持久数据 |
+| otadata | 8 KB | OTA 状态 |
+
+ROM 和音乐文件存放在 MicroSD 卡，不再使用 Flash SPIFFS 存储。
 
 ### user/asr_config.h
 
@@ -387,7 +418,7 @@ idf.py -p COM5 -b 2000000 flash
 ## 注意事项
 
 - **凭证安全**：`asr_config.h` 和 `model_config.h` 含 API Key，已加入 `.gitignore`
-- **PSRAM 必须选 Octal Mode**：录音缓冲、ROM 数据、HTTP 响应均分配于 PSRAM
+- **PSRAM 必须选 Octal Mode**：录音缓冲、ROM 数据、HTTP 响应、音乐解码缓冲均分配于 PSRAM
 - **I2S 资源分配**：I2S_NUM_0 = 麦克风（RX），I2S_NUM_1 = 扬声器（TX），互不干扰
 - **I2S_NUM_0 共享**：在线 ASR 和离线 ESP-SR 通过 deinit/reinit + taskNotify 握手切换
 - **LCD SPI 时钟**：80 MHz，PARTIAL 模式异步 DMA 刷新
@@ -396,6 +427,8 @@ idf.py -p COM5 -b 2000000 flash
 - **ESP32-S3 蓝牙限制**：仅支持 BLE，不支持 Classic BT（A2DP 不可用）
 - **游戏模式**：进入游戏自动暂停 WiFi + BLE，退出后仅恢复进入前活跃的服务
 - **音频安全**：DC-block HPF 消除直流偏置，字节尾对齐防止 PCM 错位，DMA auto_clear 消除空闲噪声
+- **SD 卡必须插入**：游戏 ROM 和音乐文件都从 SD 卡读取，未插卡时游戏和音乐功能不可用
+- **音乐文件格式**：WAV 需为 16bit PCM（8k-48k Hz），MP3 由 Helix 定点解码器支持（MPEG-1/2 Layer III）
 
 ---
 
@@ -403,7 +436,7 @@ idf.py -p COM5 -b 2000000 flash
 
 | 类别 | 行数 |
 |------|------|
-| 纯手写代码 | ~5,800 行 |
+| 纯手写代码 | ~6,400 行 |
 | 字体数据（lv_font_simhei_16 + lcdfont）| ~385,000 行 |
 | 模拟器库（walnut_cgb.h + minigb_apu.c）| ~10,500 行 |
 | LVGL 库 | 未计入 |
@@ -416,10 +449,9 @@ idf.py -p COM5 -b 2000000 flash
 
 | 内容 | 大小 |
 |------|------|
-| 固件（ESP-IDF + LVGL + 应用 + 游戏模拟器 + ESP-SR + NimBLE + SD）| ~4.7 MB |
-| SPIFFS（ROM 存储）| ~1.5 MB |
+| 固件（ESP-IDF + LVGL + 应用 + 游戏模拟器 + ESP-SR + NimBLE + Helix MP3 + FATFS）| ~4.7 MB |
 | ESP-SR 模型分区 | 3 MB |
-| OTA 备份分区 | 5.5 MB |
+| OTA 备份分区 | 6.5 MB |
 
 ### PSRAM（8 MB Octal）
 
@@ -428,6 +460,7 @@ idf.py -p COM5 -b 2000000 flash
 | ASR 录音缓冲区 | ~320 KB（识别后释放） |
 | HTTP 响应缓冲（动态扩容）| 4-32 KB（用后释放） |
 | ROM 数据（游戏运行时）| 32 KB - 2 MB |
+| 音乐解码缓冲（WAV/MP3）| ~16 KB（播放期间） |
 | WiFi / LwIP 缓冲 | ~50 KB |
 | BSS + rodata 外部段 | ~100 KB |
 | 剩余可用 | **~7 MB** |
@@ -439,5 +472,5 @@ idf.py -p COM5 -b 2000000 flash
 | LVGL PARTIAL 双缓冲（34行 x 2）| ~32 KB |
 | speaker RingBuffer | 64 KB |
 | WiFi / LwIP / mbedTLS 运行时 | ~100 KB |
-| FreeRTOS 任务栈 + TCB | ~30 KB |
-| 剩余可用 | **~110 KB** |
+| FreeRTOS 任务栈 + TCB | ~35 KB |
+| 剩余可用 | **~107 KB** |

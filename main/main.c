@@ -52,15 +52,16 @@ static void lvgl_task(void *arg)
 
 void app_main(void)
 {
-    /* NVS 和 SPIFFS 尽早初始化，不依赖任何业务路径。
-     * 这样进游戏菜单无需先联 WiFi 或触发其他功能 */
+    /* NVS 和 SD 卡尽早初始化，不依赖任何业务路径。
+     * 游戏 ROM / 音乐文件都在 SD 卡上，不再打包 SPIFFS。*/
     esp_err_t nvs_err = nvs_flash_init();
     if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES ||
         nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
         nvs_flash_init();
     }
-    rom_loader_init();  /* 挂载 /spiffs，ROM 列表可用 */
+    /* 原来 rom_loader_init 挂载 SPIFFS；现在在 sdcard_mount() 后再调，
+     * 仅做 SD 挂载状态打印。*/
 
     /* PSRAM 任务管理：业务 HTTPS/cJSON 任务的栈从 PSRAM 分配，防泄漏 */
     psram_task_init();
@@ -79,8 +80,12 @@ void app_main(void)
                  (unsigned long)sdcard_free_mb(),
                  (unsigned long)sdcard_total_mb());
     } else {
-        ESP_LOGW("MAIN", "SD 卡未挂载（可能未插卡），音乐功能不可用");
+        ESP_LOGW("MAIN", "SD 卡未挂载（可能未插卡），游戏/音乐功能不可用");
     }
+
+    /* rom_loader 现在只是包装 SD 卡读取，函数名保留兼容性；
+     * 必须在 sdcard_mount() 之后调。*/
+    rom_loader_init();
 
     /* 矩阵键盘：GB 模拟器运行时用作 8 键输入，菜单期间也会扫描但不拦截事件 */
     keypad_init();

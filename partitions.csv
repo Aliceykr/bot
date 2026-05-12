@@ -1,7 +1,13 @@
 # Name,    Type, SubType, Offset,   Size,     Flags
+# 布局说明：
+#   nvs      20K    WiFi 凭证等持久数据
+#   otadata   8K    OTA 状态
+#   app0    6.5M    OTA 槽 0
+#   app1    6.5M    OTA 槽 1（对称，避免瓶颈）
+#   model     3M    ESP-SR MultiNet 模型（不再有 storage SPIFFS，ROM 和音乐放 SD 卡）
+# 总计：20K + 8K + 6.5M + 6.5M + 3M = 16M
 nvs,       data, nvs,     0x9000,   0x5000,
 otadata,   data, ota,     0xe000,   0x2000,
-app0,      app,  ota_0,   0x10000,  0x600000,
-app1,      app,  ota_1,   0x610000, 0x580000,
-storage,   data, spiffs,  0xB90000, 0x170000,
-model,     data, spiffs,  0xD00000, 0x300000,
+app0,      app,  ota_0,   0x10000,  0x680000,
+app1,      app,  ota_1,   0x690000, 0x680000,
+model,     data, spiffs,  0xD10000, 0x2F0000,

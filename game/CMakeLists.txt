@@ -11,8 +11,9 @@ idf_component_register(
         "../user"
     REQUIRES
         lvgl
-        spiffs
         esp_partition
         driver
         esp_timer
+        fatfs
+        sdmmc
 )

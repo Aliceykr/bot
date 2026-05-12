@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 /* ================================================================
  * MAX98357A I2S 音频输出驱动
@@ -39,6 +40,39 @@ void speaker_init(void);
  * @return          实际写入字节数；缓冲满时返回 0（数据被丢弃）
  */
 int speaker_play(const int16_t *pcm, size_t len_bytes);
+
+/**
+ * @brief 动态切换 I2S 输出采样率（音乐播放需要 44.1kHz 等非默认速率）
+ *
+ * 切换前会 flush 当前 ring buffer，避免残留采样以新速率播出来变音调。
+ * 合法范围 8000..48000 Hz。调用成功后 speaker_play 送入的 PCM 将按新速率输出。
+ * 播放完后请调回 SPK_SAMPLE_RATE（16000），否则 TTS / GB 音频会变调。
+ *
+ * @param hz 新的采样率（Hz）
+ * @return true 切换成功；false 参数非法或驱动失败
+ */
+bool speaker_set_sample_rate(uint32_t hz);
+
+/**
+ * @brief 查询当前 I2S 输出采样率（Hz）
+ */
+uint32_t speaker_get_sample_rate(void);
+
+/**
+ * @brief 设置播放音量（0..100 百分比）
+ *
+ * 内部按对数曲线换算成线性增益：100% → 1.0 倍，0% → 静音（-60dB 以下截为 0）。
+ * 所有声源（TTS / 音乐 / GB / 提示音）都受这个全局音量影响。
+ * 设置后立即生效；新值保存到 NVS，重启恢复。
+ *
+ * @param percent 0..100；越界会被钳制
+ */
+void speaker_set_volume(uint8_t percent);
+
+/**
+ * @brief 查询当前音量百分比（0..100）
+ */
+uint8_t speaker_get_volume(void);
 
 /**
  * @brief 丢弃 RingBuffer 中所有待播 PCM，立即静音

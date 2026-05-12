@@ -5,7 +5,10 @@
 #include "freertos/task.h"
 #include "freertos/ringbuf.h"
 #include "freertos/semphr.h"
+#include "freertos/timers.h"
 #include "driver/i2s_std.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_log.h"
 
 #define TAG             "SPEAKER"
@@ -49,6 +52,10 @@
 /* speaker_play 内部处理缓冲 */
 #define PROC_BATCH          64
 
+/* 当前 I2S 采样率。初始化为 SPK_SAMPLE_RATE，可由 speaker_set_sample_rate 改变。
+ * 读写都要通过 speaker_set/get_sample_rate，模块内部从 s_ringbuf 消费 mono PCM。*/
+static volatile uint32_t s_sample_rate = SPK_SAMPLE_RATE;
+
 /* ================================================================
  * 模块内部状态
  * ================================================================ */
@@ -85,7 +92,72 @@ static float    s_hp_y1          = 0.0f;
 static uint16_t s_fade_count     = 0;
 
 /* ================================================================
- * 单样本处理：HPF + 淡入 + 饱和
+ * 音量（百分比 0..100 → 对数增益 gain_q15）
+ *
+ * 100% → 1.0 倍（0 dB），0% → 0（-inf dB）。
+ * 用 Q15 定点（0..32768）避免播放路径上做 float 乘法，省 CPU。
+ * 对数曲线：人耳对低音量更敏感，线性 slider 在低端会感觉不到变化。
+ *   percent=100 → gain=32768
+ *   percent=0   → gain=0
+ *   其余按 -60dB..0dB 线性插值 dB，再转回线性幅值。
+ * ================================================================ */
+static volatile uint8_t  s_volume_pct = 80;      /* 默认 80% */
+static volatile int32_t  s_gain_q15   = 32768;   /* 由 s_volume_pct 计算得来 */
+
+#define NVS_NAMESPACE_SPK    "spk"
+#define NVS_KEY_VOLUME       "vol"
+
+/* 根据百分比计算 Q15 增益
+ *   dB = -60 * (1 - pct/100)  (pct=100 → 0dB, pct=0 → -60dB)
+ *   gain = 10^(dB/20)
+ * pct=0 特殊处理为 0（完全静音） */
+static int32_t volume_pct_to_q15(uint8_t pct)
+{
+    if (pct == 0) return 0;
+    if (pct > 100) pct = 100;
+    float db   = -60.0f * (1.0f - (float)pct / 100.0f);
+    float gain = powf(10.0f, db / 20.0f);
+    int32_t q  = (int32_t)(gain * 32768.0f + 0.5f);
+    if (q > 32768) q = 32768;
+    if (q < 0)     q = 0;
+    return q;
+}
+
+static void load_volume_from_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE_SPK, NVS_READONLY, &h) != ESP_OK) return;
+    uint8_t pct;
+    if (nvs_get_u8(h, NVS_KEY_VOLUME, &pct) == ESP_OK && pct <= 100) {
+        s_volume_pct = pct;
+        s_gain_q15   = volume_pct_to_q15(pct);
+        ESP_LOGI(TAG, "音量从 NVS 恢复: %u%%", pct);
+    }
+    nvs_close(h);
+}
+
+static void save_volume_to_nvs(uint8_t pct)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE_SPK, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_u8(h, NVS_KEY_VOLUME, pct);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+/* 防抖 timer：slider 连续拖动只写一次 NVS，避免磨损 flash
+ * （NVS 写寿命 ~10 万次，100 拖动一次就可能触发 100 次写入）*/
+static TimerHandle_t s_nvs_debounce_timer = NULL;
+#define NVS_DEBOUNCE_MS   500
+
+static void nvs_debounce_cb(TimerHandle_t t)
+{
+    (void)t;
+    save_volume_to_nvs(s_volume_pct);
+}
+
+/* ================================================================
+ * 单样本处理：HPF + 淡入 + 音量 + 饱和
  * 调用方需持有 s_play_mtx
  * ================================================================ */
 static inline int16_t process_sample(int16_t x)
@@ -101,6 +173,10 @@ static inline int16_t process_sample(int16_t x)
         yi = yi * (int32_t)(s_fade_count + 1) / (int32_t)FADE_SAMPLES;
         s_fade_count++;
     }
+
+    /* 全局音量：Q15 定点乘，32768 = 1.0 倍。volatile 读一次快照避免撕裂 */
+    int32_t gain = s_gain_q15;
+    yi = (yi * gain) >> 15;
 
     if (yi >  32767) yi =  32767;
     if (yi < -32768) yi = -32768;
@@ -256,6 +332,13 @@ void speaker_init(void)
 
     ESP_LOGI(TAG, "I2S TX 初始化完成 (MONO, auto_clear) BCLK=%d LRCK=%d DOUT=%d",
              SPK_BCLK_PIN, SPK_LRCK_PIN, SPK_DOUT_PIN);
+
+    /* 从 NVS 读回上次音量（默认 80%）。必须在 NVS 初始化之后调用。
+     * app_main 里 nvs_flash_init() 在 speaker_init() 之前跑，OK。*/
+    load_volume_from_nvs();
+    s_gain_q15 = volume_pct_to_q15(s_volume_pct);
+    ESP_LOGI(TAG, "音量: %u%% (gain Q15=%ld)",
+             (unsigned)s_volume_pct, (long)s_gain_q15);
 }
 
 /* ================================================================
@@ -344,6 +427,119 @@ int speaker_play(const int16_t *pcm, size_t len_bytes)
 
     xSemaphoreGive(s_play_mtx);
     return (int)consumed;
+}
+
+/* ================================================================
+ * 采样率动态切换（音乐播放用）
+ *
+ * 切速率要解决两个时序问题：
+ *   1. ring 里可能还有旧速率数据，直接改时钟会变调（C1）
+ *   2. tx_task 可能正握着一块 item 在 i2s_channel_write，改时钟后那块
+ *      数据用新速率播出来会变调
+ *
+ * 做法：用 flush 协议（跟 speaker_flush 一样）通知 tx_task 自己清 ring，
+ * 等它 signal done 后我们才动 I2S 时钟。tx_task 在下一轮循环开头看到
+ * s_flush_request=true 会先把手里 item 丢掉再响应。
+ * ================================================================ */
+bool speaker_set_sample_rate(uint32_t hz)
+{
+    if (hz < 8000 || hz > 48000) {
+        ESP_LOGW(TAG, "采样率超出范围: %u", (unsigned)hz);
+        return false;
+    }
+    if (!s_tx_chan) {
+        ESP_LOGE(TAG, "I2S 通道未初始化");
+        return false;
+    }
+    if (hz == s_sample_rate) return true;
+
+    /* 第一步：让 tx_task 清空 ring 并回到空闲状态。
+     * 不能自己 flush_ring_only，因为 tx_task 可能手里正握着一块 item；
+     * 通过协议让它自己清比较干净。 */
+    if (s_flush_done) {
+        xSemaphoreTake(s_flush_done, 0);   /* 清掉可能的旧 signal */
+        s_flush_request = true;
+        /* 给 tx_task 足够时间处理：50ms 循环轮询 + 200ms i2s_write 最长延迟 */
+        xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(500));
+    }
+
+    /* 第二步：持锁修改 I2S 时钟。此时 ring 为空，tx_task 下次循环拿不到
+     * 数据自然不会触发 i2s_write；但仍可能正好在执行 receive 超时退出的
+     * 过程中，加锁 + ring 空双重保险。 */
+    if (s_play_mtx) xSemaphoreTake(s_play_mtx, portMAX_DELAY);
+
+    esp_err_t err = i2s_channel_disable(s_tx_chan);
+    if (err != ESP_OK) ESP_LOGW(TAG, "disable 失败: %d", err);
+
+    i2s_std_clk_config_t clk = I2S_STD_CLK_DEFAULT_CONFIG(hz);
+    err = i2s_channel_reconfig_std_clock(s_tx_chan, &clk);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "reconfig_std_clock 失败: %d", err);
+        i2s_channel_enable(s_tx_chan);   /* 恢复，避免通道死住 */
+        if (s_play_mtx) xSemaphoreGive(s_play_mtx);
+        return false;
+    }
+
+    err = i2s_channel_enable(s_tx_chan);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "重新 enable 失败: %d", err);
+        if (s_play_mtx) xSemaphoreGive(s_play_mtx);
+        return false;
+    }
+
+    s_sample_rate = hz;
+
+    /* 速率切换后重置 HPF / fade 状态，避免不同速率下 HPF 系数失配引入爆音 */
+    s_pcm_tail       = 0;
+    s_pcm_tail_valid = false;
+    s_hp_x1          = 0.0f;
+    s_hp_y1          = 0.0f;
+    s_fade_count     = 0;
+
+    if (s_play_mtx) xSemaphoreGive(s_play_mtx);
+    ESP_LOGI(TAG, "采样率切换到 %u Hz", (unsigned)hz);
+    return true;
+}
+
+uint32_t speaker_get_sample_rate(void)
+{
+    return s_sample_rate;
+}
+
+/* ================================================================
+ * 音量控制：公开 API
+ * ================================================================ */
+void speaker_set_volume(uint8_t percent)
+{
+    if (percent > 100) percent = 100;
+    if (percent == s_volume_pct) return;
+
+    /* 改音量不需要持锁：gain_q15 是 volatile int32_t，Xtensa 32bit 对齐
+     * 写入是原子的，process_sample 拿到的最多是旧值，下一个样本就更新。 */
+    s_volume_pct = percent;
+    s_gain_q15   = volume_pct_to_q15(percent);
+
+    /* NVS 写入防抖：slider 拖动会连续触发 set_volume，累计写 flash 会磨损。
+     * 用 timer 合并：每次设置重置 500ms，只在最后一次设置后 500ms 真正 commit。
+     * 首次调用懒创建 timer。 */
+    if (!s_nvs_debounce_timer) {
+        s_nvs_debounce_timer = xTimerCreate("vol_nvs", pdMS_TO_TICKS(NVS_DEBOUNCE_MS),
+                                             pdFALSE, NULL, nvs_debounce_cb);
+    }
+    if (s_nvs_debounce_timer) {
+        xTimerReset(s_nvs_debounce_timer, pdMS_TO_TICKS(10));
+    } else {
+        /* timer 创建失败：降级直接写 */
+        save_volume_to_nvs(percent);
+    }
+
+    ESP_LOGI(TAG, "音量 → %u%% (gain Q15=%ld)",
+             (unsigned)percent, (long)s_gain_q15);
+}
+
+uint8_t speaker_get_volume(void)
+{
+    return s_volume_pct;
 }
 
 /* ================================================================
