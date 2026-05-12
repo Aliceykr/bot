@@ -17,12 +17,14 @@ idf_component_register(SRCS "main.c"
                           "../user/lv_font_simhei_16.c"
                           "../user/esp_sr.c"
                           "../user/ble_prov.c"
+                          "../user/sdcard.c"
                     INCLUDE_DIRS "."
                                  "../user"
                                  ".."
                                  "../mylvgl"
                     REQUIRES lvgl driver esp_wifi nvs_flash esp_http_client json mbedtls esp_netif esp_mm esp_timer game
                              esp-sr bt
+                             fatfs sdmmc
                              )
 
 target_compile_definitions(__idf_main PRIVATE LV_LVGL_H_INCLUDE_SIMPLE=1 LV_CONF_INCLUDE_SIMPLE=1)

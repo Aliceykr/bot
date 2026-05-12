@@ -14,6 +14,7 @@
 #include "keypad.h"
 #include "rom_loader.h"
 #include "psram_task.h"
+#include "sdcard.h"
 
 static void lvgl_tick_task(void *arg)
 {
@@ -70,6 +71,16 @@ void app_main(void)
     /* BLE 也不再常驻：进入"蓝牙"菜单时才 ble_prov_init()，
      * 关闭时 ble_prov_deinit() 释放 Bluedroid 栈。节省 ~50-60KB DRAM。 */
     LCD_Init();
+
+    /* SD 卡挂载：失败不影响启动（用户可能没插卡），
+     * 应用层读 /sdcard 前自行检查 sdcard_is_mounted() */
+    if (sdcard_mount()) {
+        ESP_LOGI("MAIN", "SD 卡可用: %lu MB / %lu MB",
+                 (unsigned long)sdcard_free_mb(),
+                 (unsigned long)sdcard_total_mb());
+    } else {
+        ESP_LOGW("MAIN", "SD 卡未挂载（可能未插卡），音乐功能不可用");
+    }
 
     /* 矩阵键盘：GB 模拟器运行时用作 8 键输入，菜单期间也会扫描但不拦截事件 */
     keypad_init();
