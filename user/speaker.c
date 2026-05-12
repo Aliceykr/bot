@@ -56,6 +56,22 @@ static i2s_chan_handle_t  s_tx_chan   = NULL;
 static RingbufHandle_t    s_ringbuf   = NULL;
 static SemaphoreHandle_t  s_play_mtx  = NULL;   /* 保护 HPF / tail / fade 状态 */
 
+/* flush 协调：
+ *   speaker_flush 是从别的任务（例如 LVGL）发出的"立即静音"请求。
+ *   spk_tx_task 是 ring 的唯一合法 consumer，让它自己来清空 ring，
+ *   避免两个 consumer 同时 xRingbufferReceive 造成漏消费 / 死锁。
+ *
+ * 协议：
+ *   flush 调用方 → 置 s_flush_request，take s_flush_done（清为 0）→ 阻塞等
+ *   tx 任务每轮循环 → 若 s_flush_request：先把自己刚拿的 item return，
+ *                     再循环 xRingbufferReceive(timeout=0) 把 ring 清干净，
+ *                     清完 → 清 s_flush_request → give s_flush_done
+ *   flush 调用方被唤醒 → 继续复位 HPF / tail / fade → 返回
+ *
+ * 这样 flush 保证了 tx 任务看到的 ring 一定为空，且不会和 tx 竞争 item 所有权。 */
+static volatile bool          s_flush_request = false;
+static SemaphoreHandle_t      s_flush_done    = NULL;  /* binary semaphore */
+
 /* 字节尾：上一次 speaker_play 输入字节数是奇数时，保留的最后一个字节，
  * 下次拼上首字节组成完整 16bit 采样，防止跨包字节错位 */
 static uint8_t  s_pcm_tail       = 0;
@@ -94,17 +110,43 @@ static inline int16_t process_sample(int16_t x)
 /* ================================================================
  * 播放任务：从 ring 取出数据，直接用硬件 MONO 写 I2S
  * ring 空时不做任何动作，DMA 由驱动的 auto_clear 自动输出零电平
+ *
+ * flush 协作：每轮入口检查 s_flush_request，若置位则自己清空 ring 再
+ * 通过 s_flush_done 通知请求方。确保 ring 的 consumer 唯一性。
  * ================================================================ */
 static void spk_tx_task(void *arg)
 {
     (void)arg;
     for (;;) {
+        /* 优先处理 flush 请求：此时可能没有 item，但也要清空 ring 中的任何
+         * 残留数据，然后 signal done */
+        if (s_flush_request) {
+            size_t n = 0;
+            while (1) {
+                void *item = xRingbufferReceive(s_ringbuf, &n, 0);
+                if (!item) break;
+                vRingbufferReturnItem(s_ringbuf, item);
+            }
+            s_flush_request = false;
+            if (s_flush_done) xSemaphoreGive(s_flush_done);
+            /* flush 完立刻回头去检查 ring，避免错过新塞进来的数据 */
+            continue;
+        }
+
         size_t recv_size = 0;
         void *item = xRingbufferReceiveUpTo(
             s_ringbuf, &recv_size, pdMS_TO_TICKS(50), SPK_TX_CHUNK);
 
         if (item == NULL) {
             /* ring 空：什么都不做，DMA 由 auto_clear 负责输出零电平 */
+            continue;
+        }
+
+        /* 在 i2s_write 之前再查一次 flush：若刚收到 item 就被请求 flush，
+         * 不要把这块数据播出去，直接丢弃。这是 flush 语义必须的。 */
+        if (s_flush_request) {
+            vRingbufferReturnItem(s_ringbuf, item);
+            /* 下一轮循环会处理 flush_request 并清空 ring */
             continue;
         }
 
@@ -127,6 +169,14 @@ void speaker_init(void)
     s_play_mtx = xSemaphoreCreateMutex();
     if (!s_play_mtx) {
         ESP_LOGE(TAG, "mutex 创建失败");
+        return;
+    }
+
+    /* flush 协作用的 binary semaphore：初始为空，tx 任务完成清空后 give，
+     * flush 调用方 take 后清空，再走下一次 flush */
+    s_flush_done = xSemaphoreCreateBinary();
+    if (!s_flush_done) {
+        ESP_LOGE(TAG, "flush_done sem 创建失败");
         return;
     }
 
@@ -298,26 +348,38 @@ int speaker_play(const int16_t *pcm, size_t len_bytes)
 
 /* ================================================================
  * 丢弃所有待播数据，并复位播放状态
- * spk_tx_task 看到 ring 空后不再 i2s_write，auto_clear 输出零电平
+ *
+ * 通过 s_flush_request 通知 spk_tx_task 自己清空 ring（唯一 consumer），
+ * 等它 signal done 后再复位 HPF/tail/fade。这样严格避免双消费者竞争。
+ *
+ * 如果 tx 任务出问题没响应，给 500ms 超时兜底，即使没清干净也至少把本地
+ * 状态复位，下次 speaker_play 仍是可工作的（ring 里残留数据会继续播，
+ * 但那种情况已经是 I2S 严重故障，flush 也救不了）。
  * ================================================================ */
 void speaker_flush(void)
 {
     if (!s_ringbuf) return;
-    if (s_play_mtx) xSemaphoreTake(s_play_mtx, portMAX_DELAY);
 
-    size_t n = 0;
-    while (1) {
-        void *item = xRingbufferReceive(s_ringbuf, &n, 0);
-        if (!item) break;
-        vRingbufferReturnItem(s_ringbuf, item);
+    /* 第一步：请 tx 任务清空 ring */
+    if (s_flush_done) {
+        /* 清掉上次可能遗留的未被 take 的 signal（比如多次 flush 串行） */
+        xSemaphoreTake(s_flush_done, 0);
+        s_flush_request = true;
+
+        /* 等 tx 任务确认已清空 ring。tx 任务每 50ms 轮询一次 receive，
+         * 最长 50ms + 一次 i2s_write（<=200ms）就会看到 flush_request。
+         * 给 500ms 超时，足够任何情况下响应。 */
+        xSemaphoreTake(s_flush_done, pdMS_TO_TICKS(500));
     }
 
-    /* 复位字节对齐 / HPF / 淡入状态，确保下一段音频干净起播 */
+    /* 第二步：复位播放本地状态（HPF/tail/fade）。
+     * 此时 ring 已清空，tx 不会再从 ring 取数据，所以这些状态的写入安全。
+     * 仍然持 play_mtx，避免和 speaker_play 并发写 HPF 状态。 */
+    if (s_play_mtx) xSemaphoreTake(s_play_mtx, portMAX_DELAY);
     s_pcm_tail       = 0;
     s_pcm_tail_valid = false;
     s_hp_x1          = 0.0f;
     s_hp_y1          = 0.0f;
     s_fade_count     = 0;
-
     if (s_play_mtx) xSemaphoreGive(s_play_mtx);
 }

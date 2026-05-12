@@ -33,8 +33,9 @@ static volatile bool  s_rec_active = false;
 static TaskHandle_t   s_stop_waiter = NULL;
 
 // ================================================================
-// HTTP 响应缓冲（PSRAM 动态扩容）
+// HTTP 响应缓冲（PSRAM 动态扩容 + 识别后收缩）
 // 初始 4KB，最大 32KB。token 响应可能 ~2KB，长句识别结果可能更大。
+// 识别完成时收缩回 RESP_INIT_CAP，避免一次扩到 32KB 后永久占用。
 // ================================================================
 #define RESP_INIT_CAP  4096
 #define RESP_MAX_CAP   32768
@@ -43,6 +44,20 @@ static char   *s_http_buf = NULL;
 static size_t  s_http_cap = 0;
 static size_t  s_http_len = 0;
 static bool    s_http_overflow = false;
+
+/* 识别完成（不管成功失败）时调用：如果 buf 被扩容过就释放到 NULL，让下次
+ * 识别从 4KB 起步分配；这样稳定占用只在单次识别期间存在，空闲期不占 PSRAM。
+ * 必须在锁内调用（同 s_http_buf 的写入路径）。*/
+static void release_http_buf(void)
+{
+    if (s_http_buf) {
+        heap_caps_free(s_http_buf);
+        s_http_buf = NULL;
+    }
+    s_http_cap      = 0;
+    s_http_len      = 0;
+    s_http_overflow = false;
+}
 
 /* 互斥锁：保护 s_http_buf（识别路径），录音任务独立不受影响。
  * 在 asr_mic_init 中提前创建，消除首次并发窗口。 */
@@ -108,7 +123,11 @@ void asr_mic_init(void)
         if (!s_rec_buf) { ESP_LOGE(TAG, "录音缓冲区分配失败"); return; }
     }
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    i2s_new_channel(&chan_cfg, NULL, &s_rx_chan);
+    esp_err_t err = i2s_new_channel(&chan_cfg, NULL, &s_rx_chan);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2s_new_channel 失败: %s", esp_err_to_name(err));
+        return;
+    }
     i2s_std_config_t std_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(MIC_SAMPLE_RATE),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
@@ -121,7 +140,13 @@ void asr_mic_init(void)
             .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
         },
     };
-    i2s_channel_init_std_mode(s_rx_chan, &std_cfg);
+    err = i2s_channel_init_std_mode(s_rx_chan, &std_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2s_channel_init_std_mode 失败: %s", esp_err_to_name(err));
+        i2s_del_channel(s_rx_chan);
+        s_rx_chan = NULL;
+        return;
+    }
     ESP_LOGI(TAG, "I2S 初始化完成 SCK=%d WS=%d SD=%d", MIC_SCK_PIN, MIC_WS_PIN, MIC_SD_PIN);
 
     /* 提前创建识别互斥锁，消除 lazy-init 竞态窗口 */
@@ -203,7 +228,13 @@ void asr_record_start(void)
     s_rec_pos    = 0;
     s_recording  = true;
     s_rec_active = true;
-    i2s_channel_enable(s_rx_chan);
+    esp_err_t err = i2s_channel_enable(s_rx_chan);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2s_channel_enable 失败: %s，录音无法启动", esp_err_to_name(err));
+        s_recording  = false;
+        s_rec_active = false;
+        return;
+    }
     xTaskNotifyGive(s_rec_task);  /* 唤醒录音任务 */
     ESP_LOGI(TAG, "开始录音");
 }
@@ -242,11 +273,33 @@ bool asr_is_recording(void) { return s_recording; }
 
 // ================================================================
 // I2S 释放 / 回收（给 ESP-SR 等模块临时使用 I2S_NUM_0）
+//
+// 关键竞态：asr_rec_task 常驻任务可能正阻塞在 i2s_channel_read(s_rx_chan, ..)
+// 里（100ms 超时）。如果 deinit 直接 i2s_del_channel，会在 read 调用返回前
+// 把 s_rx_chan 底层资源释放 → 野指针 → HardFault。
+//
+// 解决：deinit 清 s_rec_active 后必须先等录音任务退出循环，再 del channel。
+// 复用 asr_record_stop 的 s_stop_waiter 通知机制。
 // ================================================================
 void asr_mic_deinit(void)
 {
-    s_rec_active = false;
+    /* 1. 先停录音逻辑循环 */
+    bool was_active = s_rec_active;
     s_recording  = false;
+    s_rec_active = false;
+
+    /* 2. 如果录音任务在跑，等它确认停止后再释放 I2S 通道 */
+    if (was_active && s_rec_task) {
+        /* 注意：若多个任务并发调 deinit，s_stop_waiter 会被后者覆盖，
+         * 先调的那个会 timeout 但不会崩溃；实际场景里只有 LVGL 任务会
+         * 切换 asr↔esp_sr，单调用者。*/
+        s_stop_waiter = xTaskGetCurrentTaskHandle();
+        /* 等任务通知：任务检测到 s_rec_active=false 后会 give。
+         * 最多等 150ms（read 超时 100ms + 余量）。*/
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(150));
+    }
+
+    /* 3. 现在任务已退出 read 调用，可以安全释放通道 */
     if (s_rx_chan) {
         i2s_channel_disable(s_rx_chan);
         i2s_del_channel(s_rx_chan);
@@ -262,7 +315,11 @@ void asr_mic_reinit(void)
         return;
     }
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    i2s_new_channel(&chan_cfg, NULL, &s_rx_chan);
+    esp_err_t err = i2s_new_channel(&chan_cfg, NULL, &s_rx_chan);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "reinit: i2s_new_channel 失败: %s", esp_err_to_name(err));
+        return;
+    }
     i2s_std_config_t std_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(MIC_SAMPLE_RATE),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
@@ -275,7 +332,13 @@ void asr_mic_reinit(void)
             .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
         },
     };
-    i2s_channel_init_std_mode(s_rx_chan, &std_cfg);
+    err = i2s_channel_init_std_mode(s_rx_chan, &std_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "reinit: init_std_mode 失败: %s", esp_err_to_name(err));
+        i2s_del_channel(s_rx_chan);
+        s_rx_chan = NULL;
+        return;
+    }
     ESP_LOGI(TAG, "I2S NUM 0 重新初始化完成");
 }
 
@@ -380,6 +443,9 @@ bool asr_recognize(uint32_t audio_len_bytes, asr_result_t *out)
     ret = true;
 
 out:
+    /* 识别结束：释放 HTTP 响应缓冲，避免长期占 PSRAM。
+     * 下次 asr_recognize 会重新 lazy-alloc 4KB 起步。*/
+    release_http_buf();
     if (s_recog_mutex) xSemaphoreGive(s_recog_mutex);
     return ret;
 }

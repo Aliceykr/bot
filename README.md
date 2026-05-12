@@ -1,6 +1,6 @@
 # Bot — ESP32-S3 AI 智能语音助手 & Game Boy 模拟器
 
-基于 ESP-IDF + LVGL 的 ESP32-S3 嵌入式项目，集成 WiFi、天气查询、AI 聊天、在线/离线语音识别、语音合成、Game Boy 游戏模拟器（含音频）、BLE 蓝牙配网，配备 TFT LCD 图形界面与旋转编码器 + 按键矩阵交互。
+基于 ESP-IDF + LVGL 的 ESP32-S3 嵌入式项目，集成 WiFi、天气查询、AI 聊天、在线/离线语音识别、语音合成、Game Boy 游戏模拟器（含音频）、BLE 蓝牙配网、MicroSD 卡存储，配备 TFT LCD 图形界面与旋转编码器 + 按键矩阵交互。
 
 ---
 
@@ -14,6 +14,7 @@
 | 扬声器 | MAX98357A + 喇叭 | I2S D 类功放，I2S_NUM_1 |
 | 输入 | 旋转编码器（A/B/SW）| PCNT 硬件计数 + GPIO 轮询 |
 | 按键 | 3x3 矩阵键盘（9 键）| 游戏方向键 + A/B/START/SELECT/EXIT |
+| 存储 | MicroSD 卡（SPI 模式）| SPI3_HOST，FAT32 文件系统 |
 
 ---
 
@@ -68,6 +69,19 @@ A/B 相由 PCNT 硬件正交解码，SW 按键 5ms 轮询状态机（20ms 防抖
 
 2ms 扫描周期，两次连续一致读取才确认。游戏模式切换：`keypad_set_game_mode(true)` 启用按键输出。
 
+### MicroSD 卡（SPI3_HOST）
+
+| 功能 | ESP32-S3 引脚 | SD 卡模块引脚 |
+|------|---------------|--------------|
+| CS   | GPIO48 | CS |
+| MOSI | GPIO8  | DI (CMD) |
+| SCK  | GPIO18 | CLK |
+| MISO | GPIO21 | DO (DAT0) |
+| VCC  | 3.3V   | VCC |
+| GND  | GND    | GND |
+
+使用 SPI3_HOST（LCD 占 SPI2_HOST），FAT32 文件系统，挂载点 `/sdcard`。
+
 ---
 
 ## 目录结构
@@ -94,20 +108,22 @@ bot/
 │   ├── model.c / model.h         # LLM 聊天（OpenAI 兼容 REST API）
 │   ├── model_config.h            # API Key / URL / 模型名（已 gitignore）
 │   ├── model_config.h.example    # 配置模板
-│   ├── speaker.c / speaker.h     # MAX98357A I2S 音频输出 + RingBuffer + DC-block HPF + 字节尾对齐
+│   ├── speaker.c / speaker.h     # MAX98357A I2S 音频输出 + DC-block HPF + 字节尾对齐
 │   ├── tts.c / tts.h             # 百度语音合成 API（流式 PCM 播放）
 │   ├── weather.c / weather.h     # 天气 HTTP 查询与解析
-│   ├── wifi.c / wifi.h           # WiFi STA 连接 + 守护任务（断线重连）+ mutex 线程安全
+│   ├── wifi.c / wifi.h           # WiFi STA 连接 + 守护任务 + mutex 线程安全
 │   ├── sntp_time.c / sntp_time.h # SNTP 网络时间同步（阿里云 NTP）
 │   ├── health.c / health.h       # 堆内存健康监控（60s 周期打印水位）
 │   ├── esp_sr.c / esp_sr.h       # ESP-SR 离线中文命令词识别（AFE + MultiNet7）
-│   ├── ble_prov.c / ble_prov.h   # NimBLE BLE 配网（HM-10 兼容 0xFFE0/0xFFE1 + mutex 线程安全）
+│   ├── ble_prov.c / ble_prov.h   # NimBLE BLE 配网（HM-10 兼容 + mutex 线程安全）
 │   ├── keypad.c / keypad.h       # 3x3 矩阵键盘扫描（游戏控制）
+│   ├── sdcard.c / sdcard.h       # MicroSD 卡 SPI 模式驱动（FATFS 挂载/卸载）
 │   └── lv_font_simhei_16.c       # 思黑体 16px LVGL 中文字体
 ├── game/
 │   ├── gb_emu.c / gb_emu.h       # Game Boy 模拟器集成（Walnut-CGB / Peanut-GB）
 │   ├── gb_audio.c / gb_audio.h   # GB 音频：MiniGB APU → mono → speaker RingBuffer
 │   ├── minigb_apu.c              # MiniGB APU 音频处理单元（第三方）
+│   ├── game_2048.c / game_2048.h # 2048 桌面游戏
 │   ├── game_runtime.c / .h       # 游戏生命周期管理（加载/运行/退出）
 │   ├── rom_loader.c / .h         # SPIFFS ROM 扫描与加载
 │   ├── walnut_cgb.h              # Walnut-CGB 模拟器核心（高性能，32位路径）
@@ -151,7 +167,7 @@ bot/
 ### 3. Game Boy 音频
 
 - MiniGB APU 模拟全部 4 个 GB 声道（方波x2 + 波形 + 噪声）
-- 每帧合成 ~268 个 stereo 样本（16kHz），合并为 mono 推入 speaker RingBuffer，硬件 I2S MONO 槽输出
+- 每帧合成 ~268 个 mono 样本（16kHz），硬件 I2S MONO 槽输出
 - APU 在独立任务/Core 0 运行，主仿真在 Core 1，真正并行不占帧预算
 - 与游戏模拟器同步运行，非阻塞输出（缓冲满时丢帧保仿真帧率）
 
@@ -178,6 +194,7 @@ MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 - 按键触发识别（无需唤醒词），AFE 噪声抑制 + VAD
 - 预定义 11 个中文命令：返回、确认、取消、连接网络、查看天气、打开游戏、打开聊天、语音助手、退出游戏、调大音量、调小音量
 - I2S_NUM_0 与在线 ASR 共享，通过 deinit/reinit 切换
+- 任务生命周期安全：graceful stop + 超时硬杀 + 资源泄漏保护
 
 ### 6. BLE 蓝牙配网
 
@@ -189,7 +206,7 @@ MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 - 非阻塞启动：`ble_prov_start` 不轮询等 host sync，由 `on_sync` 回调异步触发广播
 - 收到凭据后自动 deinit BLE 释放 DRAM，再启动 WiFi 连接
 - 游戏时自动暂停 BLE，退出后恢复
-- 所有共享状态（s_active / s_status_cb / RX 缓冲）由模块级 mutex 保护，防并发竞态
+- 所有共享状态由模块级 mutex 保护，pending 计数器防止 deinit 与 notify 并发竞态
 - deinit 使用 `s_deinit_in_progress` 门锁防双拆，controller 拆卸重试+超时兜底
 
 ### 7. WiFi 守护
@@ -197,8 +214,29 @@ MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 - 首次连接：EventGroup 等待结果，最多重试 3 次
 - 运行期断线：常驻守护任务自动重连，指数退避（5s → 5min）
 - 用户主动断开：停止守护，不自动重连
-- 支持动态凭据设置（BLE 配网写入）
-- 所有状态变量由 mutex 保护，确保事件回调、守护任务、公开 API 之间的线程安全
+- 支持动态凭据设置（BLE 配网写入），mutex 保护写入与读取并发
+- 所有共享状态（s_status / s_user_stopped / s_backoff_idx）由 mutex 保护
+- `wifi_copy_ip()` 提供带锁的 IP 快照，避免撕裂读取
+
+### 8. MicroSD 卡存储
+
+通过 SPI3_HOST 以 SPI 模式驱动 MicroSD 卡，挂载 FAT32 文件系统到 `/sdcard`：
+
+- 标准 POSIX API 读写文件（`fopen("/sdcard/xxx", "rb")`）
+- 支持 SDSC / SDHC 卡，自动检测容量
+- 挂载/卸载安全，可重入
+- 与 LCD（SPI2_HOST）互不干扰
+
+### 9. 音频输出
+
+基于 MAX98357A I2S D 类功放：
+
+- 16kHz / 16bit / 硬件 MONO 槽位（无需软件 stereo 展开）
+- DMA auto_clear：无数据时自动输出零电平，消除 DC 漂移和爆破声
+- DC-block 高通滤波器（截止 ~12.7Hz），消除 MAX98357A 直流偏置底噪
+- 字节尾对齐：HTTP chunked 传输奇数字节时保留尾部，防止 16bit 样本错位
+- 线性淡入（64 样本 / 4ms）：首次播放或 flush 后恢复时消除爆音
+- `speaker_flush()`：清空 RingBuffer 实现立即静音（游戏退出 / 界面切换）
 
 ---
 
@@ -222,8 +260,9 @@ MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 | `game_run` | 10 | 12288 B (DRAM) | GB 模拟器主循环（Core 1） |
 | `apu_task` | 5 | 4096 B | GB APU 音频合成（Core 0） |
 | `psram_cleaner` | 2 | 3072 B | 回收 PSRAM 任务栈和 TCB |
-| `esp_sr_feed` | 6 | 4096 B | ESP-SR AFE 音频喂入（Core 0） |
-| `esp_sr_detect` | 5 | 8192 B (估计) | ESP-SR MultiNet 命令检测（Core 1） |
+| `esp_sr_read` | 6 | 5120 B | ESP-SR I2S 读取 + 16→32bit 转换（Core 0） |
+| `esp_sr_feed` | 5 | 5120 B | ESP-SR AFE 音频喂入（Core 0） |
+| `esp_sr_detect` | 5 | 6144 B | ESP-SR MultiNet 命令检测（Core 1） |
 | `kpad_task` | 6 | 4096 B | 按键矩阵扫描（2ms 周期） |
 | `health` | 1 | 2048 B | 堆内存监控（60s 周期） |
 
@@ -235,11 +274,10 @@ MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 
 - LVGL 对象操作均在 `lv_task` 单线程执行
 - 后台任务通过 FreeRTOS Queue 传递结果，`lv_timer` 回调轮询队列更新 UI
-- `speaker_play()` 使用 RingBuffer 非阻塞写入，TTS/GB 音频可直接调用；内部 mutex 保护 HPF / 字节尾 / 淡入状态，多生产者并发安全
-- WiFi 模块状态变量（status / user_stopped / ip_str）由 mutex 保护，事件回调、守护任务、公开 API 之间安全并发
-- BLE 模块核心状态（s_active / s_status_cb / RX 缓冲 / deinit 门锁）由模块级 mutex 保护，NimBLE host 任务、timer service、worker、LVGL 任务之间安全并发
-- HTTP 响应缓冲由各模块 mutex 保护
-- 录音任务启停使用 `ulTaskNotifyTake` 确认同步，避免 I2S 时序冲突
+- `speaker_play()` 使用 RingBuffer 非阻塞写入，TTS/GB 音频可直接调用
+- HTTP 响应缓冲由各模块 mutex 保护，识别完成后主动释放 PSRAM
+- WiFi/BLE/ESP-SR 所有共享状态由各自模块级 mutex 保护
+- SPI 总线隔离：LCD 使用 SPI2_HOST，SD 卡使用 SPI3_HOST，互不干扰
 
 ### LCD 刷新机制
 
@@ -260,6 +298,7 @@ PARTIAL 模式 + DRAM 双缓冲 + 异步 DMA：
 
 - ESP-IDF v5.4+（推荐 v5.4.3）
 - ESP32-S3 目标芯片
+- MicroSD 卡（FAT32 格式化，可选）
 
 ### 步骤
 
@@ -301,20 +340,17 @@ idf.py -p COM5 -b 2000000 flash
 | 配置项 | 值 | 说明 |
 |--------|-----|------|
 | CPU 频率 | 240 MHz | 满速运行 |
-| Flash 模式 | QIO | 代码取指约为 DIO 的 2 倍 |
-| Flash 频率 | 80 MHz | flash 时钟 |
+| Flash 模式 | QIO 80 MHz | 代码取指约为 DIO 的 2 倍 |
 | Flash 大小 | 16 MB | N16R8 板载 |
 | PSRAM | Octal 80MHz | 8MB 八线 PSRAM |
 | SPIRAM_RODATA | 启用 | 只读常量放 PSRAM，释放 ~80KB 内部 DRAM |
-| SPIRAM_TRY_ALLOCATE_WIFI_LWIP | 启用 | WiFi/LwIP 缓冲从 PSRAM 分配，为 BLE 共存腾 DRAM |
 | 编译优化 | -Os | 体积优化，节省 ~10-20% 代码空间 |
-| mbedTLS 动态缓冲 | 启用 | SSL 内存按需分配 |
-| mbedTLS 外部内存 | 启用 | SSL 从 PSRAM 分配，减少内部 DRAM 碎片 |
+| WiFi 缓冲 | PSRAM 分配 | 静态 RX 缩至 4，动态缓冲从 PSRAM 分配，节省 DRAM |
+| mbedTLS | PSRAM 分配 | SSL 从 PSRAM 分配，减少内部 DRAM 碎片 |
+| Bluetooth LE | NimBLE | 比 Bluedroid 节省 ~40KB DRAM，仅外设角色 |
+| BT/WiFi 共存 | 启用 | BLE + WiFi 同时活跃时必需 |
+| ESP-SR | MultiNet7 CN | 离线中文命令词 + NSNet2 降噪 + VADNet1 |
 | FreeRTOS HZ | 1000 | 1ms tick 精度 |
-| Bluetooth LE | NimBLE | 轻量 BLE 栈（~40KB DRAM，比 Bluedroid 省），仅 Peripheral 角色 |
-| BT/WiFi 共存 | 启用 | BLE 和 WiFi 同时运行时的软件共存调度 |
-| WiFi 静态 RX 缓冲 | 4（默认 10）| 减少 DRAM 连续占用，动态缓冲从 PSRAM 分配 |
-| ESP-SR | MultiNet7 + NSNET2 + VADNet | 离线中文命令词识别 + 噪声抑制 + 语音活动检测 |
 
 ### 分区表（partitions.csv）
 
@@ -353,15 +389,13 @@ idf.py -p COM5 -b 2000000 flash
 - **凭证安全**：`asr_config.h` 和 `model_config.h` 含 API Key，已加入 `.gitignore`
 - **PSRAM 必须选 Octal Mode**：录音缓冲、ROM 数据、HTTP 响应均分配于 PSRAM
 - **I2S 资源分配**：I2S_NUM_0 = 麦克风（RX），I2S_NUM_1 = 扬声器（TX），互不干扰
-- **扬声器 I2S 配置**：硬件 MONO 槽（非软件 stereo 展开）、DMA `auto_clear=true` 饿死时自动输出零电平、播放前字节尾对齐防雪花噪声、一阶 DC-block HPF（a=0.995, ~13Hz）+ 4ms 淡入防爆破
-- **I2S_NUM_0 共享**：在线 ASR 和离线 ESP-SR 通过 deinit/reinit 共享 I2S_NUM_0
+- **I2S_NUM_0 共享**：在线 ASR 和离线 ESP-SR 通过 deinit/reinit + taskNotify 握手切换
 - **LCD SPI 时钟**：80 MHz，PARTIAL 模式异步 DMA 刷新
-- **编码器导航**：旋转 = 移动焦点，按键 = 确认。弹窗弹出时焦点自动切到弹窗 group
+- **SPI 总线隔离**：LCD 用 SPI2_HOST，SD 卡用 SPI3_HOST
+- **SD 卡 CS 脚**：GPIO48 与板载 WS2812 LED 共享，如有干扰可临时切 GPIO0 排查
 - **ESP32-S3 蓝牙限制**：仅支持 BLE，不支持 Classic BT（A2DP 不可用）
 - **游戏模式**：进入游戏自动暂停 WiFi + BLE，退出后仅恢复进入前活跃的服务
-- **BLE 按需加载**：蓝牙关闭时 NimBLE 栈完全释放（deinit），归还 ~40-50KB DRAM 给其他模块
-- **任务栈分配**：涉及 SPIFFS/flash IO 的任务（LVGL、游戏）使用内部 DRAM 栈；纯 HTTP/cJSON 任务使用 PSRAM 栈
-- **WiFi 缓冲优化**：静态 RX 缓冲从默认 10 降至 4（-10KB DRAM），动态缓冲从 PSRAM 分配
+- **音频安全**：DC-block HPF 消除直流偏置，字节尾对齐防止 PCM 错位，DMA auto_clear 消除空闲噪声
 
 ---
 
@@ -369,8 +403,8 @@ idf.py -p COM5 -b 2000000 flash
 
 | 类别 | 行数 |
 |------|------|
-| 纯手写代码 | ~6,200 行 |
-| 字体数据（lv_font_simhei_16 + lcdfont）| ~384,000 行 |
+| 纯手写代码 | ~5,800 行 |
+| 字体数据（lv_font_simhei_16 + lcdfont）| ~385,000 行 |
 | 模拟器库（walnut_cgb.h + minigb_apu.c）| ~10,500 行 |
 | LVGL 库 | 未计入 |
 
@@ -382,7 +416,7 @@ idf.py -p COM5 -b 2000000 flash
 
 | 内容 | 大小 |
 |------|------|
-| 固件（ESP-IDF + LVGL + 应用 + 游戏模拟器 + ESP-SR + BLE）| ~4.6 MB |
+| 固件（ESP-IDF + LVGL + 应用 + 游戏模拟器 + ESP-SR + NimBLE + SD）| ~4.7 MB |
 | SPIFFS（ROM 存储）| ~1.5 MB |
 | ESP-SR 模型分区 | 3 MB |
 | OTA 备份分区 | 5.5 MB |
@@ -391,9 +425,10 @@ idf.py -p COM5 -b 2000000 flash
 
 | 用途 | 大小 |
 |------|------|
-| ASR 录音缓冲区 | ~320 KB |
-| HTTP 响应缓冲（动态扩容）| 4-32 KB |
+| ASR 录音缓冲区 | ~320 KB（识别后释放） |
+| HTTP 响应缓冲（动态扩容）| 4-32 KB（用后释放） |
 | ROM 数据（游戏运行时）| 32 KB - 2 MB |
+| WiFi / LwIP 缓冲 | ~50 KB |
 | BSS + rodata 外部段 | ~100 KB |
 | 剩余可用 | **~7 MB** |
 
@@ -404,6 +439,5 @@ idf.py -p COM5 -b 2000000 flash
 | LVGL PARTIAL 双缓冲（34行 x 2）| ~32 KB |
 | speaker RingBuffer | 64 KB |
 | WiFi / LwIP / mbedTLS 运行时 | ~100 KB |
-| NimBLE 栈运行时（按需加载）| ~40 KB |
 | FreeRTOS 任务栈 + TCB | ~30 KB |
 | 剩余可用 | **~110 KB** |

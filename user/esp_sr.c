@@ -488,16 +488,22 @@ bool esp_sr_start_listening(esp_sr_result_cb_t on_result)
     /* 重置 MultiNet 状态 */
     s_multinet->clean(s_mn_data);
 
+    /* 先置 true 让任务起来能进 while 循环，但此前所有资源（pcm_ring / I2S /
+     * AFE / MultiNet）已经分配完毕、可以被任务安全使用。任务创建若失败走清理
+     * 分支：先把 s_listening 回滚到 false，等已起来的任务退出再释放资源。*/
     s_listening = true;
 
     /* 三个任务（按优先级从高到低）：
      *   read 任务 prio=6（I2S 读取最及时）
      *   feed 任务 prio=5（凑 AFE chunk）
      *   detect 任务 prio=5（推理，独占 Core 1）
-     * 栈开得稍大，方便长时间运行下的日志和缓冲 */
-    BaseType_t r0 = xTaskCreatePinnedToCore(sr_read_task, "sr_read", 4096,
+     * 栈调整：
+     *   - feed 要喂 AFE 内部分配，4KB 吃紧，提到 5KB
+     *   - read 带 I2S log + PSRAM malloc，实际 ~2.8KB，提到 5KB 留余量
+     *   - detect 推理栈保持 6KB */
+    BaseType_t r0 = xTaskCreatePinnedToCore(sr_read_task, "sr_read", 5120,
                                              NULL, 6, &s_read_task, 0);
-    BaseType_t r1 = xTaskCreatePinnedToCore(sr_feed_task, "sr_feed", 4096,
+    BaseType_t r1 = xTaskCreatePinnedToCore(sr_feed_task, "sr_feed", 5120,
                                              NULL, 5, &s_feed_task, 0);
     BaseType_t r2 = xTaskCreatePinnedToCore(sr_detect_task, "sr_detect", 6144,
                                              NULL, 5, &s_detect_task, 1);
@@ -506,7 +512,7 @@ bool esp_sr_start_listening(esp_sr_result_cb_t on_result)
         ESP_LOGE(TAG, "任务创建失败 read=%ld feed=%ld detect=%ld",
                  (long)r0, (long)r1, (long)r2);
         s_listening = false;
-        /* 等已起来的任务退出后再清资源 */
+        /* 等已起来的任务检测到 s_listening=false 后自然退出 */
         vTaskDelay(pdMS_TO_TICKS(200));
         if (s_pcm_ring) {
             vRingbufferDelete(s_pcm_ring);
@@ -550,15 +556,26 @@ void esp_sr_stop_listening(void)
     s_feed_task = NULL;
     s_detect_task = NULL;
     sr_task_unlock();
+    bool any_hard_killed = false;
     for (int i = 0; i < 3; i++) {
         if (to_kill[i]) {
             ESP_LOGW(TAG, "硬杀未退出的任务 %p", to_kill[i]);
             vTaskDelete(to_kill[i]);
+            any_hard_killed = true;
         }
     }
 
+    /* 被硬杀的任务可能正持有 ringbuf 内部互斥锁或 item 引用；
+     * 此时 vRingbufferDelete() 会走断言（持有者 ≠ 当前任务）→ 整机崩。
+     * 选择故意泄漏这块 ringbuf（16KB PSRAM），等 start_listening 下次
+     * 调用前手动置 NULL 让新 ringbuf 被建立。这比崩机可接受得多，
+     * 且一个周期最多泄漏一次（硬杀本身是极稀有事件）。*/
     if (s_pcm_ring) {
-        vRingbufferDelete(s_pcm_ring);
+        if (any_hard_killed) {
+            ESP_LOGW(TAG, "任务被硬杀，放弃 ringbuf 删除以避免断言崩溃（16KB 泄漏）");
+        } else {
+            vRingbufferDelete(s_pcm_ring);
+        }
         s_pcm_ring = NULL;
     }
 

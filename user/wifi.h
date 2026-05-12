@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 // WiFi 连接状态
 typedef enum {
@@ -31,8 +32,10 @@ void wifi_disconnect(void);
 // 获取当前连接状态
 wifi_status_t wifi_get_status(void);
 
-// 获取分配到的 IP 地址字符串，如 "192.168.1.100"
-const char *wifi_get_ip(void);
+// 将当前 IP 地址以稳定快照方式 copy 进 out（\0 结尾），最多 cap-1 字符。
+// 内部持锁读取，避免事件回调并发改写时读到撕裂字符串。
+// cap 必须 >= 1；cap=0 时什么都不做。
+void wifi_copy_ip(char *out, size_t cap);
 
 /* 游戏模式：完整停止 WiFi 并阻止守护任务重连，腾出所有 WiFi 内部 DRAM。
  * 不释放 WiFi 子系统配置（下次 resume 直接用），仅 stop（发断开 + 释放 buffer）。

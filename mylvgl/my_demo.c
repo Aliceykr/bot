@@ -1097,7 +1097,7 @@ static void wifi_connect_task(void *arg)
     wifi_result_t result;
     result.success = ok;
     result.cancelled = false;
-    if (ok) strncpy(result.ip, wifi_get_ip(), sizeof(result.ip)-1);
+    if (ok) wifi_copy_ip(result.ip, sizeof(result.ip));
     else result.ip[0] = '\0';
     // 只有队列还空才发（取消时队列已有cancelled消息）
     xQueueSend(wifi_result_queue, &result, 0);

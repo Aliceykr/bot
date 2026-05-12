@@ -67,9 +67,9 @@ static ble_prov_status_cb_t s_status_cb = NULL;
 static ble_prov_status_cb_t s_saved_cb  = NULL;
 static ble_prov_cred_cb_t   s_cred_cb   = NULL;
 
-static uint16_t s_conn_handle    = 0xFFFF;
+static volatile uint16_t s_conn_handle    = 0xFFFF;
 static uint16_t s_io_val_handle  = 0;
-static bool     s_notify_enabled = false;
+static volatile bool     s_notify_enabled = false;
 static uint8_t  s_own_addr_type  = 0;
 
 /* RX 累积缓冲 */
@@ -77,6 +77,12 @@ static uint8_t  s_own_addr_type  = 0;
 static char s_rx_accum[RX_ACCUM_CAP];
 static size_t s_rx_len = 0;
 static TimerHandle_t s_rx_timer = NULL;
+
+/* Pending host-API 调用计数：worker / timer 进入 ble_send_notify 前 +1，
+ * 调用完 -1。deinit 会先设门锁阻止新 pending 进入，再等现有 pending 归零，
+ * 才调 force_nimble_teardown，彻底消除 ble_send_notify 的 UAF 窗口。*/
+static volatile int32_t s_pending_host_calls = 0;
+static SemaphoreHandle_t s_pending_done_sem  = NULL;   /* binary, 用于唤醒 deinit */
 
 static int start_advertising(void);
 
@@ -95,9 +101,41 @@ static void notify_status(const char *status)
 
 static void ble_send_notify(const char *msg)
 {
-    if (s_conn_handle == 0xFFFF || !s_notify_enabled || !s_io_val_handle) return;
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(msg, strlen(msg));
-    if (om) ble_gatts_notify_custom(s_conn_handle, s_io_val_handle, om);
+    /* 跨任务调用点：worker task / timer service 都会调这个。
+     *
+     * NimBLE API 本身是线程安全的（内部 host mutex），但前提是 nimble_port 还
+     * 存活。deinit 会等 pending 计数归零才拆 host，所以只要我们在锁内通过门
+     * 锁 +1 成功，host 就保证活到 -1 前。 */
+    uint16_t conn;
+    bool notify_en;
+    uint16_t val_handle;
+    bool allowed = false;
+
+    LOCK();
+    if (s_initialized && !s_deinit_in_progress) {
+        conn       = s_conn_handle;
+        notify_en  = s_notify_enabled;
+        val_handle = s_io_val_handle;
+        s_pending_host_calls++;   /* 在锁内 ++，确保 deinit 的快照一致 */
+        allowed = true;
+    }
+    UNLOCK();
+
+    if (!allowed) return;
+
+    if (conn != 0xFFFF && notify_en && val_handle) {
+        struct os_mbuf *om = ble_hs_mbuf_from_flat(msg, strlen(msg));
+        if (om) ble_gatts_notify_custom(conn, val_handle, om);
+    }
+
+    /* pending -1。如果归零且 deinit 在等，give sem */
+    LOCK();
+    bool last = (--s_pending_host_calls == 0);
+    bool deinit_waiting = s_deinit_in_progress;
+    UNLOCK();
+    if (last && deinit_waiting && s_pending_done_sem) {
+        xSemaphoreGive(s_pending_done_sem);
+    }
 }
 
 /* ================================================================
@@ -125,9 +163,18 @@ static void parse_and_dispatch(char *buf)
 
     wifi_set_credentials(ssid, password);
 
-    ble_prov_cred_cb_t cb = s_cred_cb;
+    /* 锁内快照 cred_cb + s_initialized：
+     *   deinit 把 s_initialized=false 和 s_cred_cb=NULL 放在同一个锁区间里，
+     *   这里一次性读出一致快照，要么 "还在初始化状态 + cb 有效"，要么 "已拆完"。
+     *   避免"cb 非空但 UI 侧 BLE 菜单已释放"这种悬空调用。 */
+    ble_prov_cred_cb_t cb = NULL;
+    LOCK();
+    if (s_initialized && !s_deinit_in_progress) {
+        cb = s_cred_cb;
+    }
+    UNLOCK();
     if (cb) cb(ssid, password);
-    else    ESP_LOGW(TAG, "未注册 cred_cb，凭据已保存但 WiFi 不会自动连接");
+    else    ESP_LOGW(TAG, "cred_cb 无效（已 deinit 或未注册），凭据已保存但 WiFi 不会自动连接");
 }
 
 static void rx_worker_task(void *arg)
@@ -171,6 +218,9 @@ static void accumulate_rx(const uint8_t *data, int len)
     ESP_LOGI(TAG, "BLE 收到 %d 字节: %.*s", len, len, (const char *)data);
     if (len <= 0) return;
 
+    /* 所有对 s_rx_timer / s_rx_len / s_rx_accum 的读写都在锁内完成，
+     * 与 deinit（锁内抢走 timer 并置 NULL）互斥，消除 timer UAF（C4）。
+     * lazy-create timer 也在锁内，避免两次 accumulate_rx 同时创建两个 timer。 */
     LOCK();
     size_t room = (RX_ACCUM_CAP - 1) - s_rx_len;
     if ((size_t)len > room) len = (int)room;
@@ -178,13 +228,24 @@ static void accumulate_rx(const uint8_t *data, int len)
         memcpy(s_rx_accum + s_rx_len, data, len);
         s_rx_len += len;
     }
-    UNLOCK();
 
-    if (!s_rx_timer) {
+    /* 如果 deinit 正在进行（门锁置位），或 BLE 已经被 deinit 拆完，
+     * 不再创建 / reset timer，避免 timer use-after-free */
+    bool deinit_pending = s_deinit_in_progress;
+    bool inited = s_initialized;
+    if (!deinit_pending && inited && !s_rx_timer) {
         s_rx_timer = xTimerCreate("ble_rx", pdMS_TO_TICKS(50), pdFALSE,
                                    NULL, rx_timer_cb);
     }
-    if (s_rx_timer) xTimerReset(s_rx_timer, pdMS_TO_TICKS(10));
+    TimerHandle_t t = s_rx_timer;
+    UNLOCK();
+
+    /* xTimerReset 本身会把命令塞进 timer service queue，那边才真正操作句柄；
+     * 只要我们 deinit 的顺序是"锁内抢 timer 清 NULL → 释放锁 → xTimerDelete"，
+     * 而这里锁内读到的 t 还是 deinit 前的有效句柄，xTimerDelete 是"排队命令"，
+     * timer service task 处理它之前我们的 Reset 可能已经排在前面，这种排序
+     * 会让 Reset 在 Delete 之前执行，仍然安全。 */
+    if (t) xTimerReset(t, pdMS_TO_TICKS(10));
 }
 
 /* ================================================================
@@ -273,11 +334,13 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
+            LOCK();
             s_conn_handle = event->connect.conn_handle;
-            ESP_LOGI(TAG, "BLE 手机已连接 conn=%d", s_conn_handle);
+            UNLOCK();
+            ESP_LOGI(TAG, "BLE 手机已连接 conn=%d", event->connect.conn_handle);
             notify_status("已连接，等待配网...");
         } else {
-            /* 连接失败才重启广播；这里在 host 任务里，读 s_active 是一致的快照 */
+            /* 连接失败才重启广播 */
             bool need = false;
             LOCK();
             need = s_active;
@@ -288,11 +351,11 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(TAG, "BLE 手机已断开 reason=%d", event->disconnect.reason);
-        s_conn_handle = 0xFFFF;
-        s_notify_enabled = false;
         {
             bool need = false;
             LOCK();
+            s_conn_handle    = 0xFFFF;
+            s_notify_enabled = false;
             need = s_active;
             UNLOCK();
             if (need) {
@@ -304,8 +367,11 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_SUBSCRIBE:
         if (event->subscribe.attr_handle == s_io_val_handle) {
-            s_notify_enabled = event->subscribe.cur_notify;
-            if (s_notify_enabled) ble_send_notify("ESP32-Bot ready!");
+            bool enable = event->subscribe.cur_notify;
+            LOCK();
+            s_notify_enabled = enable;
+            UNLOCK();
+            if (enable) ble_send_notify("ESP32-Bot ready!");
         }
         return 0;
 
@@ -326,7 +392,16 @@ static void nimble_host_task(void *param)
 
 /* on_sync 原子地"消费" want_advertising：
  *   必须在锁内读 + 判断 + 清标志 + 启动 + 置 s_active。
- *   否则 stop() 在中间把 want 清零后还可能被 on_sync 幽灵启动。*/
+ *   否则 stop() 在中间把 want 清零后还可能被 on_sync 幽灵启动。
+ *
+ * 幽灵广播 (H5) 防护：
+ *   光在启动前检查 want 不够用，因为 start_advertising 本身要跑一段时间，
+ *   期间 stop 可能已经被调用清了状态。用"启动代 s_adv_gen"记账：
+ *     - 每次 stop 都把代数 +1
+ *     - on_sync / start 启动前记一份 my_gen，启动成功后在锁内比对；
+ *       若代数已经变过 → 说明中间被 stop 过 → 回滚（停广播），不置 s_active=true */
+static uint32_t s_adv_gen = 0;
+
 static void on_sync(void)
 {
     ble_hs_id_infer_auto(0, &s_own_addr_type);
@@ -336,9 +411,11 @@ static void on_sync(void)
              addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
 
     bool do_start = false;
+    uint32_t my_gen = 0;
     LOCK();
     if (s_want_advertising && !s_active) {
         s_want_advertising = false;   /* 消费掉，避免后续再次触发 */
+        my_gen = s_adv_gen;
         do_start = true;
     }
     UNLOCK();
@@ -346,16 +423,29 @@ static void on_sync(void)
     if (!do_start) return;
 
     int rc = start_advertising();
+    bool committed = false;
     LOCK();
     bool ok = (rc == 0);
-    if (ok) s_active = true;
+    /* 只有当启动成功 AND 期间没人 stop（代数未变）才真正置 active。
+     * 否则回滚：此刻广播是跑起来的，我们必须停掉它，否则就成幽灵广播 */
+    if (ok && my_gen == s_adv_gen) {
+        s_active  = true;
+        committed = true;
+    }
     UNLOCK();
 
-    if (ok) {
+    if (ok && !committed) {
+        /* 启动期间被 stop 了，立刻停掉刚起的广播 */
+        ble_gap_adv_stop();
+        ESP_LOGW(TAG, "on_sync: 启动中被 stop，回滚广播");
+        return;
+    }
+
+    if (committed) {
         notify_status("蓝牙已开启");
         ESP_LOGI(TAG, "BLE 广播已启动（on_sync）");
     } else {
-        /* 延迟启动失败：通知 UI，避免用户看到假的"已开启" */
+        /* 真正启动失败 */
         notify_status("BLE 启动失败");
         ESP_LOGE(TAG, "on_sync 内广播启动失败 rc=%d", rc);
     }
@@ -404,6 +494,15 @@ bool ble_prov_init(void)
 {
     ensure_mutex();
     if (!s_mutex) { ESP_LOGE(TAG, "mutex 创建失败"); return false; }
+
+    /* pending 信号量：给 deinit 等 host-call 归零用，一次性创建 */
+    if (!s_pending_done_sem) {
+        s_pending_done_sem = xSemaphoreCreateBinary();
+        if (!s_pending_done_sem) {
+            ESP_LOGE(TAG, "pending sem 创建失败");
+            return false;
+        }
+    }
 
     /* init 本身也要和 deinit 串行化，防止并发 init + deinit 撕裂状态 */
     LOCK();
@@ -470,6 +569,7 @@ bool ble_prov_start(ble_prov_status_cb_t cb)
     bool need_start_now = false;
     bool is_active      = false;
     bool is_inited      = false;
+    uint32_t my_gen     = 0;
 
     LOCK();
     is_inited = s_initialized;
@@ -482,6 +582,7 @@ bool ble_prov_start(ble_prov_status_cb_t cb)
         s_saved_cb  = cb;
     }
     s_want_advertising = true;
+    my_gen = s_adv_gen;
     if (ble_hs_synced()) {
         /* 直接同步路径：消费 want + 启动 + 置 active 都在锁内 */
         s_want_advertising = false;
@@ -496,11 +597,22 @@ bool ble_prov_start(ble_prov_status_cb_t cb)
 
     if (s_own_addr_type == 0) ble_hs_id_infer_auto(0, &s_own_addr_type);
     int rc = start_advertising();
+
+    bool committed = false;
     LOCK();
     bool ok = (rc == 0);
-    if (ok) s_active = true;
+    if (ok && my_gen == s_adv_gen) {
+        s_active  = true;
+        committed = true;
+    }
     UNLOCK();
 
+    if (ok && !committed) {
+        /* 启动期间被 stop，停掉刚起的广播 */
+        ble_gap_adv_stop();
+        ESP_LOGW(TAG, "ble_prov_start: 启动中被 stop，回滚广播");
+        return false;
+    }
     if (!ok) {
         notify_status("BLE 启动失败");
         return false;
@@ -513,29 +625,35 @@ bool ble_prov_start(ble_prov_status_cb_t cb)
 void ble_prov_stop(void)
 {
     /* stop 必须原子地清除 want_advertising 和 s_active，
-     * 否则 on_sync 会读到旧 want=true 继续"幽灵启动" */
+     * 并递增 s_adv_gen 让任何进行中的 start/on_sync 检测到"我被打断了"，
+     * 回滚它自己刚起的广播（H5 幽灵广播防护） */
     bool was_active = false;
     LOCK();
     was_active = s_active;
     s_active = false;
     s_want_advertising = false;
+    s_adv_gen++;
     UNLOCK();
 
-    if (!was_active) return;
-
+    /* 无论之前 active 与否，都尝试 stop 广播，防止"on_sync 正在启动时"
+     * 我们的 stop 赶在启动前执行完。由 on_sync/start 的 gen 检查兜底回滚。 */
     ble_gap_adv_stop();
-    if (s_conn_handle != 0xFFFF) {
-        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-        s_conn_handle = 0xFFFF;
-    }
+    uint16_t conn_to_term;
+    LOCK();
+    conn_to_term = s_conn_handle;
+    s_conn_handle = 0xFFFF;
     s_notify_enabled = false;
+    UNLOCK();
+    if (conn_to_term != 0xFFFF) {
+        ble_gap_terminate(conn_to_term, BLE_ERR_REM_USER_CONN_TERM);
+    }
 
-    notify_status("蓝牙已关闭");
+    if (was_active) notify_status("蓝牙已关闭");
 
     LOCK();
     s_status_cb = NULL;
     UNLOCK();
-    ESP_LOGI(TAG, "BLE 已停止");
+    if (was_active) ESP_LOGI(TAG, "BLE 已停止");
 }
 
 bool ble_prov_is_active(void)
@@ -599,6 +717,27 @@ void ble_prov_deinit(void)
         return;
     }
 
+    /* 先等现有 pending host-call（worker / timer 里的 ble_send_notify 等）
+     * 全部结束，再拆 nimble_port。否则它们正在用的 mbuf/pool 会成 UAF。
+     * 由于 s_deinit_in_progress 已经置位，不会再有新的 pending 进来。
+     * 最多等 2 秒兜底，超时就强拆（此时极大概率是 pending 任务卡死）。*/
+    if (s_pending_done_sem) {
+        /* 先清一下旧 signal */
+        xSemaphoreTake(s_pending_done_sem, 0);
+    }
+    for (int i = 0; i < 40; ++i) {     /* 40 × 50ms = 2s */
+        int32_t pending;
+        LOCK();
+        pending = s_pending_host_calls;
+        UNLOCK();
+        if (pending <= 0) break;
+        if (s_pending_done_sem) {
+            xSemaphoreTake(s_pending_done_sem, pdMS_TO_TICKS(50));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+
     if (s_active) ble_prov_stop();
 
     if (timer_to_delete) {
@@ -610,6 +749,7 @@ void ble_prov_deinit(void)
     LOCK();
     s_status_cb        = NULL;
     s_saved_cb         = NULL;
+    s_cred_cb          = NULL;              /* 清除凭据回调，防止 rx worker 调悬空 */
     s_rx_len           = 0;
     s_initialized      = false;
     s_conn_handle      = 0xFFFF;
