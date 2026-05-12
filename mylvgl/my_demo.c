@@ -1371,12 +1371,28 @@ static void show_game_screen(void)
     int count = 0;
     bool ok = rom_loader_scan(s_roms, &count);
 
+    /* 内置游戏"2048"：不走 ROM 扫描，手动加一条列表项。
+     * rom_item_cb 通过 user_data 传 __builtin_2048 触发 game_runtime_run
+     * 里的内置分派。放在列表顶部：即使 SD 卡上没有 ROM 也能玩 2048。
+     * 字符串是程序段常量，可长期作为 user_data。*/
+    static const char *kBuiltin2048 = "__builtin_2048";
+    lv_obj_t *btn_2048 = lv_list_add_button(rlist, LV_SYMBOL_PLAY, "2048 (内置)");
+    lv_obj_set_style_bg_color(btn_2048, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_bg_color(btn_2048, lv_color_hex(0xe94560), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(btn_2048, lv_color_hex(0xffffff), 0);
+    lv_obj_t *lbl_2048 = lv_obj_get_child(btn_2048, 1);
+    if (lbl_2048) lv_obj_set_style_text_font(lbl_2048, &lv_font_simhei_16, 0);
+    lv_obj_add_event_cb(btn_2048, rom_item_cb, LV_EVENT_CLICKED, (void *)kBuiltin2048);
+    lv_group_add_obj(gg, btn_2048);
+
     if (!ok) {
-        lv_obj_t *msg = lv_list_add_text(rlist, "SPIFFS 挂载失败");
+        lv_obj_t *msg = lv_list_add_text(rlist, "SD 卡未挂载或 /rom 目录不存在");
         lv_obj_set_style_text_color(msg, lv_color_hex(0xff4040), 0);
+        lv_obj_set_style_text_font(msg, &lv_font_simhei_16, 0);
     } else if (count == 0) {
-        lv_obj_t *msg = lv_list_add_text(rlist, "未找到 .gb / .gbc 文件\n请放到 spiffs_image/roms/");
+        lv_obj_t *msg = lv_list_add_text(rlist, "SD 卡 /rom 目录暂无 .gb / .gbc");
         lv_obj_set_style_text_color(msg, lv_color_hex(0xaaaaaa), 0);
+        lv_obj_set_style_text_font(msg, &lv_font_simhei_16, 0);
     } else {
         for (int i = 0; i < count; i++) {
             char label[ROM_MAX_NAME + 32];

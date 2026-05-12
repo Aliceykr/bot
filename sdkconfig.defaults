@@ -71,11 +71,12 @@ CONFIG_SW_COEXIST_ENABLE=y
 # LVGL large font support
 CONFIG_LV_FONT_FMT_TXT_LARGE=y
 
-# FATFS: 开启长文件名 + 中文 GBK 代码页
-# 不开的话，中文文件名会被转成 Windows 8.3 短名（如 "M50000~1.MP3"）
-# - LFN_HEAP：长文件名缓冲放堆，比 STACK 省 DRAM
-# - LFN_MAX_CHAR_SIZE=3：每个 UCS-2 字符最多 3 字节 UTF-8，兼容中文
-# - CODEPAGE_936：Simplified Chinese，SD 卡上中文名按 GBK 编码存
+# FATFS: enable Long File Name + Simplified Chinese codepage
+# Without LFN, filenames with non-ASCII chars get returned as 8.3 short names
+# (e.g. "M50000~1.MP3"). LFN_HEAP puts LFN buffers on heap (saves DRAM vs STACK).
+# CODEPAGE_936 = Simplified Chinese GBK for SFN decoding.
+# Note: no Chinese characters in this file - kconfgen reads with system codepage
+# on Windows (GBK), UTF-8 bytes would crash config generation.
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_MAX_LFN=255
 CONFIG_FATFS_API_ENCODING_UTF_8=y

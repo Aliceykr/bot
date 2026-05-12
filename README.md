@@ -133,8 +133,8 @@ bot/
 ├── lvgl/                         # LVGL 9.x 源码
 ├── lv_conf.h                     # LVGL 配置
 ├── partitions.csv                # 自定义分区表（6.5MB 双 OTA + ESP-SR 模型）
-├── sdkconfig.defaults            # 默认配置（含 ESP32-S3 / BLE / ESP-SR / WiFi / FATFS 优化）
-└── CMakeLists.txt                # 顶层 CMake（UTF-8 编码 + 去掉 SPIFFS 打包）
+├── sdkconfig.defaults            # 默认配置（含 ESP32-S3 / BLE / ESP-SR / WiFi / FATFS）
+└── CMakeLists.txt                # 顶层 CMake（UTF-8 编码）
 ```
 
 ---
@@ -147,11 +147,11 @@ bot/
 
 - **环境监测** — 占位（开发中）
 - **天气与日期** — HTTP 拉取实时天气，展示温度、湿度、风力、实时时钟
-- **游戏** — 扫描 SD 卡 `/sdcard/rom/` 中的 .gb/.gbc ROM 文件，选择运行 Game Boy 模拟器
+- **游戏** — 内置 2048 游戏（无需 SD 卡）+ 扫描 SD 卡 `/sdcard/rom/` 中的 .gb/.gbc ROM 文件运行 Game Boy 模拟器
 - **聊天助手** — 屏幕键盘输入文字，调用 LLM API 获取回复，滚动对话记录
 - **语音助手** — 在线流程：录音 → 百度 ASR 识别 → LLM 回复 → 百度 TTS 合成播放
 - **语音命令** — 离线 ESP-SR 中文命令词识别（按钮触发，无需唤醒词）
-- **蓝牙** — 开启 BLE 广播，手机发送 "SSID_xxx password_xxx" 进行 WiFi 配网
+- **蓝牙** — 开启 BLE 广播，手机发送 "SSID_xxx password_xxx" 配网后自动连接 WiFi（WiFi 连接由 BLE 配网回调自动触发，无独立菜单入口）
 - **音乐** — 扫描 SD 卡 `/sdcard/music/` 下的 WAV / MP3 文件，选择播放（支持暂停/切歌）
 - **音量** — 滑块调节音量（0-100%），对数增益曲线，NVS 持久化，重启自动恢复
 
@@ -162,6 +162,7 @@ bot/
 - GB 原生分辨率 160x144，1.5 倍缩放到 240x216
 - SPI 80MHz 异步 DMA 双行缓冲渲染
 - ROM 从 SD 卡加载到 PSRAM（最大 4MB），小 ROM（<=256KB）自动复制到 DRAM 加速
+- 内置 2048 游戏：无需 ROM 文件，列表顶部始终可见，即使 SD 卡上无 ROM 也可游玩
 - 3x3 按键矩阵提供完整的 GB 控制输入（A/B/方向/START/SELECT/EXIT）
 - 进入游戏自动暂停 WiFi 和 BLE，退出后恢复进入前活跃的服务
 
@@ -229,6 +230,7 @@ MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 - 挂载/卸载安全，可重入
 - 与 LCD（SPI2_HOST）互不干扰
 - 存放 Game Boy ROM（`/sdcard/rom/`）和音乐文件（`/sdcard/music/`）
+- 游戏列表内置 2048（无需 ROM 文件），始终可见
 
 ### 9. 音乐播放器
 
@@ -351,6 +353,8 @@ cp user/model_config.h.example user/model_config.h
 └── music/        # 放置 .wav / .mp3 音乐文件（16bit PCM WAV 或 MP3）
 ```
 
+> 注意：实际 ROM 目录为 `/sdcard/rom`（不带 s），不是 `/sdcard/roms`。
+
 **4. 编译、烧录**
 
 ```bash
@@ -427,8 +431,52 @@ ROM 和音乐文件存放在 MicroSD 卡，不再使用 Flash SPIFFS 存储。
 - **ESP32-S3 蓝牙限制**：仅支持 BLE，不支持 Classic BT（A2DP 不可用）
 - **游戏模式**：进入游戏自动暂停 WiFi + BLE，退出后仅恢复进入前活跃的服务
 - **音频安全**：DC-block HPF 消除直流偏置，字节尾对齐防止 PCM 错位，DMA auto_clear 消除空闲噪声
-- **SD 卡必须插入**：游戏 ROM 和音乐文件都从 SD 卡读取，未插卡时游戏和音乐功能不可用
+- **SD 卡必须插入**：Game Boy ROM 和音乐文件从 SD 卡读取，未插卡时音乐和 GB 游戏不可用（内置 2048 仍可玩）
 - **音乐文件格式**：WAV 需为 16bit PCM（8k-48k Hz），MP3 由 Helix 定点解码器支持（MPEG-1/2 Layer III）
+
+---
+
+## 工程亮点
+
+### 线程安全设计
+
+ESP32-S3 多任务环境下，共享状态的并发访问是最常见的崩溃源。本项目采用分层防护策略：
+
+- **模块级 mutex**：WiFi、BLE、Speaker、音乐播放器各自维护独立的 mutex，保护内部状态不被事件回调、守护任务、UI 任务撕裂读写
+- **volatile 无锁读取**：`wifi_get_status()`、`speaker_get_volume()` 等高频查询路径使用 `volatile` + 32 位对齐原子语义，避免加锁拖慢 UI/HTTP 路径
+- **flush 协议**：Speaker 的 `speaker_flush()` / `speaker_set_sample_rate()` 不直接操作 ring buffer，而是通过 `s_flush_request` + `s_flush_done` 信号量通知 tx_task 自行清空，保证 ring buffer 的唯一消费者不变
+- **异步 UI 操作**：音乐切歌/停止通过一次性后台任务执行（`music_stop_task` / `music_play_task`），避免 `music_stop` 的 2 秒等待阻塞 LVGL 线程；任务创建失败时降级为同步调用，功能正确优先
+
+### 内存精细管理
+
+ESP32-S3 内部 DRAM 仅 ~338KB，项目在内存使用上做了多层优化：
+
+- **PSRAM 优先策略**：HTTP 响应缓冲、录音缓冲、ROM 数据、音乐解码缓冲、WiFi/LwIP 动态缓冲均分配在 8MB PSRAM，内部 DRAM 只放必须的 LVGL 双缓冲和 FreeRTOS 任务栈
+- **用后即释**：ASR HTTP 响应缓冲在识别完成后立即 `release_http_buf()` 释放回 NULL，下次识别从 4KB 重新起步，避免单次扩容到 32KB 后永久占用；音乐扫描缓冲（`s_music_scan_buf`）在退出音乐屏幕时释放
+- **动态扩容 + 收缩**：HTTP 响应缓冲从 4KB 起步，按需 2 倍扩容到最大 32KB，识别完成后收缩回 NULL
+- **NVS 写入防抖**：音量 slider 拖动通过 500ms 软件定时器合并写入，避免连续 100 次 flash 写操作加速磨损
+- **BLE/ESP-SR 懒加载**：蓝牙和离线语音识别仅在进入对应界面时初始化，退出时 deinit 释放 ~100KB DRAM，空闲期零占用
+
+### I2S 资源共享
+
+I2S_NUM_0 被在线 ASR（`asr.c`）和离线 ESP-SR（`esp_sr.c`）共享，通过安全的交接协议：
+
+- `asr_mic_deinit()` 先置 `s_rec_active = false`，再通过 `s_stop_waiter` + `xTaskNotifyGive` 等录音任务确认退出循环后，才调用 `i2s_del_channel`，避免在 `i2s_channel_read` 阻塞期间释放底层资源导致 HardFault
+- `asr_mic_reinit()` 重建 I2S 通道后，常驻录音任务自动恢复，无需重新创建任务
+
+### 音频处理健壮性
+
+- **字节尾对齐**：HTTP chunked 传输可能给出奇数字节，`speaker_play` 保留尾字节到下次拼合，防止 16bit PCM 样本错位变成白噪声
+- **DC-block HPF**：一阶高通滤波器（截止 ~12.7Hz @16kHz）消除 MAX98357A 直流偏置，Q15 定点乘避免浮点开销
+- **线性淡入**：每次 flush 或首次播放的前 64 个样本按线性 ramp 升起，消除爆破声
+- **动态采样率切换**：音乐播放前通过 flush 协议清空 ring + disable I2S → reconfig clock → enable，确保旧速率数据完全播完再切；播完自动恢复 16kHz，TTS/GB 音频不受影响
+- **MP3 错误容忍**：连续 32 帧解码失败自动放弃，防止垃圾数据把 Helix 解码器推进非法状态导致 crash；自动跳过 ID3v2 tag 防止误同步
+
+### 系统级鲁棒性
+
+- **WiFi 守护任务**：首次连接 EventGroup 等待 + 快速重试 3 次；运行期断线自动指数退避重连（5s → 5min），永不放弃；用户主动断开则停止守护
+- **BLE deinit 防护**：`s_deinit_in_progress` 门锁防止双拆；`s_pending_host_calls` 计数器等待跨任务 NimBLE API 调用完成后再拆 host；`s_adv_gen` 代际计数器防止 stop 后残留广播（ghost advertising）
+- **任务生命周期安全**：ESP-SR 三个任务（read/feed/detect）通过 graceful stop + 2 秒超时硬杀 + ring buffer 残留保护，避免资源泄漏；音乐播放器的 `music_stop` 采用 10 轮 ×200ms 轮询确认旧任务退出，防止快速切歌产生僵尸任务
 
 ---
 
