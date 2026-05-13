@@ -81,3 +81,11 @@ Desktop.ini
 user/model_config.h
 user/asr_config.h
 user/bemfa_config.h
+
+# Flutter BLE App build artifacts
+BLE_APP/.dart_tool/
+BLE_APP/build/
+BLE_APP/.flutter-plugins
+BLE_APP/.flutter-plugins-dependencies
+BLE_APP/android/.gradle/
+BLE_APP/ios/Pods/
