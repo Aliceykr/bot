@@ -170,6 +170,7 @@ typedef struct {
 
 static QueueHandle_t weather_result_queue = NULL;
 static bool weather_fetching = false;
+static volatile bool s_weather_cancelled = false;
 
 typedef struct {
     bool success;
@@ -314,16 +315,23 @@ static void show_weather_screen(const weather_data_t *d)
 
 static void weather_cancel_btn_cb(lv_event_t *e)
 {
+    s_weather_cancelled = true;
     weather_fetching = false;
     safe_delete_loading_dialog(&weather_spinner_cont);
     indev_set_group(group);
+    /* drain 已有结果，避免迟到的旧结果污染下一次 fetch */
+    weather_result_t drained;
+    while (xQueueReceive(weather_result_queue, &drained, 0) == pdTRUE) {}
 }
 
 static void weather_fetch_task(void *arg)
 {
     weather_result_t res;
     res.success = weather_fetch(&res.data);
-    xQueueSend(weather_result_queue, &res, 0);
+    /* 取消后不投递结果，避免主循环弹出天气界面 */
+    if (!s_weather_cancelled) {
+        xQueueSend(weather_result_queue, &res, 0);
+    }
     psram_task_exit();
 }
 
@@ -565,6 +573,13 @@ static void asr_btn_cb(lv_event_t *e)
         lv_label_set_text(asr_status_label, "识别中...");
         lv_obj_set_style_bg_color(asr_btn, lv_color_hex(0x555555), 0);
         uint32_t *len_arg = malloc(sizeof(uint32_t));
+        if (!len_arg) {
+            /* DRAM 紧张：malloc 失败，安全回退（不解引用空指针） */
+            lv_label_set_text(asr_status_label, "内存不足");
+            lv_obj_set_style_bg_color(asr_btn, lv_color_hex(0x16213e), 0);
+            asr_processing = false;
+            return;
+        }
         *len_arg = asr_audio_len;
         BaseType_t ret = xTaskCreatePSRAM(asr_recognize_task, "asr_task", 16384, len_arg, 3, NULL);
         if (ret != pdPASS) {
@@ -811,26 +826,46 @@ static void sr_cmd_back_cb(lv_event_t *e)
 // 蓝牙开关（菜单直接切换，无独立界面）
 // ================================================================
 
+/* 弹窗对象正在销毁时统一清零全局句柄，覆盖所有销毁路径
+ * （OK 按钮 / 父屏切换 / 显式 lv_obj_delete），避免悬空指针 */
+static void ble_result_dialog_delete_cb(lv_event_t *e)
+{
+    (void)e;
+    ble_result_dialog = NULL;
+}
+
 static void show_ble_screen(void)
 {
     if (ble_prov_is_active()) {
         ble_prov_stop();
         ble_prov_deinit();
         ble_result_dialog = create_result_dialog("蓝牙已关闭", 0x888888);
+        if (ble_result_dialog) {
+            lv_obj_add_event_cb(ble_result_dialog, ble_result_dialog_delete_cb, LV_EVENT_DELETE, NULL);
+        }
         return;
     }
 
     if (!ble_prov_init()) {
         ble_prov_deinit();
         ble_result_dialog = create_result_dialog("蓝牙初始化失败", 0xff0000);
+        if (ble_result_dialog) {
+            lv_obj_add_event_cb(ble_result_dialog, ble_result_dialog_delete_cb, LV_EVENT_DELETE, NULL);
+        }
         return;
     }
     ble_prov_set_cred_cb(ble_cred_cb);
     if (ble_prov_start(NULL)) {
         ble_result_dialog = create_result_dialog("蓝牙已开启\n设备: ESP32-Bot", 0x1E90FF);
+        if (ble_result_dialog) {
+            lv_obj_add_event_cb(ble_result_dialog, ble_result_dialog_delete_cb, LV_EVENT_DELETE, NULL);
+        }
     } else {
         ble_prov_deinit();
         ble_result_dialog = create_result_dialog("蓝牙广播失败", 0xff0000);
+        if (ble_result_dialog) {
+            lv_obj_add_event_cb(ble_result_dialog, ble_result_dialog_delete_cb, LV_EVENT_DELETE, NULL);
+        }
     }
 }
 
@@ -1196,6 +1231,11 @@ static void wifi_status_timer_cb(lv_timer_t *timer)
     // 检查天气查询结果
     weather_result_t wresp;
     if (xQueueReceive(weather_result_queue, &wresp, 0) == pdTRUE) {
+        if (s_weather_cancelled) {
+            /* 防御：drain 漏过的迟到结果，取消后不显示天气界面 */
+            weather_fetching = false;
+            return;
+        }
         weather_fetching = false;
         safe_delete_loading_dialog(&weather_spinner_cont);
         if (wresp.success) {
@@ -2176,6 +2216,8 @@ static void list_event_cb(lv_event_t *e)
             return;
         }
         if (weather_fetching) return;
+        s_weather_cancelled = false;
+        { weather_result_t drained; while (xQueueReceive(weather_result_queue, &drained, 0) == pdTRUE) {} }
         weather_fetching = true;
         weather_spinner_cont = create_loading_dialog("Fetching Weather...", weather_cancel_btn_cb);
         xTaskCreatePSRAM(weather_fetch_task, "weather_task", 16384, NULL, 3, NULL);

@@ -24,6 +24,18 @@ static size_t  s_resp_cap = 0;
 static size_t  s_resp_len = 0;
 static bool    s_resp_overflow = false;
 
+/* 释放 HTTP 响应缓冲区，在 API 函数返回前调用（必须在 mutex 持有期间） */
+static inline void resp_buf_release(void)
+{
+    if (s_resp_buf) {
+        heap_caps_free(s_resp_buf);
+        s_resp_buf = NULL;
+    }
+    s_resp_cap      = 0;
+    s_resp_len      = 0;
+    s_resp_overflow = false;
+}
+
 /* 互斥锁：保护 s_resp_buf 及后续 JSON 解析期间的模块状态，防并发调用 */
 static SemaphoreHandle_t s_mutex = NULL;
 static void ensure_mutex(void) {
@@ -73,7 +85,7 @@ static bool http_get(const char *url)
 {
     s_resp_len = 0;
     s_resp_overflow = false;
-    /* 缓冲复用，不在此处释放 */
+    /* 缓冲由 weather_fetch 的 cleanup 路径统一释放（resp_buf_release） */
 
     esp_http_client_config_t config = {
         .url            = url,
@@ -167,6 +179,7 @@ bool weather_fetch(weather_data_t *out)
     ret = true;
 
 out:
+    resp_buf_release();
     if (s_mutex) xSemaphoreGive(s_mutex);
     return ret;
 }

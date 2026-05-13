@@ -25,6 +25,18 @@ static size_t  s_resp_cap = 0;
 static size_t  s_resp_len = 0;
 static bool    s_resp_overflow = false;
 
+/* 释放 HTTP 响应缓冲区，在 API 函数返回前调用（必须在 mutex 持有期间） */
+static inline void resp_buf_release(void)
+{
+    if (s_resp_buf) {
+        heap_caps_free(s_resp_buf);
+        s_resp_buf = NULL;
+    }
+    s_resp_cap      = 0;
+    s_resp_len      = 0;
+    s_resp_overflow = false;
+}
+
 /* Token 缓存 */
 static char s_token[256] = "";
 static int64_t s_expire_us = 0;   /* esp_timer_get_time() 单调时间戳，到期点 */
@@ -103,16 +115,19 @@ static bool fetch_token_locked(void)
 
     if (err != ESP_OK || status != 200) {
         ESP_LOGE(TAG, "token 请求失败: err=%d status=%d", err, status);
+        resp_buf_release();
         return false;
     }
     if (s_resp_overflow || !s_resp_buf) {
         ESP_LOGE(TAG, "token 响应超大或分配失败");
+        resp_buf_release();
         return false;
     }
 
     cJSON *root = cJSON_Parse(s_resp_buf);
     if (!root) {
         ESP_LOGE(TAG, "token JSON 解析失败");
+        resp_buf_release();
         return false;
     }
     cJSON *tok = cJSON_GetObjectItem(root, "access_token");
@@ -132,15 +147,25 @@ static bool fetch_token_locked(void)
         ESP_LOGE(TAG, "响应无 access_token: %.200s", s_resp_buf);
     }
     cJSON_Delete(root);
+    resp_buf_release();
     return ok;
+}
+
+/* 必须在 app_main 启动阶段单线程调用一次，确保 mutex 在任何并发调用前创建 */
+void baidu_token_init(void)
+{
+    /* 幂等：仅在 mutex 尚未创建时创建，app_main 单线程阶段调用 */
+    if (s_mutex == NULL) {
+        s_mutex = xSemaphoreCreateMutex();
+        configASSERT(s_mutex);
+    }
 }
 
 static void ensure_mutex(void)
 {
     if (!s_mutex) {
-        /* 极小竞态窗口：多个任务首次并发调用时，两个任务都可能创建
-         * mutex。ESP-IDF 启动阶段通常由 WiFi 连接后才进 ASR/TTS 路径，
-         * 单任务触发。为稳妥，首次调用放在 baidu_token_get 串行路径上 */
+        /* 兜底：理论上 baidu_token_init 已在 app_main 调用过 */
+        ESP_LOGW(TAG, "baidu_token_init 未在 app_main 阶段调用，回退 lazy-create");
         s_mutex = xSemaphoreCreateMutex();
     }
 }

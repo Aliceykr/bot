@@ -22,4 +22,7 @@ const char *baidu_token_get(void);
  * 在 API 返回 401 或 token 相关错误码时调用。 */
 void baidu_token_invalidate(void);
 
+/* 必须在 app_main 启动阶段单线程调用一次，确保 mutex 在任何并发调用前创建 */
+void baidu_token_init(void);
+
 #endif /* __BAIDU_TOKEN_H */

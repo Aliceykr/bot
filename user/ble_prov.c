@@ -391,15 +391,13 @@ static void accumulate_rx(const uint8_t *data, int len)
         s_rx_timer = xTimerCreate("ble_rx", pdMS_TO_TICKS(50), pdFALSE,
                                    NULL, rx_timer_cb);
     }
-    TimerHandle_t t = s_rx_timer;
-    UNLOCK();
 
-    /* xTimerReset 本身会把命令塞进 timer service queue，那边才真正操作句柄；
-     * 只要我们 deinit 的顺序是"锁内抢 timer 清 NULL → 释放锁 → xTimerDelete"，
-     * 而这里锁内读到的 t 还是 deinit 前的有效句柄，xTimerDelete 是"排队命令"，
-     * timer service task 处理它之前我们的 Reset 可能已经排在前面，这种排序
-     * 会让 Reset 在 Delete 之前执行，仍然安全。 */
-    if (t) xTimerReset(t, pdMS_TO_TICKS(10));
+    /* xTimerReset 必须在锁内调用，与 deinit 的 s_rx_timer = NULL 互斥，
+     * 避免 reset 操作命中已被 delete 的句柄（UAF） */
+    if (s_rx_timer) {
+        xTimerReset(s_rx_timer, pdMS_TO_TICKS(10));
+    }
+    UNLOCK();
 }
 
 /* ================================================================

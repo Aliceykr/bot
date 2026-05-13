@@ -365,7 +365,8 @@ static bool decode_mp3_stream(FILE *fp)
         if (in_left <= 0) break;
 
         /* 2. 找 sync word */
-        uint8_t *read_ptr = in_buf + (MP3_INPUT_CHUNK - in_left);
+        /* memmove 后有效数据布局是 [in_buf, in_buf + in_left)，解码起点是 in_buf */
+        uint8_t *read_ptr = in_buf;
         int offset = MP3FindSyncWord(read_ptr, in_left);
         if (offset < 0) {
             /* 整块都没 sync：丢弃，重新 fread */

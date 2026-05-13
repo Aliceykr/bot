@@ -28,6 +28,18 @@ static void ensure_mutex(void) {
     if (!s_mutex) s_mutex = xSemaphoreCreateMutex();
 }
 
+/* 释放 HTTP 响应缓冲区，在 API 函数返回前调用（必须在 mutex 持有期间） */
+static inline void resp_buf_release(void)
+{
+    if (s_resp_buf) {
+        heap_caps_free(s_resp_buf);
+        s_resp_buf = NULL;
+    }
+    s_resp_cap      = 0;
+    s_resp_len      = 0;
+    s_resp_overflow = false;
+}
+
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
     switch (evt->event_id) {
@@ -165,6 +177,7 @@ bool model_chat(const char *user_msg, model_result_t *out)
     ret = true;
 
 out:
+    resp_buf_release();   /* 归还 PSRAM 响应缓冲，避免 API 返回后内存驻留 */
     if (s_mutex) xSemaphoreGive(s_mutex);
     return ret;
 }
