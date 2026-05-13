@@ -1214,9 +1214,9 @@ static void show_result_box(bool ok, bool cancelled, const char *ip)
     /* 构造结果文字后创建结果弹窗 */
     char msg[64];
     if (ok)
-        snprintf(msg, sizeof(msg), LV_SYMBOL_OK " Connected!\n%s", ip);
+        snprintf(msg, sizeof(msg), "WiFi 已连接\n%s", ip);
     else
-        snprintf(msg, sizeof(msg), LV_SYMBOL_CLOSE " WiFi Failed!");
+        snprintf(msg, sizeof(msg), "WiFi 连接失败");
 
     create_result_dialog(msg, ok ? 0x00ff00 : 0xff0000);
 }
@@ -1243,7 +1243,7 @@ static void wifi_status_timer_cb(lv_timer_t *timer)
         } else {
             /* 构造错误信息后创建结果弹窗 */
             char err_msg[80];
-            snprintf(err_msg, sizeof(err_msg), LV_SYMBOL_CLOSE " %s", wresp.data.error_msg);
+            snprintf(err_msg, sizeof(err_msg), "%s", wresp.data.error_msg);
             create_result_dialog(err_msg, 0xff0000);
         }
     }
@@ -1489,11 +1489,11 @@ static void music_status_tick(lv_timer_t *t)
     const char *name = music_current_name();
     if (st == MUSIC_STATE_PLAYING && name && name[0]) {
         char buf[128];
-        snprintf(buf, sizeof(buf), LV_SYMBOL_AUDIO " 正在播放: %s", name);
+        snprintf(buf, sizeof(buf), "正在播放: %s", name);
         lv_label_set_text(music_status_lbl, buf);
     } else if (st == MUSIC_STATE_PAUSED && name && name[0]) {
         char buf[128];
-        snprintf(buf, sizeof(buf), LV_SYMBOL_PAUSE " 已暂停: %s", name);
+        snprintf(buf, sizeof(buf), "已暂停: %s", name);
         lv_label_set_text(music_status_lbl, buf);
     } else {
         lv_label_set_text(music_status_lbl, "空闲（旋转选曲，按键播放/停止）");
