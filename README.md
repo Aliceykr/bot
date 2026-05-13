@@ -1,6 +1,6 @@
 # Bot — ESP32-S3 AI 智能语音助手 & Game Boy 模拟器
 
-基于 ESP-IDF + LVGL 的 ESP32-S3 嵌入式项目，集成 WiFi、天气查询、AI 聊天、在线/离线语音识别、语音合成、Game Boy 游戏模拟器（含音频）、BLE 蓝牙配网、MicroSD 卡音乐播放器（WAV + MP3）、音量控制、巴法云智能设备控制，配备 TFT LCD 图形界面与旋转编码器 + 按键矩阵交互。
+基于 ESP-IDF + LVGL 的 ESP32-S3 嵌入式项目，集成 WiFi、天气查询、AI 聊天、在线/离线语音识别、语音合成、Game Boy 游戏模拟器（含音频）、BLE 蓝牙配网与远程音乐控制、MicroSD 卡音乐播放器（WAV + MP3）、音量控制、巴法云智能设备控制，配备 TFT LCD 图形界面与旋转编码器 + 按键矩阵交互。
 
 ---
 
@@ -73,7 +73,7 @@ A/B 相由 PCNT 硬件正交解码，SW 按键 5ms 轮询状态机（20ms 防抖
 
 | 功能 | ESP32-S3 引脚 | SD 卡模块引脚 |
 |------|---------------|--------------|
-| CS   | GPIO48 | CS |
+| CS   | GPIO0  | CS |
 | MOSI | GPIO8  | DI (CMD) |
 | SCK  | GPIO18 | CLK |
 | MISO | GPIO21 | DO (DAT0) |
@@ -81,6 +81,8 @@ A/B 相由 PCNT 硬件正交解码，SW 按键 5ms 轮询状态机（20ms 防抖
 | GND  | GND    | GND |
 
 使用 SPI3_HOST（LCD 占 SPI2_HOST），FAT32 文件系统，挂载点 `/sdcard`。
+
+> 注意：CS 使用 GPIO0（Boot 按键脚），上电时不要按住即可。原 GPIO48 因板载 WS2812 LED 干扰 CS 信号而弃用。
 
 ---
 
@@ -154,7 +156,7 @@ bot/
 - **聊天助手** — 屏幕键盘输入文字，调用 LLM API 获取回复，滚动对话记录
 - **语音助手** — 在线流程：录音 → 百度 ASR 识别 → LLM 回复 → 百度 TTS 合成播放
 - **语音命令** — 离线 ESP-SR 中文命令词识别（按钮触发，无需唤醒词）
-- **蓝牙** — 开启 BLE 广播，手机发送 "SSID_xxx password_xxx" 配网后自动连接 WiFi（WiFi 连接由 BLE 配网回调自动触发，无独立菜单入口）
+- **蓝牙** — 开启 BLE 广播，手机发送 "SSID_xxx password_xxx" 配网后自动连接 WiFi；支持 BLE 远程音乐控制（`/music on` 列歌、`/序号` 播放、`/music off` 停止）
 - **音乐** — 扫描 SD 卡 `/sdcard/music/` 下的 WAV / MP3 文件，选择播放（支持暂停/切歌）
 - **音量** — 滑块调节音量（0-100%），对数增益曲线，NVS 持久化，重启自动恢复
 - **智能设备** — 巴法云 TCP 设备云控制，拉取已绑定设备列表，点击按钮 toggle 开关
@@ -202,18 +204,29 @@ MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 - I2S_NUM_0 与在线 ASR 共享，通过 deinit/reinit 切换
 - 任务生命周期安全：graceful stop + 超时硬杀 + 资源泄漏保护
 
-### 6. BLE 蓝牙配网
+### 6. BLE 蓝牙配网与远程音乐控制
 
-基于 NimBLE（比 Bluedroid 节省 ~40KB DRAM）的 HM-10 兼容配网功能：
+基于 NimBLE（比 Bluedroid 节省 ~40KB DRAM）的 HM-10 兼容配网功能 + BLE 远程音乐控制：
 
+**配网协议：**
 - 手机 BLE 扫描连接 "ESP32-Bot"（Service 0xFFE0, Characteristic 0xFFE1）
 - 发送 "SSID_名称 password_密码" 即可自动连接 WiFi
 - 50ms 空闲超时自动拼包，配网结果通过 BLE Notify 返回手机
-- 非阻塞启动：`ble_prov_start` 不轮询等 host sync，由 `on_sync` 回调异步触发广播
 - 收到凭据后自动 deinit BLE 释放 DRAM，再启动 WiFi 连接
+
+**音乐控制协议（`/` 前缀命令）：**
+- `/music on` — 扫描 SD 卡音乐目录，逐行 notify 返回歌曲列表（带序号）
+- `/music off` — 异步停止后台播放
+- `/<序号>` — 按序号播放对应歌曲（推荐，避免中文编码问题）
+- `/<歌名>` — 前缀匹配文件名播放
+
+**实现细节：**
+- 非阻塞启动：`ble_prov_start` 不轮询等 host sync，由 `on_sync` 回调异步触发广播
 - 游戏时自动暂停 BLE，退出后恢复
 - 所有共享状态由模块级 mutex 保护，pending 计数器防止 deinit 与 notify 并发竞态
 - deinit 使用 `s_deinit_in_progress` 门锁防双拆，controller 拆卸重试+超时兜底
+- 音乐 stop 通过独立一次性任务异步执行，避免阻塞 BLE worker（最多 2 秒）
+- 歌曲扫描缓冲动态分配到 PSRAM（~4.6KB），命令处理完毕即释放
 
 ### 7. WiFi 守护
 
@@ -293,7 +306,7 @@ SD 卡音乐播放，支持 WAV 和 MP3 格式：
 | `asr_llm` | 3 | 16384 B (PSRAM) | ASR → LLM → TTS（一次性） |
 | `game_run` | 10 | 12288 B (DRAM) | GB 模拟器主循环（Core 1） |
 | `apu_task` | 5 | 4096 B | GB APU 音频合成（Core 0） |
-| `music` | 4 | 12288 B (DRAM) | SD 卡音乐解码（WAV/MP3）播放（一次性） |
+| `music` | 4 | 10240 B (DRAM) | SD 卡音乐解码（WAV/MP3）播放（一次性） |
 | `music_stop` | 3 | 2048 B (DRAM) | 异步停止音乐播放（一次性） |
 | `psram_cleaner` | 2 | 3072 B | 回收 PSRAM 任务栈和 TCB |
 | `esp_sr_read` | 6 | 5120 B | ESP-SR I2S 读取 + 16→32bit 转换（Core 0） |
@@ -302,6 +315,7 @@ SD 卡音乐播放，支持 WAV 和 MP3 格式：
 | `kpad_task` | 6 | 4096 B | 按键矩阵扫描（2ms 周期） |
 | `bemfa_list` | 3 | 8192 B (PSRAM) | 巴法云设备列表 HTTPS 请求（一次性） |
 | `bemfa_toggle` | 3 | 8192 B (PSRAM) | 巴法云设备 toggle HTTPS 请求（一次性） |
+| `ble_mstop` | 3 | 2048 B (DRAM) | BLE 触发的异步音乐停止（一次性） |
 | `health` | 1 | 2048 B | 堆内存监控（60s 周期） |
 
 ### PSRAM 任务创建
@@ -453,7 +467,7 @@ ROM 和音乐文件存放在 MicroSD 卡，不再使用 Flash SPIFFS 存储。
 - **I2S_NUM_0 共享**：在线 ASR 和离线 ESP-SR 通过 deinit/reinit + taskNotify 握手切换
 - **LCD SPI 时钟**：80 MHz，PARTIAL 模式异步 DMA 刷新
 - **SPI 总线隔离**：LCD 用 SPI2_HOST，SD 卡用 SPI3_HOST
-- **SD 卡 CS 脚**：GPIO48 与板载 WS2812 LED 共享，如有干扰可临时切 GPIO0 排查
+- **SD 卡 CS 脚**：GPIO0（Boot 按键脚），上电时不要按住；原 GPIO48 因板载 WS2812 LED 干扰而弃用
 - **ESP32-S3 蓝牙限制**：仅支持 BLE，不支持 Classic BT（A2DP 不可用）
 - **游戏模式**：进入游戏自动暂停 WiFi + BLE，退出后仅恢复进入前活跃的服务
 - **音频安全**：DC-block HPF 消除直流偏置，字节尾对齐防止 PCM 错位，DMA auto_clear 消除空闲噪声
@@ -478,8 +492,8 @@ ESP32-S3 多任务环境下，共享状态的并发访问是最常见的崩溃�
 ESP32-S3 内部 DRAM 仅 ~338KB，项目在内存使用上做了多层优化：
 
 - **PSRAM 优先策略**：HTTP 响应缓冲、录音缓冲、ROM 数据、音乐解码缓冲、WiFi/LwIP 动态缓冲均分配在 8MB PSRAM，内部 DRAM 只放必须的 LVGL 双缓冲和 FreeRTOS 任务栈
-- **用后即释**：ASR HTTP 响应缓冲在识别完成后立即 `release_http_buf()` 释放回 NULL，下次识别从 4KB 重新起步，避免单次扩容到 32KB 后永久占用；音乐扫描缓冲（`s_music_scan_buf`）在退出音乐屏幕时释放
-- **动态扩容 + 收缩**：HTTP 响应缓冲从 4KB 起步，按需 2 倍扩容到最大 32KB，识别完成后收缩回 NULL
+- **用后即释**：ASR HTTP 响应缓冲在识别完成后立即 `release_http_buf()` 释放回 NULL，下次识别从 4KB 重新起步，避免单次扩容到 32KB 后永久占用；baidu_token / model / weather 三个模块的响应缓冲在 API 返回前统一 `resp_buf_release()` 归零；音乐扫描缓冲（`s_music_scan_buf`）在退出音乐屏幕时释放
+- **动态扩容 + 即时收缩**：HTTP 响应缓冲从 4KB 起步，按需 2 倍扩容到最大 32KB，API 返回后立即释放回 NULL（不再常驻到下次复用）
 - **NVS 写入防抖**：音量 slider 拖动通过 500ms 软件定时器合并写入，避免连续 100 次 flash 写操作加速磨损
 - **BLE/ESP-SR 懒加载**：蓝牙和离线语音识别仅在进入对应界面时初始化，退出时 deinit 释放 ~100KB DRAM，空闲期零占用
 
@@ -496,13 +510,19 @@ I2S_NUM_0 被在线 ASR（`asr.c`）和离线 ESP-SR（`esp_sr.c`）共享，通
 - **DC-block HPF**：一阶高通滤波器（截止 ~12.7Hz @16kHz）消除 MAX98357A 直流偏置，Q15 定点乘避免浮点开销
 - **线性淡入**：每次 flush 或首次播放的前 64 个样本按线性 ramp 升起，消除爆破声
 - **动态采样率切换**：音乐播放前通过 flush 协议清空 ring + disable I2S → reconfig clock → enable，确保旧速率数据完全播完再切；播完自动恢复 16kHz，TTS/GB 音频不受影响
-- **MP3 错误容忍**：连续 32 帧解码失败自动放弃，防止垃圾数据把 Helix 解码器推进非法状态导致 crash；自动跳过 ID3v2 tag 防止误同步
+- **MP3 错误容忍**：连续 32 帧解码失败自动放弃，防止垃圾数据把 Helix 解码器推进非法状态导致 crash；自动跳过 ID3v2 tag 防止误同步；输入缓冲 memmove 后 read_ptr 始终指向有效数据头部，短读场景下不会读到未初始化字节
 
 ### 系统级鲁棒性
 
 - **WiFi 守护任务**：首次连接 EventGroup 等待 + 快速重试 3 次；运行期断线自动指数退避重连（5s → 5min），永不放弃；用户主动断开则停止守护
 - **BLE deinit 防护**：`s_deinit_in_progress` 门锁防止双拆；`s_pending_host_calls` 计数器等待跨任务 NimBLE API 调用完成后再拆 host；`s_adv_gen` 代际计数器防止 stop 后残留广播（ghost advertising）
+- **BLE timer 竞态修复**：`accumulate_rx` 的 `xTimerReset` 移入 LOCK 块内，与 deinit 路径的 `s_rx_timer = NULL` 互斥，消除 UAF 窗口
 - **任务生命周期安全**：ESP-SR 三个任务（read/feed/detect）通过 graceful stop + 2 秒超时硬杀 + ring buffer 残留保护，避免资源泄漏；音乐播放器的 `music_stop` 采用 10 轮 ×200ms 轮询确认旧任务退出，防止快速切歌产生僵尸任务
+- **NULL 指针防护**：所有 `malloc` / `xTaskCreatePSRAM` 返回值均检查，失败时安全回退（UI 提示"内存不足"）而非解引用崩溃
+- **异步取消语义**：天气查询支持真正的取消（`s_weather_cancelled` 标志 + drain queue + 双重检查），取消后后台任务完成也不会弹出界面
+- **LVGL 对象生命周期**：BLE 结果弹窗通过 `LV_EVENT_DELETE` 回调统一清零全局句柄，覆盖所有销毁路径（OK 按钮 / 父屏切换 / 显式 delete），消除悬空指针
+- **HTTP 缓冲即用即释**：baidu_token / model / weather 三个模块的 `s_resp_buf` 在 API 返回前统一 `resp_buf_release()`，避免 PSRAM 长期驻留浪费
+- **模块 init 提前到单线程阶段**：`baidu_token_init()` / `bemfa_init()` 在 `app_main` 中调用，消除并发首次调用创建多个 mutex 的竞态
 
 ---
 
