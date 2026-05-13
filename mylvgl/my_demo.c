@@ -1530,6 +1530,29 @@ static void music_back_btn_cb(lv_event_t *e)
     indev_set_group(group);
 }
 
+/* 关闭后台音乐按钮：
+ *   正在播（IDLE 之外）→ 异步 stop，弹窗"已关闭"
+ *   空闲 → 弹窗"无后台音乐"
+ *
+ * "后台音乐"包含从本界面点的和 BLE 发的 /<歌名> 触发的，
+ * 都是同一个 music 模块，stop 都能关。*/
+static void music_bg_stop_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (music_state() == MUSIC_STATE_IDLE) {
+        create_result_dialog("无后台音乐", 0x888888);
+        return;
+    }
+
+    BaseType_t r = xTaskCreate(music_stop_task_cb, "music_stop",
+                               2048, NULL, 3, NULL);
+    if (r != pdPASS) {
+        ESP_LOGW("DEMO", "music_stop_task 创建失败，降级同步 stop");
+        music_stop();
+    }
+    create_result_dialog("已关闭后台音乐", 0x1E90FF);
+}
+
 /* 点击列表项：
  *   - 如果正在播放这首 → stop（异步）
  *   - 否则（空闲 / 播放别的 / 暂停） → 切换到这首重新播（异步）
@@ -1643,6 +1666,16 @@ static void show_music_screen(void)
     if (back_txt_lbl) lv_obj_set_style_text_font(back_txt_lbl, &lv_font_simhei_16, 0);
     lv_obj_add_event_cb(back_btn, music_back_btn_cb, LV_EVENT_CLICKED, NULL);
     lv_group_add_obj(mg, back_btn);
+
+    /* 关闭后台音乐按钮 */
+    lv_obj_t *bg_stop_btn = lv_list_add_button(music_list, LV_SYMBOL_STOP, "关闭后台音乐");
+    lv_obj_set_style_bg_color(bg_stop_btn, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_bg_color(bg_stop_btn, lv_color_hex(0xe94560), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(bg_stop_btn, lv_color_hex(0xffffff), 0);
+    lv_obj_t *bg_stop_txt_lbl = lv_obj_get_child(bg_stop_btn, 1);
+    if (bg_stop_txt_lbl) lv_obj_set_style_text_font(bg_stop_txt_lbl, &lv_font_simhei_16, 0);
+    lv_obj_add_event_cb(bg_stop_btn, music_bg_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_group_add_obj(mg, bg_stop_btn);
 
     if (count == 0) {
         /* 空列表提示项（不能点击）*/

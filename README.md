@@ -1,6 +1,6 @@
 # Bot — ESP32-S3 AI 智能语音助手 & Game Boy 模拟器
 
-基于 ESP-IDF + LVGL 的 ESP32-S3 嵌入式项目，集成 WiFi、天气查询、AI 聊天、在线/离线语音识别、语音合成、Game Boy 游戏模拟器（含音频）、BLE 蓝牙配网、MicroSD 卡音乐播放器（WAV + MP3）、音量控制，配备 TFT LCD 图形界面与旋转编码器 + 按键矩阵交互。
+基于 ESP-IDF + LVGL 的 ESP32-S3 嵌入式项目，集成 WiFi、天气查询、AI 聊天、在线/离线语音识别、语音合成、Game Boy 游戏模拟器（含音频）、BLE 蓝牙配网、MicroSD 卡音乐播放器（WAV + MP3）、音量控制、巴法云智能设备控制，配备 TFT LCD 图形界面与旋转编码器 + 按键矩阵交互。
 
 ---
 
@@ -94,7 +94,7 @@ bot/
 │   ├── CMakeLists.txt            # 编译入口，列出所有源文件
 │   └── idf_component.yml        # IDF 组件依赖（esp-sr、helix-mp3）
 ├── mylvgl/
-│   ├── my_demo.c                 # LVGL 主界面逻辑（菜单/天气/聊天/语音/游戏/BLE/音乐/音量）
+│   ├── my_demo.c                 # LVGL 主界面逻辑（菜单/天气/聊天/语音/游戏/BLE/音乐/音量/智能设备）
 │   ├── my_demo.h
 │   ├── lv_port_disp.c / .h       # LVGL 显示驱动（PARTIAL 双缓冲 + 异步 DMA）
 │   ├── lv_port_indev.c / .h      # LVGL 输入设备（PCNT 编码器）
@@ -111,6 +111,9 @@ bot/
 │   ├── speaker.c / speaker.h     # MAX98357A I2S 音频输出 + DC-block HPF + 音量 + 动态采样率
 │   ├── tts.c / tts.h             # 百度语音合成 API（流式 PCM 播放）
 │   ├── weather.c / weather.h     # 天气 HTTP 查询与解析
+│   ├── bemfa.c / bemfa.h         # 巴法云智能设备 HTTP REST 控制（拉取列表 / 推送 on/off）
+│   ├── bemfa_config.h            # 巴法云私钥（已 gitignore）
+│   ├── bemfa_config.h.example    # 配置模板
 │   ├── wifi.c / wifi.h           # WiFi STA 连接 + 守护任务 + mutex 线程安全
 │   ├── sntp_time.c / sntp_time.h # SNTP 网络时间同步（阿里云 NTP）
 │   ├── health.c / health.h       # 堆内存健康监控（60s 周期打印水位）
@@ -154,6 +157,7 @@ bot/
 - **蓝牙** — 开启 BLE 广播，手机发送 "SSID_xxx password_xxx" 配网后自动连接 WiFi（WiFi 连接由 BLE 配网回调自动触发，无独立菜单入口）
 - **音乐** — 扫描 SD 卡 `/sdcard/music/` 下的 WAV / MP3 文件，选择播放（支持暂停/切歌）
 - **音量** — 滑块调节音量（0-100%），对数增益曲线，NVS 持久化，重启自动恢复
+- **智能设备** — 巴法云 TCP 设备云控制，拉取已绑定设备列表，点击按钮 toggle 开关
 
 ### 2. Game Boy 模拟器
 
@@ -257,6 +261,17 @@ SD 卡音乐播放，支持 WAV 和 MP3 格式：
 - `speaker_set_sample_rate()`：动态切换 I2S 输出采样率（8k-48k Hz），通过 flush 协议确保旧速率数据播完再切，避免变调
 - **音量控制**：Q15 定点对数增益（0-100% → -60dB..0dB），volatile 原子写入无需持锁，NVS 持久化（500ms 防抖合并 slider 拖动写入）
 
+### 11. 智能设备（巴法云）
+
+通过巴法云 TCP 设备云 HTTP REST API 控制已绑定的智能设备：
+
+- **设备列表**：GET `/vb/api/v2/allTopic` 拉取所有主题，兼容扁平 / 嵌套两种 JSON 响应结构
+- **设备控制**：POST `/va/postJsonMsg` 推送 "on" / "off" 消息，点击按钮自动 toggle
+- **线程安全**：模块级 mutex 串行化 HTTPS 请求，避免两个 HTTP client 并发引发 mbedTLS 冲突
+- **PSRAM 动态缓冲**：HTTP 响应从 4KB 起步按需 2 倍扩容到最大 32KB，API 返回后立即释放
+- **异步 UI**：后台 PSRAM 任务执行 HTTPS 操作，通过 FreeRTOS Queue + lv_timer 轮询更新 UI，LVGL 线程零阻塞
+- **屏幕生命周期安全**：mutex + active 标志保护 Queue 句柄，退出屏幕时后台任务检测到 inactive 后丢弃结果而非写入已删除队列
+
 ---
 
 ## 系统架构
@@ -285,6 +300,8 @@ SD 卡音乐播放，支持 WAV 和 MP3 格式：
 | `esp_sr_feed` | 5 | 5120 B | ESP-SR AFE 音频喂入（Core 0） |
 | `esp_sr_detect` | 5 | 6144 B | ESP-SR MultiNet 命令检测（Core 1） |
 | `kpad_task` | 6 | 4096 B | 按键矩阵扫描（2ms 周期） |
+| `bemfa_list` | 3 | 8192 B (PSRAM) | 巴法云设备列表 HTTPS 请求（一次性） |
+| `bemfa_toggle` | 3 | 8192 B (PSRAM) | 巴法云设备 toggle HTTPS 请求（一次性） |
 | `health` | 1 | 2048 B | 堆内存监控（60s 周期） |
 
 ### PSRAM 任务创建
@@ -297,7 +314,7 @@ SD 卡音乐播放，支持 WAV 和 MP3 格式：
 - 后台任务通过 FreeRTOS Queue 传递结果，`lv_timer` 回调轮询队列更新 UI
 - `speaker_play()` 使用 RingBuffer 非阻塞写入，TTS/GB 音频可直接调用
 - HTTP 响应缓冲由各模块 mutex 保护，识别完成后主动释放 PSRAM
-- WiFi/BLE/ESP-SR/音乐 所有共享状态由各自模块级 mutex 保护
+- WiFi/BLE/ESP-SR/音乐/巴法云 所有共享状态由各自模块级 mutex 保护
 - SPI 总线隔离：LCD 使用 SPI2_HOST，SD 卡使用 SPI3_HOST，互不干扰
 - `speaker_set_sample_rate()` 通过 flush 协议与 tx_task 协调，确保 ring 清空后再切换 I2S 时钟
 - `speaker_set_volume()` 使用 volatile + Q15 定点乘，无需持锁即可在播放路径上原子生效
@@ -338,10 +355,12 @@ cd bot
 ```bash
 cp user/asr_config.h.example user/asr_config.h
 cp user/model_config.h.example user/model_config.h
+cp user/bemfa_config.h.example user/bemfa_config.h
 ```
 
 编辑 `user/asr_config.h` 填入百度 AI 平台 API Key 和 Secret Key。
 编辑 `user/model_config.h` 填入 LLM API Key、接口 URL 和模型名称。
+编辑 `user/bemfa_config.h` 填入巴法云私钥（注册 cloud.bemfa.com → 个人中心 → 复制"私钥"）。
 
 **3. 准备 MicroSD 卡**
 
@@ -417,11 +436,18 @@ ROM 和音乐文件存放在 MicroSD 卡，不再使用 Flash SPIFFS 存储。
 | `MODEL_API_URL` | 接口地址（OpenAI 兼容）|
 | `MODEL_NAME` | 模型名称（如 `deepseek-chat`）|
 
+### user/bemfa_config.h
+
+| 宏 | 说明 |
+|----|------|
+| `BEMFA_UID` | 巴法云私钥（openID）|
+| `BEMFA_TYPE` | 设备类型（固定 `3` = TCP 设备云）|
+
 ---
 
 ## 注意事项
 
-- **凭证安全**：`asr_config.h` 和 `model_config.h` 含 API Key，已加入 `.gitignore`
+- **凭证安全**：`asr_config.h`、`model_config.h` 和 `bemfa_config.h` 含 API Key / 私钥，已加入 `.gitignore`
 - **PSRAM 必须选 Octal Mode**：录音缓冲、ROM 数据、HTTP 响应、音乐解码缓冲均分配于 PSRAM
 - **I2S 资源分配**：I2S_NUM_0 = 麦克风（RX），I2S_NUM_1 = 扬声器（TX），互不干扰
 - **I2S_NUM_0 共享**：在线 ASR 和离线 ESP-SR 通过 deinit/reinit + taskNotify 握手切换
@@ -442,7 +468,7 @@ ROM 和音乐文件存放在 MicroSD 卡，不再使用 Flash SPIFFS 存储。
 
 ESP32-S3 多任务环境下，共享状态的并发访问是最常见的崩溃源。本项目采用分层防护策略：
 
-- **模块级 mutex**：WiFi、BLE、Speaker、音乐播放器各自维护独立的 mutex，保护内部状态不被事件回调、守护任务、UI 任务撕裂读写
+- **模块级 mutex**：WiFi、BLE、Speaker、音乐播放器、巴法云各自维护独立的 mutex，保护内部状态不被事件回调、守护任务、UI 任务撕裂读写
 - **volatile 无锁读取**：`wifi_get_status()`、`speaker_get_volume()` 等高频查询路径使用 `volatile` + 32 位对齐原子语义，避免加锁拖慢 UI/HTTP 路径
 - **flush 协议**：Speaker 的 `speaker_flush()` / `speaker_set_sample_rate()` 不直接操作 ring buffer，而是通过 `s_flush_request` + `s_flush_done` 信号量通知 tx_task 自行清空，保证 ring buffer 的唯一消费者不变
 - **异步 UI 操作**：音乐切歌/停止通过一次性后台任务执行（`music_stop_task` / `music_play_task`），避免 `music_stop` 的 2 秒等待阻塞 LVGL 线程；任务创建失败时降级为同步调用，功能正确优先

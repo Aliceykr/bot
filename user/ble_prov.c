@@ -1,5 +1,6 @@
 #include "ble_prov.h"
 #include "wifi.h"
+#include "music.h"
 #include "esp_log.h"
 #include "esp_bt.h"
 #include "nimble/nimble_port.h"
@@ -17,6 +18,7 @@
 #include "esp_heap_caps.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define TAG "BLE_PROV"
 #define DEVICE_NAME "ESP32-Bot"
@@ -139,12 +141,33 @@ static void ble_send_notify(const char *msg)
 }
 
 /* ================================================================
- * Worker：解析 → wifi_set_credentials → s_cred_cb（独立 4KB 栈）
+ * Worker：解析 → 分发到 WiFi 配网 / 音乐控制 / ...
+ *
+ * 协议：
+ *   "SSID_xxx password_yyy" → WiFi 配网（原协议）
+ *   "/music on"              → 列出所有音乐（多行 notify）
+ *   "/music off"             → 停止播放
+ *   "/<歌名>"                → 前缀匹配播放
  * ================================================================ */
+static void handle_wifi_prov(char *buf);
+static void handle_music_command(const char *cmd);
+
 static void parse_and_dispatch(char *buf)
 {
     ESP_LOGI(TAG, "处理完整消息: %s", buf);
 
+    /* 首字符 '/' 视为音乐 / 控制命令；否则走 WiFi 配网。
+     * 优先级这样排：真实配网消息以 "SSID_" 开头，永远不是 '/'，安全 */
+    if (buf[0] == '/') {
+        handle_music_command(buf + 1);  /* 跳过 '/' */
+        return;
+    }
+    handle_wifi_prov(buf);
+}
+
+/* 原 WiFi 配网解析，逻辑不变 */
+static void handle_wifi_prov(char *buf)
+{
     char *ssid_start = strstr(buf, "SSID_");
     if (!ssid_start) { ble_send_notify("格式错误"); return; }
     ssid_start += 5;
@@ -175,6 +198,137 @@ static void parse_and_dispatch(char *buf)
     UNLOCK();
     if (cb) cb(ssid, password);
     else    ESP_LOGW(TAG, "cred_cb 无效（已 deinit 或未注册），凭据已保存但 WiFi 不会自动连接");
+}
+
+/* ================================================================
+ * 音乐命令处理
+ *
+ * "music on"        → 扫描 SD 卡 /music 目录，每首歌发一个 notify
+ * "music off"       → 停止后台播放
+ * "<歌名>"          → 前缀匹配 .mp3/.wav 并后台播放
+ *
+ * 内存策略：不缓存歌曲列表（最省 RAM），命令处理期间用一个 static 扫描
+ * 数组（~4.8KB BSS，一直占着但不多一份），扫完 notify 完即丢，播放时
+ * 再扫一次做前缀匹配。重复扫描代价小（FATFS 目录扫描几十 ms）。
+ * worker task 串行处理命令，static 数组不会并发被写。
+ * ================================================================ */
+/* 一次性后台任务：异步调 music_stop 后自删。
+ * BLE worker task 不能同步调 music_stop（最多阻塞 2s 等播放任务退出，
+ * 期间手机后续命令排队）。把 stop 投到独立任务，BLE worker 立即返回。*/
+static void ble_music_stop_task(void *arg)
+{
+    (void)arg;
+    music_stop();
+    vTaskDelete(NULL);
+}
+
+static void handle_music_command(const char *cmd)
+{
+    /* 把所有变量声明提到函数顶部，避免后面 goto out 时跨过初始化触发
+     * GCC -Wjump-misses-init 警告。*/
+    int count = 0;
+    const music_entry_t *match = NULL;
+    char *endp = NULL;
+    long idx = 0;
+    char path[128];
+    char line[128];
+
+    /* 扫描结果 ~4.8KB，从 PSRAM 临时分配代替 static BSS，常驻 0 DRAM。
+     * BLE worker task 4KB 栈不够放在栈上，故走 heap。FATFS 扫描本身就几十
+     * 毫秒，多一次 alloc/free 几乎无感。 */
+    music_entry_t *s_scan = heap_caps_malloc(
+        sizeof(music_entry_t) * MUSIC_MAX_COUNT, MALLOC_CAP_SPIRAM);
+    if (!s_scan) {
+        ble_send_notify("内存不足");
+        return;
+    }
+
+    /* "music on" 列出所有歌 */
+    if (strcmp(cmd, "music on") == 0) {
+        if (!music_scan(s_scan, &count)) {
+            ble_send_notify("SD 卡未挂载或目录不存在");
+            goto out;
+        }
+        if (count == 0) {
+            ble_send_notify("(无音乐文件)");
+            goto out;
+        }
+        for (int i = 0; i < count; ++i) {
+            /* %.*s 明确限长，避免 GCC format-truncation 告警（name 虽然是
+             * char[64]，编译器不信它一定 \0 结尾在前 64 字节）*/
+            snprintf(line, sizeof(line), "%d. %.*s",
+                     i + 1, (int)(sizeof(s_scan[i].name) - 1), s_scan[i].name);
+            ble_send_notify(line);
+            /* notify 包之间小间隔，给手机端和 BLE stack 喘息，避免丢包 */
+            vTaskDelay(pdMS_TO_TICKS(30));
+        }
+        snprintf(line, sizeof(line), "--- 共 %d 首，/<名字> 播放 ---", count);
+        ble_send_notify(line);
+        goto out;
+    }
+
+    /* "music off" 异步停止播放 */
+    if (strcmp(cmd, "music off") == 0) {
+        BaseType_t r = xTaskCreate(ble_music_stop_task, "ble_mstop",
+                                   2048, NULL, 3, NULL);
+        if (r != pdPASS) {
+            /* 创建失败降级同步 stop（接受 worker 阻塞，功能优先） */
+            ESP_LOGW(TAG, "ble_music_stop_task 创建失败，降级同步");
+            music_stop();
+        }
+        ble_send_notify("已停止");
+        goto out;
+    }
+
+    /* 其他 "/xxx" 视为歌名（可带/不带后缀）或序号，匹配一首歌播放 */
+    if (!music_scan(s_scan, &count) || count == 0) {
+        ble_send_notify("无可用音乐");
+        goto out;
+    }
+
+    /* 先尝试序号匹配（/1、/2 ...）。序号对 BLE 最友好：
+     * 避免手机输入法把 '~' 打成全角 '～'、字母大小写不一致等问题 */
+    idx = strtol(cmd, &endp, 10);
+    if (endp != cmd && *endp == '\0' && idx >= 1 && idx <= count) {
+        match = &s_scan[idx - 1];
+    }
+
+    /* 序号没命中就做文件名前缀匹配。
+     * 规则：前缀字节相同 && cmd 之后紧跟 '.' 或结尾
+     *   "/song01"     → 匹配 "song01.mp3" / "song01.wav"
+     *   "/song01.mp3" → 精确匹配 */
+    if (!match) {
+        size_t cmd_len = strlen(cmd);
+        for (int i = 0; i < count; ++i) {
+            if (strncmp(s_scan[i].name, cmd, cmd_len) == 0) {
+                char next = s_scan[i].name[cmd_len];
+                if (next == '\0' || next == '.') {
+                    match = &s_scan[i];
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!match) {
+        snprintf(line, sizeof(line), "未找到: %s", cmd);
+        ble_send_notify(line);
+        goto out;
+    }
+
+    music_full_path(match->name, path, sizeof(path));
+    if (music_play(path)) {
+        snprintf(line, sizeof(line), "播放: %.*s",
+                 (int)(sizeof(match->name) - 1), match->name);
+        ble_send_notify(line);
+    } else {
+        ble_send_notify("播放失败");
+    }
+
+out:
+    /* 唯一释放点：所有提前返回都跳到这里。
+     * s_scan 必为非 NULL（函数入口已经判过失败 return） */
+    heap_caps_free(s_scan);
 }
 
 static void rx_worker_task(void *arg)

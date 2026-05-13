@@ -36,8 +36,10 @@
 
 #define MUSIC_DIR   SDCARD_MOUNT_POINT "/music"
 
-/* 每次 fread 的块大小（必须偶数，WAV 样本对齐要用）*/
-#define FREAD_CHUNK   8192
+/* 每次 fread 的块大小（必须偶数，WAV 样本对齐要用）
+ * 必须放内部 DMA-capable DRAM（见下方 file_buf 分配），
+ * 因此保守用 4KB 减少内部 DRAM 压力 */
+#define FREAD_CHUNK   4096
 
 /* ================================================================
  * 扫描 / 路径工具
@@ -212,10 +214,11 @@ static bool decode_wav_stream(FILE *fp)
         return false;
     }
 
-    uint8_t *file_buf = heap_caps_malloc(FREAD_CHUNK, MALLOC_CAP_SPIRAM);
+    uint8_t *file_buf = heap_caps_malloc(FREAD_CHUNK, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     int16_t *mono_buf = heap_caps_malloc(FREAD_CHUNK / 2, MALLOC_CAP_SPIRAM);
     if (!file_buf || !mono_buf) {
-        ESP_LOGE(TAG, "PSRAM 缓冲分配失败");
+        ESP_LOGE(TAG, "缓冲分配失败 (file_buf DMA-DRAM=%p, mono_buf PSRAM=%p)",
+                 file_buf, mono_buf);
         if (file_buf) heap_caps_free(file_buf);
         if (mono_buf) heap_caps_free(mono_buf);
         return false;
@@ -320,17 +323,19 @@ static bool decode_mp3_stream(FILE *fp)
     }
     fseek(fp, skip_to, SEEK_SET);
 
-    /* 输入缓冲 + PCM 输出缓冲都放 PSRAM */
-    uint8_t *in_buf  = heap_caps_malloc(MP3_INPUT_CHUNK, MALLOC_CAP_SPIRAM);
-    /* helix 常量：MAX_NSAMP * MAX_NGRAN * MAX_NCHAN = 576*2*2 = 2304
-     * 这是一帧输出的 int16 总数（stereo 交错），buffer 分配 2304 个 int16 即可 */
+    /* 输入缓冲必须放内部 DMA-capable DRAM：SDSPI 驱动读扇区时要 DMA 直接
+     * 访问 fread 目标地址，PSRAM 不是 DMA-capable，FATFS 会分配 bounce 缓冲
+     * 拷贝——内存紧张时 bounce 失败报 0x101。直接把 in_buf 放内部 DRAM 避免绕。
+     * 2KB 对内部 DRAM 压力很小。 */
+    uint8_t *in_buf  = heap_caps_malloc(MP3_INPUT_CHUNK, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    /* 解码输出不走 IO，PSRAM 最省 DRAM */
     int16_t *pcm_buf = heap_caps_malloc(MP3_MAX_PCM_SAMPLES * sizeof(int16_t),
                                          MALLOC_CAP_SPIRAM);
-    /* 降混后 mono 输出（stereo 降 mono 时样本数减半）*/
     int16_t *mono_buf = heap_caps_malloc((MP3_MAX_PCM_SAMPLES / 2) * sizeof(int16_t),
                                           MALLOC_CAP_SPIRAM);
     if (!in_buf || !pcm_buf || !mono_buf) {
-        ESP_LOGE(TAG, "MP3 缓冲分配失败");
+        ESP_LOGE(TAG, "MP3 缓冲分配失败 (in_buf DMA-DRAM=%p, pcm PSRAM=%p, mono PSRAM=%p)",
+                 in_buf, pcm_buf, mono_buf);
         goto out_free;
     }
 
@@ -574,11 +579,11 @@ bool music_play(const char *path)
 
     /* 任务栈：
      *   WAV 路径实际用 ~2KB（header 解析 + memcpy）
-     *   MP3 路径 helix decode + fread(FATFS) + 错误路径累积 ~6-7KB
-     * 给 12KB 留安全余量。放内部 DRAM（关 cache 无关，FATFS 不关 cache，
-     * 但 helix 内部 table 放 flash，关 cache 时不能访问→若从 PSRAM 栈切换
-     * 后被抢占 + 同时刷 flash 可能崩）。*/
-    BaseType_t r = xTaskCreate(music_task, "music", 12288,
+     *   MP3 路径 helix decode 实测 ~6-7KB，加 fread(FATFS) 深调用余量
+     *   给 10KB 足够（helix 官方示例也是 10KB 档），比之前 12KB 省 2KB DRAM。
+     * 放内部 DRAM：helix 内部 const 表放 flash，关 cache 时不能访问→若
+     * 从 PSRAM 栈切换后被抢占 + 同时刷 flash 可能崩。*/
+    BaseType_t r = xTaskCreate(music_task, "music", 10240,
                                pa, 4, &s_task);
     if (r != pdPASS) {
         free(pa);
