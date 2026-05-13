@@ -45,4 +45,9 @@ void wifi_suspend_for_game(void);
 /* 游戏结束后恢复 WiFi（异步，立即返回）。 */
 void wifi_resume_after_game(void);
 
+/* 蓝牙互斥模式：完整关闭 WiFi（包括 esp_wifi_deinit），腾出 ~30KB 连续 DRAM
+ * 给 BLE controller。调用后 wifi_connect 会重新走完整 init 流程。
+ * 用于"开蓝牙时关闭 WiFi"场景。 */
+void wifi_full_shutdown_for_ble(void);
+
 #endif

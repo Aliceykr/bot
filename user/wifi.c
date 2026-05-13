@@ -231,6 +231,11 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 /* ================================================================
  * 公开接口
  * ================================================================ */
+/* netif/event 子系统只能 init 一次（即便 wifi 驱动栈被 deinit 又 init）*/
+static bool s_netif_inited = false;
+static esp_event_handler_instance_t s_inst_any_id = NULL;
+static esp_event_handler_instance_t s_inst_got_ip = NULL;
+
 bool wifi_connect(void)
 {
     /* 首次调用时创建 mutex，消除 lazy-init 竞态 */
@@ -244,9 +249,13 @@ bool wifi_connect(void)
     }
 
     if (!s_initialized) {
-        ESP_ERROR_CHECK(esp_netif_init());
-        ESP_ERROR_CHECK(esp_event_loop_create_default());
-        esp_netif_create_default_wifi_sta();
+        /* netif + event loop 只 init 一次（即使 WiFi 驱动栈被 deinit 又 init） */
+        if (!s_netif_inited) {
+            ESP_ERROR_CHECK(esp_netif_init());
+            ESP_ERROR_CHECK(esp_event_loop_create_default());
+            esp_netif_create_default_wifi_sta();
+            s_netif_inited = true;
+        }
 
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
         /* 不用 ESP_ERROR_CHECK：内部 DRAM 不足时 esp_wifi_init 会返回 ESP_ERR_NO_MEM，
@@ -260,12 +269,13 @@ bool wifi_connect(void)
             return false;
         }
 
-        esp_event_handler_instance_t instance_any_id;
-        esp_event_handler_instance_t instance_got_ip;
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                                            &event_handler, NULL, &instance_any_id));
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                                            &event_handler, NULL, &instance_got_ip));
+        /* 事件 handler 只注册一次（重新 init 时 handler 已经在 default event loop） */
+        if (!s_inst_any_id) {
+            ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                                &event_handler, NULL, &s_inst_any_id));
+            ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                                &event_handler, NULL, &s_inst_got_ip));
+        }
 
         wifi_config_t wifi_config = {
             .sta = {
@@ -387,6 +397,42 @@ void wifi_resume_after_game(void)
     } else {
         ESP_LOGI(TAG, "WiFi 恢复启动，等待自动重连");
     }
+}
+
+/* ================================================================
+ * 蓝牙互斥模式：完整释放 WiFi 驱动栈，腾出 ~30KB 连续 DRAM 给 BLE controller
+ * 调用后 wifi_connect 会重新走完整 init 流程
+ * ================================================================ */
+
+void wifi_full_shutdown_for_ble(void)
+{
+    if (!s_initialized) return;
+
+    /* 先杀守护任务，避免它在 esp_wifi_deinit 期间调用已销毁的 WiFi API */
+    WIFI_LOCK();
+    TaskHandle_t guard = s_guardian_handle;
+    s_guardian_handle = NULL;
+    s_user_stopped = true;
+    s_status = WIFI_STATUS_DISCONNECTED;
+    memcpy(s_ip_str, "0.0.0.0", 8);
+    /* 重置 has_connected_once：下次重连失败要走"首次连接"快速失败路径，
+     * 否则会卡 60s 等 EventGroup 超时（H1）*/
+    s_has_connected_once = false;
+    WIFI_UNLOCK();
+
+    if (guard) {
+        /* 守护任务在 xTaskNotifyWait 或 vTaskDelay 中等，不持任何 mutex，
+         * 直接 vTaskDelete 安全 */
+        vTaskDelete(guard);
+    }
+
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+    /* 完整释放 WiFi 驱动占用的 DRAM（包括 RX buffer pool） */
+    esp_wifi_deinit();
+    s_initialized = false;
+    ESP_LOGI(TAG, "WiFi 完全关闭，释放 DRAM。free=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 }
 
 void wifi_set_credentials(const char *ssid, const char *password)

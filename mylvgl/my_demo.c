@@ -172,6 +172,14 @@ static QueueHandle_t weather_result_queue = NULL;
 static bool weather_fetching = false;
 static volatile bool s_weather_cancelled = false;
 
+/* BLE 异步启动结果（task → LVGL timer 消费）*/
+typedef enum {
+    BLE_START_OK = 0,
+    BLE_START_FAIL_INIT,
+    BLE_START_FAIL_ADV,
+} ble_start_result_t;
+static QueueHandle_t ble_start_result_queue = NULL;
+
 typedef struct {
     bool success;
     bool cancelled;
@@ -834,9 +842,52 @@ static void ble_result_dialog_delete_cb(lv_event_t *e)
     ble_result_dialog = NULL;
 }
 
+/* 异步 BLE 启动 task：避免 wifi_full_shutdown_for_ble 的 500ms 阻塞 LVGL 线程 */
+typedef struct {
+    bool wifi_was_active;
+} ble_start_args_t;
+
+static void ble_start_task(void *arg)
+{
+    ble_start_args_t *args = (ble_start_args_t *)arg;
+    bool wifi_was_active = args ? args->wifi_was_active : false;
+    if (args) free(args);
+
+    if (wifi_was_active) {
+        ESP_LOGI("BLE_SCR", "WiFi 在运行，先关闭以释放 DRAM 给 BLE...");
+        wifi_full_shutdown_for_ble();
+        vTaskDelay(pdMS_TO_TICKS(500));  /* 等 WiFi 驱动栈完全释放 */
+        ESP_LOGI("BLE_SCR", "WiFi 已关闭，DRAM free=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    }
+
+    if (!ble_prov_init()) {
+        ble_prov_deinit();
+        ESP_LOGE("BLE_SCR", "BLE 初始化失败，DRAM free=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        ble_start_result_t r = BLE_START_FAIL_INIT;
+        if (ble_start_result_queue) xQueueSend(ble_start_result_queue, &r, 0);
+        vTaskDelete(NULL);
+        return;
+    }
+    ble_prov_set_cred_cb(ble_cred_cb);
+    if (!ble_prov_start(NULL)) {
+        ble_prov_deinit();
+        ESP_LOGE("BLE_SCR", "BLE 广播启动失败");
+        ble_start_result_t r = BLE_START_FAIL_ADV;
+        if (ble_start_result_queue) xQueueSend(ble_start_result_queue, &r, 0);
+    } else {
+        ESP_LOGI("BLE_SCR", "BLE 已启动");
+        ble_start_result_t r = BLE_START_OK;
+        if (ble_start_result_queue) xQueueSend(ble_start_result_queue, &r, 0);
+    }
+    vTaskDelete(NULL);
+}
+
 static void show_ble_screen(void)
 {
     if (ble_prov_is_active()) {
+        /* 关闭蓝牙，释放 BLE controller 内存。WiFi 不自动恢复，由用户主动连。*/
         ble_prov_stop();
         ble_prov_deinit();
         ble_result_dialog = create_result_dialog("蓝牙已关闭", 0x888888);
@@ -846,26 +897,42 @@ static void show_ble_screen(void)
         return;
     }
 
-    if (!ble_prov_init()) {
-        ble_prov_deinit();
-        ble_result_dialog = create_result_dialog("蓝牙初始化失败", 0xff0000);
+    /* WiFi 和 BLE 互斥：BLE controller 启动需要 ~33KB 连续 DRAM，
+     * WiFi 在跑时 DRAM 已碎片化无法分配。必须 deinit WiFi 释放完整 DRAM。
+     * status 一次性读到局部变量，避免 TOCTOU 三连读期间状态变化 */
+    wifi_status_t st = wifi_get_status();
+    bool wifi_was_active = (st == WIFI_STATUS_CONNECTED ||
+                            st == WIFI_STATUS_RECONNECTING ||
+                            st == WIFI_STATUS_CONNECTING);
+
+    /* 异步启动：避免 500ms WiFi 释放 + BLE init 阻塞 LVGL 线程
+     * UI 立刻显示"启动中..."提示，后台任务做实际工作 */
+    ble_start_args_t *args = malloc(sizeof(*args));
+    if (!args) {
+        ble_result_dialog = create_result_dialog("内存不足", 0xff0000);
         if (ble_result_dialog) {
             lv_obj_add_event_cb(ble_result_dialog, ble_result_dialog_delete_cb, LV_EVENT_DELETE, NULL);
         }
         return;
     }
-    ble_prov_set_cred_cb(ble_cred_cb);
-    if (ble_prov_start(NULL)) {
-        ble_result_dialog = create_result_dialog("蓝牙已开启\n设备: ESP32-Bot", 0x1E90FF);
+    args->wifi_was_active = wifi_was_active;
+
+    BaseType_t r = xTaskCreate(ble_start_task, "ble_start", 4096, args, 3, NULL);
+    if (r != pdPASS) {
+        free(args);
+        ble_result_dialog = create_result_dialog("BLE 任务创建失败", 0xff0000);
         if (ble_result_dialog) {
             lv_obj_add_event_cb(ble_result_dialog, ble_result_dialog_delete_cb, LV_EVENT_DELETE, NULL);
         }
-    } else {
-        ble_prov_deinit();
-        ble_result_dialog = create_result_dialog("蓝牙广播失败", 0xff0000);
-        if (ble_result_dialog) {
-            lv_obj_add_event_cb(ble_result_dialog, ble_result_dialog_delete_cb, LV_EVENT_DELETE, NULL);
-        }
+        return;
+    }
+
+    const char *msg = wifi_was_active
+        ? "正在启动蓝牙...\n(关闭 WiFi 中)"
+        : "正在启动蓝牙...";
+    ble_result_dialog = create_result_dialog(msg, 0x1E90FF);
+    if (ble_result_dialog) {
+        lv_obj_add_event_cb(ble_result_dialog, ble_result_dialog_delete_cb, LV_EVENT_DELETE, NULL);
     }
 }
 
@@ -1245,6 +1312,43 @@ static void wifi_status_timer_cb(lv_timer_t *timer)
             char err_msg[80];
             snprintf(err_msg, sizeof(err_msg), "%s", wresp.data.error_msg);
             create_result_dialog(err_msg, 0xff0000);
+        }
+    }
+
+    // 检查 BLE 异步启动结果，更新提示弹窗
+    ble_start_result_t bresp;
+    if (ble_start_result_queue &&
+        xQueueReceive(ble_start_result_queue, &bresp, 0) == pdTRUE) {
+        /* 先关掉"正在启动蓝牙..."的提示 dialog */
+        if (ble_result_dialog && lv_obj_is_valid(ble_result_dialog)) {
+            lv_obj_delete(ble_result_dialog);
+        }
+        ble_result_dialog = NULL;
+
+        const char *msg;
+        uint32_t color;
+        switch (bresp) {
+            case BLE_START_OK:
+                msg = "蓝牙已开启\n设备: ESP32-Bot";
+                color = 0x1E90FF;
+                break;
+            case BLE_START_FAIL_INIT:
+                msg = "蓝牙初始化失败\nDRAM 不足";
+                color = 0xff0000;
+                break;
+            case BLE_START_FAIL_ADV:
+                msg = "蓝牙广播失败";
+                color = 0xff0000;
+                break;
+            default:
+                msg = "蓝牙状态未知";
+                color = 0xff0000;
+                break;
+        }
+        ble_result_dialog = create_result_dialog(msg, color);
+        if (ble_result_dialog) {
+            lv_obj_add_event_cb(ble_result_dialog, ble_result_dialog_delete_cb,
+                                LV_EVENT_DELETE, NULL);
         }
     }
 }
@@ -2244,6 +2348,7 @@ void my_demo(void)
 {
     wifi_result_queue = xQueueCreate(2, sizeof(wifi_result_t));
     weather_result_queue = xQueueCreate(2, sizeof(weather_result_t));
+    ble_start_result_queue = xQueueCreate(2, sizeof(ble_start_result_t));
     asr_mic_init();
 
     lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(0x1a1a2e), 0);
