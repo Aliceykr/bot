@@ -69,6 +69,17 @@ A/B 相由 PCNT 硬件正交解码，SW 按键 5ms 轮询状态机（20ms 防抖
 
 2ms 扫描周期，两次连续一致读取才确认。游戏模式切换：`keypad_set_game_mode(true)` 启用按键输出。
 
+### MPU6050 六轴传感器（I2C_NUM_0）
+
+| 功能 | ESP32-S3 引脚 | MPU6050 引脚 |
+|------|---------------|--------------|
+| SDA  | GPIO13 | SDA |
+| SCL  | GPIO7  | SCL |
+| 3.3V | 3.3V   | VCC |
+| GND  | GND    | GND、AD0（地址 0x68）|
+
+400kHz I2C，±2g 量程，DLPF 44Hz。仅在进入 2048 游戏时初始化，退出后释放总线。倾斜阈值 0.30g，X/Y 主导轴判定方向，平放时无输入。
+
 ### MicroSD 卡（SPI3_HOST）
 
 | 功能 | ESP32-S3 引脚 | SD 卡模块引脚 |
@@ -124,6 +135,7 @@ bot/
 │   ├── music.c / music.h         # SD 卡音乐播放器（WAV + MP3/helix 解码）
 │   ├── keypad.c / keypad.h       # 3x3 矩阵键盘扫描（游戏控制）
 │   ├── sdcard.c / sdcard.h       # MicroSD 卡 SPI 模式驱动（FATFS 挂载/卸载）
+│   ├── mpu6050.c / mpu6050.h     # MPU6050 六轴传感器 I2C 驱动（2048 倾斜控制）
 │   └── lv_font_simhei_16.c       # 思黑体 16px LVGL 中文字体
 ├── game/
 │   ├── gb_emu.c / gb_emu.h       # Game Boy 模拟器集成（Walnut-CGB / Peanut-GB）
@@ -169,6 +181,7 @@ bot/
 - SPI 80MHz 异步 DMA 双行缓冲渲染
 - ROM 从 SD 卡加载到 PSRAM（最大 4MB），小 ROM（<=256KB）自动复制到 DRAM 加速
 - 内置 2048 游戏：无需 ROM 文件，列表顶部始终可见，即使 SD 卡上无 ROM 也可游玩
+- 2048 倾斜控制：MPU6050 加速度计读取设备倾斜方向，自动映射到上下左右四个方向，与按键并存（按键优先，无按键时启用倾斜）
 - 3x3 按键矩阵提供完整的 GB 控制输入（A/B/方向/START/SELECT/EXIT）
 - 进入游戏自动暂停 WiFi 和 BLE，退出后恢复进入前活跃的服务
 

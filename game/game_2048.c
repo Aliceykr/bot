@@ -12,6 +12,18 @@
 #include "driver/gpio.h"
 #include "lcd.h"
 #include "keypad.h"
+#include "mpu6050.h"
+
+/* ================================================================
+ * 契约校验：mpu_dir_t 的整数值必须与 parse_direction() 返回的方向 int 值
+ * 保持一致，否则 do_move((int)tilt) 会跑错方向。
+ * 修改任一方都会在编译期报错。
+ * ================================================================ */
+_Static_assert(MPU_DIR_NONE  == 0, "MPU_DIR_NONE must be 0");
+_Static_assert(MPU_DIR_UP    == 1, "MPU_DIR_UP must match parse_direction UP=1");
+_Static_assert(MPU_DIR_DOWN  == 2, "MPU_DIR_DOWN must match parse_direction DOWN=2");
+_Static_assert(MPU_DIR_LEFT  == 3, "MPU_DIR_LEFT must match parse_direction LEFT=3");
+_Static_assert(MPU_DIR_RIGHT == 4, "MPU_DIR_RIGHT must match parse_direction RIGHT=4");
 
 /* 字体位图：定义在 lcdfont.h 里（被 lcd.c 编译时一起实例化）。
  * 这里不 include 头文件（会二次定义），用 extern 引用即可。 */
@@ -93,7 +105,9 @@ static uint32_t s_score = 0;
 static uint32_t s_best  = 0;
 static uint32_t s_moves = 0;
 static bool     s_game_over = false;
-static bool     s_exit_requested = false;
+/* volatile：跨任务读写。game_2048_request_exit() 从 LVGL 任务设置，
+ * 主循环（独立任务）轮询读取。volatile 防止编译器把循环中的读优化成寄存器缓存。 */
+static volatile bool s_exit_requested = false;
 
 typedef struct {
     int8_t  sr, sc;   /* 源格 */
@@ -706,10 +720,20 @@ void game_2048_run(void)
         for (int c = 0; c < GRID_N; c++)
             if (s_board[r][c] != 0) play_popin_animation(r, c);
 
+    /* MPU6050 倾斜控制（可选）：进入游戏时初始化，失败则降级到纯按键 */
+    bool tilt_available = mpu6050_init();
+    if (tilt_available) {
+        ESP_LOGI(TAG, "倾斜控制已启用");
+    } else {
+        ESP_LOGW(TAG, "MPU6050 不可用，仅按键控制");
+    }
+
     /* 输入主循环 */
     TickType_t last_move_tick = 0;
     int last_dir = 0;
     int prev_parsed = 0;
+    /* 倾斜方向需要"经过 NONE 才能再次触发"，避免持续倾斜连发 */
+    int prev_tilt = 0;
 
     while (!s_exit_requested) {
         if (keypad_consume_exit_request()) {
@@ -717,9 +741,17 @@ void game_2048_run(void)
             break;
         }
 
+        /* 1. 按键方向 */
         uint16_t bits = keypad_get_bits();
         int dir = parse_direction(bits);
 
+        /* 2. 倾斜方向（仅在按键无方向输入时启用，避免冲突）*/
+        int tilt = 0;
+        if (tilt_available && dir == 0) {
+            tilt = (int)mpu6050_get_direction();
+        }
+
+        /* 按键边沿触发 */
         if (dir != 0 && dir != prev_parsed) {
             TickType_t now = xTaskGetTickCount();
             TickType_t dt = (now - last_move_tick) * portTICK_PERIOD_MS;
@@ -733,11 +765,32 @@ void game_2048_run(void)
         }
         prev_parsed = dir;
 
+        /* 倾斜边沿触发：必须从 NONE 切换到非 NONE 才动一次。
+         * 这样持续倾斜不会狂刷方向，必须先回正再倾斜才再次触发。
+         * （tilt != 0 由 prev_tilt == 0 && tilt != prev_tilt 隐含保证）*/
+        if (prev_tilt == 0 && tilt != 0) {
+            TickType_t now = xTaskGetTickCount();
+            TickType_t dt = (now - last_move_tick) * portTICK_PERIOD_MS;
+            if (dt >= 200) {   /* 倾斜冷却 200ms，避免抖动误触 */
+                if (!s_game_over) {
+                    do_move(tilt);
+                    last_dir = tilt;
+                    last_move_tick = now;
+                }
+            }
+        }
+        prev_tilt = tilt;
+
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 
     ESP_LOGI(TAG, "退出 2048，最终分数 %lu，步数 %lu",
              (unsigned long)s_score, (unsigned long)s_moves);
+
+    /* 释放 MPU6050（如果初始化过） */
+    if (tilt_available) {
+        mpu6050_deinit();
+    }
 
     /* 释放 framebuffer */
     if (s_fb) {
