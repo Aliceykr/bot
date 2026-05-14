@@ -135,13 +135,13 @@ bot/
 │   ├── music.c / music.h         # SD 卡音乐播放器（WAV + MP3/helix 解码）
 │   ├── keypad.c / keypad.h       # 3x3 矩阵键盘扫描（游戏控制）
 │   ├── sdcard.c / sdcard.h       # MicroSD 卡 SPI 模式驱动（FATFS 挂载/卸载）
-│   ├── mpu6050.c / mpu6050.h     # MPU6050 六轴传感器 I2C 驱动（2048 倾斜控制）
 │   └── lv_font_simhei_16.c       # 思黑体 16px LVGL 中文字体
 ├── game/
 │   ├── gb_emu.c / gb_emu.h       # Game Boy 模拟器集成（Walnut-CGB / Peanut-GB）
 │   ├── gb_audio.c / gb_audio.h   # GB 音频：MiniGB APU → mono → speaker RingBuffer
 │   ├── minigb_apu.c              # MiniGB APU 音频处理单元（第三方）
-│   ├── game_2048.c / game_2048.h # 2048 桌面游戏
+│   ├── game_2048.c / game_2048.h # 2048 桌面游戏（支持 MPU6050 倾斜控制）
+│   ├── mpu6050.c / mpu6050.h     # MPU6050 六轴传感器 I2C 驱动（仅 2048 使用）
 │   ├── game_runtime.c / .h       # 游戏生命周期管理（加载/运行/退出）
 │   ├── rom_loader.c / .h         # SD 卡 ROM 扫描与加载（原 SPIFFS 已废弃）
 │   ├── walnut_cgb.h              # Walnut-CGB 模拟器核心（高性能，32位路径）
