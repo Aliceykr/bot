@@ -1,6 +1,9 @@
 #ifndef __BAIDU_TOKEN_H
 #define __BAIDU_TOKEN_H
 
+#include <stdbool.h>
+#include <stddef.h>
+
 /*
  * 百度 OAuth2 access_token 共享缓存
  *
