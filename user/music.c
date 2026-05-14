@@ -118,6 +118,11 @@ static char                   s_current_name[96] = "";
 static inline void mp_lock(void)   { if (s_mtx) xSemaphoreTake(s_mtx, portMAX_DELAY); }
 static inline void mp_unlock(void) { if (s_mtx) xSemaphoreGive(s_mtx); }
 
+void music_init(void)
+{
+    if (!s_mtx)      s_mtx = xSemaphoreCreateMutex();
+    if (!s_done_sem) s_done_sem = xSemaphoreCreateBinary();
+}
 /* 解码任务公用的 PCM 推送 + 暂停/停止控制。
  * 返回 false 表示被 stop 请求打断，调用方应立即返回。*/
 static bool push_pcm_mono_blocking(const int16_t *pcm, size_t bytes)
@@ -540,6 +545,7 @@ bool music_play(const char *path)
 {
     if (!path) return false;
 
+    /* 兜底：如果 music_init 未被调用过 */
     if (!s_mtx)       s_mtx = xSemaphoreCreateMutex();
     if (!s_done_sem)  s_done_sem = xSemaphoreCreateBinary();
     if (!s_mtx || !s_done_sem) return false;

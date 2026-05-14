@@ -141,8 +141,8 @@ bool tts_speak(const char *text)
 
     bool ret = false;
 
-    const char *token = baidu_token_get();
-    if (!token) {
+    char token_buf[256];
+    if (!baidu_token_copy(token_buf, sizeof(token_buf))) {
         ESP_LOGE(TAG, "获取 token 失败");
         goto out;
     }
@@ -156,7 +156,7 @@ bool tts_speak(const char *text)
     static char body[5120];
     int body_len = snprintf(body, sizeof(body),
         "tex=%s&tok=%s&cuid=esp32s3_bot&ctp=1&lan=zh&spd=5&pit=5&vol=9&per=0&aue=6",
-        encoded, token);
+        encoded, token_buf);
     if (body_len <= 0 || body_len >= (int)sizeof(body)) {
         ESP_LOGE(TAG, "body 构建失败或过长");
         goto out;

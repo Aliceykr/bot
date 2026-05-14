@@ -18,6 +18,7 @@
 
 /* 守护任务通知位 */
 #define GUARDIAN_NOTIFY_DISCONNECT 0x01
+#define GUARDIAN_NOTIFY_SHUTDOWN   0x02
 
 /* ================================================================
  * 模块状态
@@ -90,6 +91,12 @@ static void wifi_guardian_task(void *arg)
         uint32_t notify = 0;
         xTaskNotifyWait(0, ULONG_MAX, &notify, portMAX_DELAY);
 
+        /* 收到 shutdown 通知：自行退出，避免外部 vTaskDelete 导致死锁 */
+        if (notify & GUARDIAN_NOTIFY_SHUTDOWN) {
+            ESP_LOGI(TAG, "守护：收到 shutdown 通知，退出");
+            break;
+        }
+
         if (!(notify & GUARDIAN_NOTIFY_DISCONNECT)) continue;
 
         /* 指数退避循环：一直重试直到连上或用户主动停止 */
@@ -116,7 +123,15 @@ static void wifi_guardian_task(void *arg)
             uint32_t wait_ms = s_backoff_ms[idx];
             ESP_LOGW(TAG, "守护：%u ms 后重连（第 %u 次退避）",
                      (unsigned)wait_ms, (unsigned)(idx + 1));
-            vTaskDelay(pdMS_TO_TICKS(wait_ms));
+
+            /* 分段等待：每 100ms 检查一次 shutdown 通知，避免长等期间无法退出 */
+            uint32_t waited = 0;
+            while (waited < wait_ms) {
+                uint32_t step = (wait_ms - waited) > 100 ? 100 : (wait_ms - waited);
+                vTaskDelay(pdMS_TO_TICKS(step));
+                waited += step;
+                if (snapshot_user_stopped()) break;
+            }
 
             if (snapshot_user_stopped()) continue;  /* 等待期间被取消 */
             if (snapshot_status() == WIFI_STATUS_CONNECTED) {
@@ -153,6 +168,12 @@ static void wifi_guardian_task(void *arg)
             /* 超时未连上：loop 继续下一档退避 */
         }
     }
+
+    /* 自行退出前清句柄 */
+    WIFI_LOCK();
+    s_guardian_handle = NULL;
+    WIFI_UNLOCK();
+    vTaskDelete(NULL);
 }
 
 /* ================================================================
@@ -408,10 +429,9 @@ void wifi_full_shutdown_for_ble(void)
 {
     if (!s_initialized) return;
 
-    /* 先杀守护任务，避免它在 esp_wifi_deinit 期间调用已销毁的 WiFi API */
+    /* 通知守护任务自行退出，避免 vTaskDelete 导致 mutex 死锁 */
     WIFI_LOCK();
     TaskHandle_t guard = s_guardian_handle;
-    s_guardian_handle = NULL;
     s_user_stopped = true;
     s_status = WIFI_STATUS_DISCONNECTED;
     memcpy(s_ip_str, "0.0.0.0", 8);
@@ -421,9 +441,23 @@ void wifi_full_shutdown_for_ble(void)
     WIFI_UNLOCK();
 
     if (guard) {
-        /* 守护任务在 xTaskNotifyWait 或 vTaskDelay 中等，不持任何 mutex，
-         * 直接 vTaskDelete 安全 */
-        vTaskDelete(guard);
+        /* 发送 shutdown 通知让守护任务自行退出 */
+        xTaskNotify(guard, GUARDIAN_NOTIFY_SHUTDOWN, eSetBits);
+        /* 等守护任务自行清理退出（最多 2 秒）*/
+        for (int i = 0; i < 40; i++) {
+            WIFI_LOCK();
+            bool gone = (s_guardian_handle == NULL);
+            WIFI_UNLOCK();
+            if (gone) break;
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        /* 超时兜底：如果还没退出，记日志但不强杀 */
+        WIFI_LOCK();
+        if (s_guardian_handle != NULL) {
+            ESP_LOGW(TAG, "守护任务退出超时，强制清理句柄");
+            s_guardian_handle = NULL;
+        }
+        WIFI_UNLOCK();
     }
 
     esp_wifi_disconnect();

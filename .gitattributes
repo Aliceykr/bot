@@ -1,0 +1,2 @@
+# 统一行尾为 LF，避免跨平台幽灵更改
+* text=auto eol=lf

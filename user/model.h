@@ -17,4 +17,7 @@ typedef struct {
 // 阻塞直到收到响应或超时
 bool model_chat(const char *user_msg, model_result_t *out);
 
+// 必须在 app_main 启动阶段单线程调用一次，确保 mutex 在任何并发调用前创建
+void model_init(void);
+
 #endif

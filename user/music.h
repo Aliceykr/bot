@@ -62,6 +62,9 @@ void music_full_path(const char *name, char *out, size_t cap);
  * 如果当前已在播放，先安全 stop 旧任务再启动新任务。*/
 bool music_play(const char *path);
 
+/* 必须在 app_main 启动阶段单线程调用一次，确保 mutex/sem 在任何并发调用前创建 */
+void music_init(void);
+
 /* 停止当前播放。阻塞至后台任务退出（最多 500ms）。*/
 void music_stop(void);
 

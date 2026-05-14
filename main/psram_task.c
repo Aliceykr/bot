@@ -61,6 +61,11 @@ static void task_entry(void *arg)
 {
     entry_ctx_t *ctx = (entry_ctx_t *)arg;
 
+    /* 让出一次 CPU：确保创建者有机会完成 ctx->cleanup.handle 赋值。
+     * 正常情况下创建者在 xTaskCreateStatic 返回后立即赋值，但如果新任务
+     * 优先级更高导致立即抢占，这里 yield 回去让创建者跑完赋值再继续。 */
+    taskYIELD();
+
     /* 把用户函数跑完 */
     ctx->user_func(ctx->user_arg);
 
@@ -120,6 +125,12 @@ BaseType_t xTaskCreatePSRAMPinnedToCore(TaskFunction_t func, const char *name,
         heap_caps_free(ctx);
         return pdFAIL;
     }
+    /* 必须在任务有机会运行前赋值 handle。由于 xTaskCreateStaticPinnedToCore
+     * 在当前任务上下文中返回（新任务还没被调度），且新任务优先级 <= 当前任务
+     * 或调度器在 critical section 内，这里赋值是安全的。
+     * 但为防万一（新任务优先级更高立即抢占），在 task_entry 开头加 taskYIELD
+     * 前先确保 handle 已写入。实际上 xTaskCreateStatic 返回后 handle 就是
+     * 有效的，ctx->cleanup.handle 只是给 cleaner 用的副本。 */
     ctx->cleanup.handle = h;
     if (handle_out) *handle_out = h;
     return pdPASS;

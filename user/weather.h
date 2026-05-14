@@ -25,4 +25,7 @@ typedef struct {
 // 查询天气+时间，结果存入 out
 bool weather_fetch(weather_data_t *out);
 
+// 必须在 app_main 启动阶段单线程调用一次，确保 mutex 在任何并发调用前创建
+void weather_init(void);
+
 #endif

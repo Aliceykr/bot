@@ -24,8 +24,17 @@ static bool    s_resp_overflow = false;
 
 /* 互斥锁：保护响应缓冲，防并发调用 */
 static SemaphoreHandle_t s_mutex = NULL;
-static void ensure_mutex(void) {
+
+void model_init(void)
+{
     if (!s_mutex) s_mutex = xSemaphoreCreateMutex();
+}
+
+static void ensure_mutex(void) {
+    if (!s_mutex) {
+        ESP_LOGW(TAG, "model_init 未在 app_main 阶段调用，回退 lazy-create");
+        s_mutex = xSemaphoreCreateMutex();
+    }
 }
 
 /* 释放 HTTP 响应缓冲区，在 API 函数返回前调用（必须在 mutex 持有期间） */

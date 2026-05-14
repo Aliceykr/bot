@@ -482,9 +482,11 @@ ROM 和音乐文件存放在 MicroSD 卡，不再使用 Flash SPIFFS 存储。
 
 ESP32-S3 多任务环境下，共享状态的并发访问是最常见的崩溃源。本项目采用分层防护策略：
 
-- **模块级 mutex**：WiFi、BLE、Speaker、音乐播放器、巴法云各自维护独立的 mutex，保护内部状态不被事件回调、守护任务、UI 任务撕裂读写
+- **模块级 mutex**：WiFi、BLE、Speaker、音乐播放器、巴法云、大模型、天气各自维护独立的 mutex，保护内部状态不被事件回调、守护任务、UI 任务撕裂读写；所有 mutex 在 `app_main` 单线程阶段提前创建，消除 lazy-init 竞态窗口
 - **volatile 无锁读取**：`wifi_get_status()`、`speaker_get_volume()` 等高频查询路径使用 `volatile` + 32 位对齐原子语义，避免加锁拖慢 UI/HTTP 路径
+- **锁内拷贝**：`baidu_token_copy()` 在持有 mutex 期间将 token 拷贝到调用方栈缓冲区，释放锁后调用方使用的是本地副本，彻底消除跨线程指针悬空风险
 - **flush 协议**：Speaker 的 `speaker_flush()` / `speaker_set_sample_rate()` 不直接操作 ring buffer，而是通过 `s_flush_request` + `s_flush_done` 信号量通知 tx_task 自行清空，保证 ring buffer 的唯一消费者不变
+- **协作式任务退出**：WiFi 守护任务通过 notify 通知自行退出（而非 `vTaskDelete` 硬杀），避免在持有 mutex 时被删除导致永久死锁
 - **异步 UI 操作**：音乐切歌/停止通过一次性后台任务执行（`music_stop_task` / `music_play_task`），避免 `music_stop` 的 2 秒等待阻塞 LVGL 线程；任务创建失败时降级为同步调用，功能正确优先
 
 ### 内存精细管理
@@ -514,7 +516,7 @@ I2S_NUM_0 被在线 ASR（`asr.c`）和离线 ESP-SR（`esp_sr.c`）共享，通
 
 ### 系统级鲁棒性
 
-- **WiFi 守护任务**：首次连接 EventGroup 等待 + 快速重试 3 次；运行期断线自动指数退避重连（5s → 5min），永不放弃；用户主动断开则停止守护
+- **WiFi 守护任务**：首次连接 EventGroup 等待 + 快速重试 3 次；运行期断线自动指数退避重连（5s → 5min），永不放弃；用户主动断开则停止守护；`wifi_full_shutdown_for_ble()` 通过 `GUARDIAN_NOTIFY_SHUTDOWN` 通知守护任务协作式退出，避免 `vTaskDelete` 硬杀导致 mutex 死锁
 - **BLE deinit 防护**：`s_deinit_in_progress` 门锁防止双拆；`s_pending_host_calls` 计数器等待跨任务 NimBLE API 调用完成后再拆 host；`s_adv_gen` 代际计数器防止 stop 后残留广播（ghost advertising）
 - **BLE timer 竞态修复**：`accumulate_rx` 的 `xTimerReset` 移入 LOCK 块内，与 deinit 路径的 `s_rx_timer = NULL` 互斥，消除 UAF 窗口
 - **任务生命周期安全**：ESP-SR 三个任务（read/feed/detect）通过 graceful stop + 2 秒超时硬杀 + ring buffer 残留保护，避免资源泄漏；音乐播放器的 `music_stop` 采用 10 轮 ×200ms 轮询确认旧任务退出，防止快速切歌产生僵尸任务
@@ -522,7 +524,10 @@ I2S_NUM_0 被在线 ASR（`asr.c`）和离线 ESP-SR（`esp_sr.c`）共享，通
 - **异步取消语义**：天气查询支持真正的取消（`s_weather_cancelled` 标志 + drain queue + 双重检查），取消后后台任务完成也不会弹出界面
 - **LVGL 对象生命周期**：BLE 结果弹窗通过 `LV_EVENT_DELETE` 回调统一清零全局句柄，覆盖所有销毁路径（OK 按钮 / 父屏切换 / 显式 delete），消除悬空指针
 - **HTTP 缓冲即用即释**：baidu_token / model / weather 三个模块的 `s_resp_buf` 在 API 返回前统一 `resp_buf_release()`，避免 PSRAM 长期驻留浪费
-- **模块 init 提前到单线程阶段**：`baidu_token_init()` / `bemfa_init()` 在 `app_main` 中调用，消除并发首次调用创建多个 mutex 的竞态
+- **模块 init 提前到单线程阶段**：`baidu_token_init()` / `bemfa_init()` / `model_init()` / `weather_init()` / `music_init()` 在 `app_main` 中调用，消除并发首次调用创建多个 mutex 的竞态
+- **baidu_token 线程安全拷贝**：新增 `baidu_token_copy()` 在锁内将 token 拷贝到调用方缓冲区，ASR/TTS 使用该接口避免释放锁后 token 被其他线程覆写导致悬空读取
+- **WiFi 守护任务协作式退出**：`wifi_full_shutdown_for_ble()` 不再使用 `vTaskDelete` 硬杀守护任务（可能在持有 mutex 时被杀导致死锁），改为发送 `GUARDIAN_NOTIFY_SHUTDOWN` 通知让任务自行退出，等待确认后再继续拆除 WiFi 驱动
+- **PSRAM 任务 handle 竞态防护**：`task_entry` 开头加 `taskYIELD()`，确保创建者完成 `cleanup.handle` 赋值后新任务才开始执行用户函数，防止高优先级任务立即完成导致 cleaner 收到未初始化的 handle
 
 ---
 

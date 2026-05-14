@@ -17,6 +17,9 @@
 #include "sdcard.h"
 #include "bemfa.h"
 #include "baidu_token.h"
+#include "model.h"
+#include "weather.h"
+#include "music.h"
 
 static void lvgl_tick_task(void *arg)
 {
@@ -73,6 +76,12 @@ void app_main(void)
     bemfa_init();
     /* 百度 token 模块一次性 init：创建内部 mutex，避免 ASR/TTS 并发首次调用竞态 */
     baidu_token_init();
+    /* 大模型模块一次性 init：创建内部 mutex，避免并发首次调用竞态 */
+    model_init();
+    /* 天气模块一次性 init：创建内部 mutex */
+    weather_init();
+    /* 音乐模块一次性 init：创建内部 mutex 和 sem */
+    music_init();
     /* ESP-SR 不再常驻：进入"语音命令"界面时懒加载 esp_sr_init()，
      * 退出时 esp_sr_deinit() 释放 DRAM。节省 ~60-80KB 内部 RAM。 */
     /* BLE 也不再常驻：进入"蓝牙"菜单时才 ble_prov_init()，

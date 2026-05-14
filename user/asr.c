@@ -365,8 +365,8 @@ bool asr_recognize(uint32_t audio_len_bytes, asr_result_t *out)
         snprintf(out->error_msg, sizeof(out->error_msg), "No audio");
         goto out;
     }
-    const char *token = baidu_token_get();
-    if (!token) {
+    char token_buf[256];
+    if (!baidu_token_copy(token_buf, sizeof(token_buf))) {
         snprintf(out->error_msg, sizeof(out->error_msg), "Token failed");
         goto out;
     }
@@ -377,7 +377,7 @@ bool asr_recognize(uint32_t audio_len_bytes, asr_result_t *out)
     char asr_url[384];
     snprintf(asr_url, sizeof(asr_url),
         "%s?dev_pid=80001&cuid=esp32s3_bot&token=%s",
-        BAIDU_ASR_URL, token);
+        BAIDU_ASR_URL, token_buf);
 
     s_http_len = 0;
     s_http_overflow = false;

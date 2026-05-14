@@ -195,6 +195,32 @@ const char *baidu_token_get(void)
     return ret;
 }
 
+bool baidu_token_copy(char *buf, size_t buf_size)
+{
+    if (!buf || buf_size == 0) return false;
+
+    ensure_mutex();
+    if (!s_mutex) return false;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    int64_t now = esp_timer_get_time();
+    bool need_fetch = (strlen(s_token) == 0) || (now + REFRESH_MARGIN_US >= s_expire_us);
+
+    if (need_fetch) {
+        if (!fetch_token_locked()) {
+            xSemaphoreGive(s_mutex);
+            return false;
+        }
+    }
+
+    strncpy(buf, s_token, buf_size - 1);
+    buf[buf_size - 1] = '\0';
+
+    xSemaphoreGive(s_mutex);
+    return true;
+}
+
 void baidu_token_invalidate(void)
 {
     ensure_mutex();

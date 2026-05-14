@@ -15,8 +15,18 @@
 /* 获取当前有效 token 字符串。
  * 返回非 NULL：有效 token，调用方只需读取不能释放
  * 返回 NULL：获取失败（网络错误或认证失败）
+ *
+ * 注意：返回的指针指向模块内部 static 缓冲区，释放锁后可能被其他线程
+ * 覆写。如果需要跨时间使用 token，请用 baidu_token_copy() 代替。
  */
 const char *baidu_token_get(void);
+
+/* 线程安全地将当前有效 token 拷贝到调用方缓冲区。
+ * 返回 true 表示成功（buf 已填充 \0 结尾的 token）；
+ * 返回 false 表示获取失败（网络错误或认证失败），buf 内容未定义。
+ * buf_size 建议 >= 256。
+ */
+bool baidu_token_copy(char *buf, size_t buf_size);
 
 /* 强制失效当前缓存，下次调用 baidu_token_get 会重新请求。
  * 在 API 返回 401 或 token 相关错误码时调用。 */

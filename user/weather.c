@@ -38,8 +38,17 @@ static inline void resp_buf_release(void)
 
 /* 互斥锁：保护 s_resp_buf 及后续 JSON 解析期间的模块状态，防并发调用 */
 static SemaphoreHandle_t s_mutex = NULL;
-static void ensure_mutex(void) {
+
+void weather_init(void)
+{
     if (!s_mutex) s_mutex = xSemaphoreCreateMutex();
+}
+
+static void ensure_mutex(void) {
+    if (!s_mutex) {
+        ESP_LOGW(TAG, "weather_init 未在 app_main 阶段调用，回退 lazy-create");
+        s_mutex = xSemaphoreCreateMutex();
+    }
 }
 
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
