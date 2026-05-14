@@ -1,0 +1,43 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "ESP-IDF Build",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "-c",
+        "export IDF_TOOLS_PATH=/home/aliceykr/.espressif && source /home/aliceykr/.espressif/esp-idf/export.sh && idf.py build"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": ["$gcc"],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "ESP-IDF Flash",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "-c",
+        "export IDF_TOOLS_PATH=/home/aliceykr/.espressif && source /home/aliceykr/.espressif/esp-idf/export.sh && idf.py -p /dev/ttyUSB0 flash"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "ESP-IDF Monitor",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "-c",
+        "export IDF_TOOLS_PATH=/home/aliceykr/.espressif && source /home/aliceykr/.espressif/esp-idf/export.sh && idf.py -p /dev/ttyUSB0 monitor"
+      ],
+      "problemMatcher": []
+    }
+  ]
+}
