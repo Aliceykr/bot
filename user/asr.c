@@ -24,6 +24,10 @@ static int16_t *s_rec_buf = NULL;
 static volatile uint32_t s_rec_pos = 0;
 static volatile bool s_recording = false;
 static i2s_chan_handle_t s_rx_chan = NULL;
+/* 跟踪 i2s_channel_enable 状态，避免对未 enable 的通道调 disable
+ * （会触发底层 ERROR 日志，虽不影响功能但污染串口）。
+ * record_start enable 后置 true，record_stop / mic_deinit 在 disable 前检查。 */
+static bool s_i2s_enabled = false;
 
 /* 录音任务：从 I2S 读取数据，转换为单声道 16bit PCM 写入 s_rec_buf
  * 常驻，通过 s_rec_active 标志控制启停，不录音时阻塞等通知 */
@@ -192,7 +196,10 @@ static void asr_rec_task(void *arg)
             /* 缓冲满：自动停止 */
             s_rec_active = false;
             s_recording  = false;
-            i2s_channel_disable(s_rx_chan);
+            if (s_i2s_enabled) {
+                i2s_channel_disable(s_rx_chan);
+                s_i2s_enabled = false;
+            }
             ESP_LOGI(TAG, "录音缓冲满，自动停止");
             continue;
         }
@@ -235,6 +242,7 @@ void asr_record_start(void)
         s_rec_active = false;
         return;
     }
+    s_i2s_enabled = true;
     xTaskNotifyGive(s_rec_task);  /* 唤醒录音任务 */
     ESP_LOGI(TAG, "开始录音");
 }
@@ -250,7 +258,10 @@ uint32_t asr_record_stop(void)
      * 最多等 200ms（i2s_channel_read 超时 100ms + 余量），
      * 超时也继续 disable，不会死锁。 */
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(200));
-    if (s_rx_chan) i2s_channel_disable(s_rx_chan);
+    if (s_rx_chan && s_i2s_enabled) {
+        i2s_channel_disable(s_rx_chan);
+        s_i2s_enabled = false;
+    }
 
     uint32_t pos   = s_rec_pos;
     uint32_t bytes = pos * sizeof(int16_t);
@@ -301,7 +312,10 @@ void asr_mic_deinit(void)
 
     /* 3. 现在任务已退出 read 调用，可以安全释放通道 */
     if (s_rx_chan) {
-        i2s_channel_disable(s_rx_chan);
+        if (s_i2s_enabled) {
+            i2s_channel_disable(s_rx_chan);
+            s_i2s_enabled = false;
+        }
         i2s_del_channel(s_rx_chan);
         s_rx_chan = NULL;
     }

@@ -77,9 +77,13 @@ static esp_err_t sr_i2s_init(void)
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &s_sr_rx_chan));
 
+    /* INMP441 输出 24bit 数据，左对齐到 32bit 槽位中。
+     * 与 asr.c 保持一致：32bit stereo Philips 模式，软件层取左声道并右移 16 位
+     * 转 16bit mono 给 AFE。如果改成 16bit MONO 槽位，硬件层直接丢弃低位会
+     * 导致小信号失真严重，且和 read 任务里 (raw >> 16) * 3 的转换逻辑不匹配。 */
     i2s_std_config_t std_cfg = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(16000),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,
             .bclk = MIC_SCK_PIN,
@@ -91,7 +95,7 @@ static esp_err_t sr_i2s_init(void)
     };
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_sr_rx_chan, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(s_sr_rx_chan));
-    ESP_LOGI(TAG, "I2S NUM 0 初始化 (16bit mono for ESP-SR)");
+    ESP_LOGI(TAG, "I2S NUM 0 初始化 (32bit stereo INMP441 → 软件转 16bit mono)");
     return ESP_OK;
 }
 
@@ -384,7 +388,7 @@ bool esp_sr_init(void)
     }
     afe_cfg->wakenet_init = false;      /* 不需要唤醒词 */
     afe_cfg->vad_init     = true;
-    afe_cfg->ns_init      = true;       /* 降噪 */
+    afe_cfg->ns_init      = false;      /* 关闭降噪：NSNet2 会损害识别准确率（官方警告） */
     afe_cfg->agc_mode     = 3;          /* 自动增益 */
     afe_cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
     afe_cfg->afe_linear_gain = 2.0;
@@ -414,23 +418,35 @@ bool esp_sr_init(void)
         goto init_fail;
     }
 
-    /* 5. 注册命令词（MultiNet7 要求拼音格式，空格分隔音节） */
+    /* 5. 注册命令词（MultiNet7 要求拼音格式，空格分隔音节）
+     * 注意：MultiNet7 对短命令（≤2 音节）识别率差，官方建议 3-6 音节。
+     * 命令 ID 与 my_demo.c 中 sr_dispatch_cmd 的分发逻辑一一对应，
+     * 修改时需同步更新两边。 */
     esp_mn_commands_alloc(s_multinet, s_mn_data);
 
-    esp_mn_commands_add(1,  "fan hui");
-    esp_mn_commands_add(2,  "que ren");
-    esp_mn_commands_add(3,  "qu xiao");
-    esp_mn_commands_add(10, "lian jie wang luo");
-    esp_mn_commands_add(11, "cha kan tian qi");
-    esp_mn_commands_add(12, "da kai you xi");
-    esp_mn_commands_add(13, "da kai liao tian");
-    esp_mn_commands_add(14, "yu yin zhu shou");
-    esp_mn_commands_add(20, "tui chu you xi");
-    esp_mn_commands_add(30, "tiao da yin liang");
-    esp_mn_commands_add(31, "tiao xiao yin liang");
+    esp_mn_commands_add(1, "da kai huan jing jian ce");      /* 打开环境监测 */
+    esp_mn_commands_add(2, "da kai tian qi he ri qi");       /* 打开天气和日期（需 WiFi）*/
+    esp_mn_commands_add(3, "da kai you xi");                 /* 打开游戏 */
+    esp_mn_commands_add(4, "da kai liao tian zhu shou");     /* 打开聊天助手（需 WiFi）*/
+    esp_mn_commands_add(5, "da kai yu yin zhu shou");        /* 打开语音助手（需 WiFi）*/
+    esp_mn_commands_add(6, "da kai lan ya");                 /* 打开蓝牙 */
+    esp_mn_commands_add(7, "da kai yin yue");                /* 打开音乐 */
+    esp_mn_commands_add(8, "da kai yin liang");              /* 打开音量 */
+    esp_mn_commands_add(9, "da kai zhi neng she bei");       /* 打开智能设备（需 WiFi）*/
 
     esp_mn_commands_update();
     s_multinet->print_active_speech_commands(s_mn_data);
+
+    /* 6. 抑制 AFE 库在 stop 时空 ringbuf 的警告。
+     * stop 时 feed 任务先退出，detect 任务最后一次 fetch 时 AFE 内部
+     * ring 已空，AFE 会打 W 警告。这是正常退出顺序，不是错误。
+     * 把 AFE tag 的日志等级降到 ERROR，屏蔽这条无害警告。
+     *
+     * 注：这是全局副作用（esp_log_level_set 是进程范围的），deinit 后
+     * 不会还原。考虑到目前只有 ESP-SR 用 AFE，且压制的只是 W 警告
+     * （不影响 E 错误），副作用可接受。如果将来其他模块用 AFE，
+     * 把这行移到 app_main 一次性设置。 */
+    esp_log_level_set("AFE", ESP_LOG_ERROR);
 
     ESP_LOGI(TAG, "ESP-SR 初始化完成");
     ESP_LOGI(TAG, "内部 RAM 剩余: %lu KB", (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));

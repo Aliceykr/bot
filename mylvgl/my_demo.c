@@ -44,6 +44,9 @@ static void ble_cred_cb(const char *ssid, const char *password);
 static void show_music_screen(void);
 static void show_volume_screen(void);
 static void show_bemfa_screen(void);
+static void show_chat_screen(void);
+static void show_asr_screen(void);
+static void show_ble_screen(void);
 
 /* 全局 UI 对象 */
 static lv_obj_t *list;
@@ -685,149 +688,542 @@ static void asr_back_cb(lv_event_t *e)
 }
 
 // ================================================================
-// 语音命令界面（ESP-SR 离线命令词识别）
+// 语音命令开关（ESP-SR 离线命令词识别）
+//
+// 类似蓝牙开关：菜单点一下"语音命令"就 toggle 开/关，无独立界面。
+//   - 开启：暂停 WiFi（释放 DRAM）→ esp_sr_init → start_listening
+//   - 关闭：stop_listening → esp_sr_deinit → 恢复 WiFi
+//   - 识别到命令：自动停止 SR → 异步等待资源就绪 → 跳转到对应功能
+//
+// 识别 → 跳转的核心流程（sr_dispatch_task）：
+//   1. esp_sr_deinit 释放 ~100KB DRAM（同步阻塞 ~2s）
+//   2. 如需 WiFi（聊天/语音助手/天气/智能设备）：恢复 WiFi 并轮询等待
+//      最多 8 秒；超时则按"未联网"处理弹提示
+//   3. 投递目标命令 ID 回 LVGL 线程（sr_pending_action 队列）
+//   4. LVGL timer 拿到后调 show_xxx_screen 打开功能
+//
+//   全程串行化保证 SR 资源释放 + WiFi 就绪 + 功能启动按时序进行，
+//   避免"识别后立刻判 WiFi 没连"或"BLE init 时 SR 还占着 DRAM"的竞态。
+//
+// WiFi 守卫：需要 WiFi 的功能（天气/聊天/语音助手/智能设备）若识别时未联网，
+//   只弹"请连接 WiFi"提示，不开启功能。
 // ================================================================
-static lv_obj_t *sr_cmd_scr         = NULL;
-static lv_obj_t *sr_cmd_result_lbl  = NULL;
-static lv_obj_t *sr_cmd_status_lbl  = NULL;
-static lv_obj_t *sr_cmd_btn         = NULL;
-static bool sr_cmd_active = false;
-/* 进入 SR 界面前 WiFi 是否活跃：退出时据此决定是否 resume。
- * ESP-SR 模型 + AFE pipeline 占用大量内部 DRAM，与 WiFi 驱动共存会让
- * esp_timer_create 等内部 DRAM 分配失败 → abort 重启。懒加载边界：进入
- * 前暂停 WiFi，退出后恢复。 */
+
+/* SR 状态机：
+ *   IDLE      → 未启动
+ *   STARTING  → 启动任务在跑（init+start_listening）
+ *   ACTIVE    → 正在监听
+ *   DISPATCH  → 已识别到命令，正在 teardown + 等 WiFi（不再分发新命令）
+ *   STOPPING  → 用户主动关闭中
+ * 用枚举替代多个布尔标志，避免 toggle 双击竞态（Bug 4）。 */
+typedef enum {
+    SR_STATE_IDLE = 0,
+    SR_STATE_STARTING,
+    SR_STATE_ACTIVE,
+    SR_STATE_DISPATCH,
+    SR_STATE_STOPPING,
+} sr_state_t;
+
+/* 用 atomic 简单起见用 volatile + 单写者约定（LVGL 线程是状态写入唯一来源，
+ * 后台任务只读 + CAS-like 写）。FreeRTOS volatile uint32_t 读写在 ESP32-S3
+ * 上是原子的（4 字节对齐 + 单核访问），不需要额外 atomic 类型。 */
+static volatile sr_state_t sr_state = SR_STATE_IDLE;
+
+/* SR 启用时是否暂停了 WiFi：teardown 时据此决定是否恢复 WiFi。 */
 static bool sr_wifi_was_active = false;
 
+/* SR 启动结果（异步任务投递回 LVGL timer）*/
+typedef enum {
+    SR_START_OK = 0,
+    SR_START_FAIL_INIT,
+    SR_START_FAIL_LISTEN,
+} sr_start_result_t;
+static QueueHandle_t sr_start_result_queue = NULL;
+
+/* SR 识别结果（detect 任务回调投递回 LVGL timer）*/
 typedef struct {
-    bool detected;
     int  command_id;
     float probability;
-    char command_str[128];
-} sr_cmd_ui_result_t;
-
+    char command_str[64];
+} sr_cmd_result_t;
 static QueueHandle_t sr_cmd_result_queue = NULL;
+
+/* dispatch 任务结果（teardown 完成 + WiFi 就绪后通知 LVGL 线程开功能）。
+ * 单 slot 队列：DISPATCH 期间不会有第二条命令被分发（state 机保证）。
+ *
+ * dispatch_failed=true 表示后台任务无法启动（malloc/task create 失败），
+ * timer 收到此标志后只切回 IDLE，不删 dialog 也不开功能。 */
+typedef struct {
+    int  command_id;
+    bool wifi_ok;          /* 需 WiFi 的命令：true 表示 WiFi 已就绪 */
+    bool needs_wifi;       /* 该命令是否需要 WiFi */
+    bool dispatch_failed;  /* fallback 标志：worker 启动失败 */
+} sr_pending_action_t;
+static QueueHandle_t sr_pending_action_queue = NULL;
+
+/* SR 状态弹窗：进入"启动中"时显示，启动结果到达后切换为成功/失败提示。
+ * 由用户 OK 关闭，或 sr_dispatch 主动关掉以让位功能屏幕。 */
+static lv_obj_t *sr_status_dialog = NULL;
+static void sr_status_dialog_delete_cb(lv_event_t *e)
+{
+    (void)e;
+    sr_status_dialog = NULL;
+}
 
 /* ESP-SR 回调（运行在 detect 任务上下文）→ 通过队列通知 LVGL */
 static void sr_cmd_result_cb(int id, const char *text, float prob)
 {
-    sr_cmd_ui_result_t res = {0};
-    if (id >= 0 && text) {
-        res.detected   = true;
-        res.command_id = id;
-        res.probability = prob;
-        strncpy(res.command_str, text, sizeof(res.command_str) - 1);
-    }
-    if (sr_cmd_result_queue) {
-        xQueueSend(sr_cmd_result_queue, &res, 0);
-    }
-}
-
-/* LVGL timer 轮询识别结果
- *
- * 持续监听模式下：
- *   - 收到命令词（res.detected=true）→ 显示结果，监听**继续**，不停不重启
- *   - ESP-SR 现在不再上报 TIMEOUT 结果（detect 任务内部静默 clean 了），
- *     所以不会误判为"超时结束"
- *   - 用户手动点"停止识别"按钮才真正停下来 */
-static void sr_cmd_timer_cb(lv_timer_t *t)
-{
-    if (!sr_cmd_scr || !lv_obj_is_valid(sr_cmd_scr)) {
-        lv_timer_delete(t);
-        return;
-    }
     if (!sr_cmd_result_queue) return;
-
-    sr_cmd_ui_result_t res;
-    if (xQueueReceive(sr_cmd_result_queue, &res, 0) != pdTRUE) return;
-
-    if (res.detected) {
-        lv_label_set_text_fmt(sr_cmd_result_lbl, "识别: %s\n置信度: %.0f%%",
-                              res.command_str, res.probability * 100);
-        lv_label_set_text(sr_cmd_status_lbl, "识别成功，继续监听...");
-    }
-    /* 不关闭 listener，UI 保持"停止识别"按钮状态 */
+    sr_cmd_result_t res = {0};
+    res.command_id = id;
+    res.probability = prob;
+    if (text) strncpy(res.command_str, text, sizeof(res.command_str) - 1);
+    xQueueSend(sr_cmd_result_queue, &res, 0);
 }
 
-static void sr_cmd_btn_cb(lv_event_t *e)
+/* 是否需要 WiFi 的命令分类。dispatch 任务先 teardown SR 再据此决定
+ * 是否等 WiFi。集中放一处方便维护。 */
+static bool sr_cmd_needs_wifi(int command_id)
 {
-    if (sr_cmd_active) {
-        /* 正在监听 → 手动停止 */
-        sr_cmd_active = false;
-        esp_sr_stop_listening();
-        lv_label_set_text(sr_cmd_status_lbl, "已停止");
-        lv_obj_set_style_bg_color(sr_cmd_btn, lv_color_hex(0x16213e), 0);
-        lv_obj_t *btn_lbl = lv_obj_get_child(sr_cmd_btn, 0);
-        if (btn_lbl) lv_label_set_text(btn_lbl, "开始识别");
-        return;
-    }
-
-    if (esp_sr_is_listening()) return;
-
-    if (!sr_cmd_result_queue)
-        sr_cmd_result_queue = xQueueCreate(4, sizeof(sr_cmd_ui_result_t));
-
-    if (esp_sr_start_listening(sr_cmd_result_cb)) {
-        sr_cmd_active = true;
-        lv_label_set_text(sr_cmd_status_lbl, "正在监听...");
-        lv_obj_set_style_bg_color(sr_cmd_btn, lv_color_hex(0xe94560), 0);
-        lv_obj_t *btn_lbl = lv_obj_get_child(sr_cmd_btn, 0);
-        if (btn_lbl) lv_label_set_text(btn_lbl, "停止识别");
-    } else {
-        lv_label_set_text(sr_cmd_status_lbl, "启动失败");
+    switch (command_id) {
+        case 2:  /* 打开天气和日期 */
+        case 4:  /* 打开聊天助手 */
+        case 5:  /* 打开语音助手 */
+        case 9:  /* 打开智能设备 */
+            return true;
+        default:
+            return false;
     }
 }
 
-/* 后台任务：执行 ESP-SR 关闭 + 可选的 WiFi 恢复。
- * sr_cmd_back_cb 里调 esp_sr_stop_listening/deinit 最长阻塞 2 秒，
- * 如果在 LVGL 线程里做会冻结动画/输入。独立任务跑保证 UI 流畅。 */
+/* ----------------------------------------------------------------
+ * dispatch 任务：识别成功后的串行清理 + 等待 + 投递。
+ *   1. 同步 esp_sr_deinit（~2s）
+ *   2. 如需 WiFi 则 wifi_resume_after_game + 轮询等 CONNECTED（最多 8s）
+ *   3. 投递 sr_pending_action 给 LVGL timer
+ *   全程在独立任务做，LVGL 线程立刻返回继续渲染。
+ * ---------------------------------------------------------------- */
 typedef struct {
-    bool resume_wifi;
-} sr_teardown_arg_t;
+    int command_id;
+} sr_dispatch_arg_t;
 
-static void sr_teardown_task(void *arg)
+static void sr_dispatch_task(void *arg)
 {
-    sr_teardown_arg_t *a = (sr_teardown_arg_t *)arg;
-    bool resume_wifi = a ? a->resume_wifi : false;
+    sr_dispatch_arg_t *a = (sr_dispatch_arg_t *)arg;
+    int command_id = a ? a->command_id : 0;
     if (a) free(a);
 
-    esp_sr_deinit();  /* 内部如在监听会先 stop_listening，最长 ~2 秒 */
+    bool needs_wifi = sr_cmd_needs_wifi(command_id);
+    bool was_active = sr_wifi_was_active;
+    sr_wifi_was_active = false;
 
-    if (resume_wifi) {
-        ESP_LOGI("SR_CMD", "恢复 WiFi 连接");
+    /* 1. 完整释放 SR 资源（~100KB DRAM）。同步等模型/AFE/任务退出。 */
+    esp_sr_deinit();
+    ESP_LOGI("SR_CMD", "SR 已释放, 准备执行命令 id=%d (needs_wifi=%d)",
+             command_id, needs_wifi);
+
+    /* 2. 处理 WiFi：
+     *    - 命令需 WiFi 且 SR 启动前 WiFi 在跑 → resume + 等连上
+     *    - 命令需 WiFi 但 SR 启动前就没 WiFi → 直接 wifi_ok=false（等也没用）
+     *    - 命令不需 WiFi 但 SR 启动前 WiFi 在跑 → 仅 resume，不等（不阻塞）
+     *    - 命令不需 WiFi 且 SR 启动前没 WiFi → 啥也不做 */
+    bool wifi_ok = !needs_wifi;  /* 不需要 WiFi 的命令默认"OK"（不阻塞） */
+
+    if (was_active) {
         wifi_resume_after_game();
+        if (needs_wifi) {
+            /* 轮询等 WiFi 重连（最多 8s）。WiFi 守护任务接管重连，
+             * 这里只是观察 status 变化。 */
+            for (int i = 0; i < 80; i++) {
+                if (wifi_get_status() == WIFI_STATUS_CONNECTED) {
+                    wifi_ok = true;
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+            if (!wifi_ok) {
+                ESP_LOGW("SR_CMD", "等 WiFi 超时(8s)，按未联网处理");
+            }
+        }
+    } else if (needs_wifi) {
+        /* SR 启动前就没 WiFi，命令需要 WiFi：直接判失败 */
+        wifi_ok = false;
     }
+
+    /* 3. 投递回 LVGL 线程。LVGL timer 拿到后会切到目标功能。 */
+    sr_pending_action_t action = {
+        .command_id      = command_id,
+        .wifi_ok         = wifi_ok,
+        .needs_wifi      = needs_wifi,
+        .dispatch_failed = false,
+    };
+    if (sr_pending_action_queue) {
+        xQueueSend(sr_pending_action_queue, &action, 0);
+    }
+
+    /* 不在这里设 state = IDLE！由 LVGL timer 处理完 pending_action 后再设。
+     * 原因：state 切换必须全部在 LVGL 线程做，否则会出现：
+     *   1. 此处 state = IDLE
+     *   2. 用户点菜单（输入事件排队）
+     *   3. LVGL 先处理输入：show_sr_cmd_screen 看 IDLE → 开新 SR
+     *   4. LVGL 再处理 timer：执行 pending_action → 切屏 + 关 SR dialog
+     * 这样新开的 SR 状态弹窗被误删，且屏幕被切走，体验混乱。 */
     vTaskDelete(NULL);
 }
 
-static void sr_cmd_back_cb(lv_event_t *e)
+/* 启动 dispatch 任务。仅在 SR_STATE_ACTIVE 时由 timer 调用，
+ * 调用前会把 sr_state 设为 SR_STATE_DISPATCH（一次性）。
+ *
+ * 失败处理：
+ *   malloc / xTaskCreate 失败时不能在 LVGL 线程做同步 esp_sr_deinit
+ *   （会阻塞 ~2s 卡死 UI）。退而求其次：投递 dispatch_failed 标志的
+ *   pending_action，让 timer 把 state 切回 IDLE。
+ *   SR 资源会泄漏（未 deinit），用户下次再开会失败 —— 详见
+ *   fail_post_pending 处的注释。 */
+static void sr_kick_dispatch(int command_id)
 {
-    if (sr_cmd_active) {
-        /* 不在这里阻塞调 stop_listening，交给后台 teardown 任务 */
-        sr_cmd_active = false;
+    sr_dispatch_arg_t *arg = malloc(sizeof(*arg));
+    if (!arg) {
+        ESP_LOGE("SR_CMD", "dispatch arg 分配失败");
+        goto fail_post_pending;
     }
-    sr_cmd_scr = NULL;
-    sr_cmd_result_lbl = NULL;
-    sr_cmd_status_lbl = NULL;
-    sr_cmd_btn = NULL;
+    arg->command_id = command_id;
+    if (xTaskCreate(sr_dispatch_task, "sr_disp", 4096, arg, 3, NULL) == pdPASS) {
+        return;
+    }
+    ESP_LOGE("SR_CMD", "dispatch task 创建失败");
+    free(arg);
 
-    /* 后台做重活：esp_sr_deinit + wifi_resume_after_game
-     * LVGL 线程直接切屏，不卡顿。*/
-    sr_teardown_arg_t *arg = malloc(sizeof(sr_teardown_arg_t));
-    if (arg) {
-        arg->resume_wifi = sr_wifi_was_active;
-        sr_wifi_was_active = false;
-        xTaskCreate(sr_teardown_task, "sr_td", 4096, arg, 3, NULL);
-    } else {
-        /* malloc 失败时 fallback 同步做，至少不丢释放 */
-        esp_sr_deinit();
-        if (sr_wifi_was_active) {
-            wifi_resume_after_game();
-            sr_wifi_was_active = false;
+fail_post_pending:
+    /* 投递 dispatch_failed 标志：execute_action 看到此标志会跳过功能执行，
+     * 也不会删 sr_status_dialog（用户刚显示的"已关闭"提示需要保留）。
+     * timer 处理完此 action 后切回 IDLE，避免 LVGL 阻塞。
+     *
+     * 注意：SR 资源此处仍占用（无法在 LVGL 线程同步 deinit）。state 已
+     * 切回 IDLE 但底层任务/AFE 还在跑，用户下次菜单点击会走"开启"分支
+     * 调 esp_sr_init —— 此时 esp_sr.c 内部 s_listening=true，start_listening
+     * 会失败。用户需先 toggle 一次（state=IDLE→STARTING→FAIL→IDLE 会
+     * 触发 sr_kick_stop 走 deinit 路径）才能恢复。这是已知降级行为，
+     * malloc/task create 失败本身就是 OOM 边缘场景，不再做更复杂的恢复。 */
+    if (sr_pending_action_queue) {
+        sr_pending_action_t act = {
+            .command_id      = command_id,
+            .wifi_ok         = false,
+            .needs_wifi      = false,
+            .dispatch_failed = true,
+        };
+        xQueueSend(sr_pending_action_queue, &act, 0);
+    }
+}
+
+/* 用户主动关闭 SR：teardown 任务（不投 dispatch action）。
+ * 仅在 SR_STATE_ACTIVE / SR_STATE_STARTING 时调用，调用前置 STOPPING。 */
+typedef struct {
+    bool resume_wifi;
+} sr_stop_arg_t;
+
+static void sr_stop_task(void *arg)
+{
+    sr_stop_arg_t *a = (sr_stop_arg_t *)arg;
+    bool resume_wifi = a ? a->resume_wifi : false;
+    if (a) free(a);
+
+    esp_sr_deinit();
+    if (resume_wifi) {
+        ESP_LOGI("SR_CMD", "用户关闭 SR，恢复 WiFi");
+        wifi_resume_after_game();
+    }
+    sr_state = SR_STATE_IDLE;
+    vTaskDelete(NULL);
+}
+
+/* 失败时同 sr_kick_dispatch：不在 LVGL 线程同步 deinit，投递 pending_action
+ * 让 timer 切回 IDLE。 */
+static void sr_kick_stop(void)
+{
+    bool actually_resume = sr_wifi_was_active;
+    sr_wifi_was_active = false;
+
+    sr_stop_arg_t *arg = malloc(sizeof(*arg));
+    if (!arg) {
+        ESP_LOGE("SR_CMD", "stop arg 分配失败");
+        goto fail_post_pending;
+    }
+    arg->resume_wifi = actually_resume;
+    if (xTaskCreate(sr_stop_task, "sr_stop", 4096, arg, 3, NULL) == pdPASS) {
+        return;
+    }
+    ESP_LOGE("SR_CMD", "stop task 创建失败");
+    free(arg);
+
+fail_post_pending:
+    /* 投递 dispatch_failed=true：execute_action 会跳过执行，特别是不会删
+     * sr_status_dialog（用户刚通过 show_sr_cmd_screen 显示了"已关闭"
+     * 提示，必须保留让用户看到关闭意图已被记录）。
+     *
+     * SR 资源此处未释放，下次重新开启同 sr_kick_dispatch 注释（已知降级）。 */
+    if (sr_pending_action_queue) {
+        sr_pending_action_t act = {
+            .command_id      = 0,
+            .wifi_ok         = false,
+            .needs_wifi      = false,
+            .dispatch_failed = true,
+        };
+        xQueueSend(sr_pending_action_queue, &act, 0);
+    }
+}
+
+/* 在 LVGL 线程执行真正的功能跳转。dispatch task 投递 sr_pending_action
+ * 后，timer 取到这个结构 → 调用本函数。
+ *
+ * 此时 SR 已完全释放（~100KB DRAM 已归还），WiFi 已就绪（若需要），
+ * 跳转目标资源无冲突。 */
+static void sr_execute_action(const sr_pending_action_t *act)
+{
+    /* fallback 路径：worker 启动失败（malloc/xTaskCreate 失败），SR 资源
+     * 仍然占用，且 sr_status_dialog 可能是用户刚显示的"已关闭"提示
+     * （sr_kick_stop fallback 走这里）。这种情况下不能删 dialog 也不能
+     * 开任何功能，timer 把 state 切回 IDLE 后直接返回。 */
+    if (act->dispatch_failed) {
+        ESP_LOGW("SR_CMD", "dispatch worker 启动失败，跳过功能执行");
+        return;
+    }
+
+    /* 关掉 SR 状态弹窗，让位给目标功能 */
+    if (sr_status_dialog && lv_obj_is_valid(sr_status_dialog)) {
+        lv_obj_delete(sr_status_dialog);
+        sr_status_dialog = NULL;
+    }
+
+    /* 需 WiFi 但未就绪：弹提示后退出 */
+    if (act->needs_wifi && !act->wifi_ok) {
+        const char *zh;
+        switch (act->command_id) {
+            case 2:  zh = "天气查询"; break;
+            case 4:  zh = "聊天";     break;
+            case 5:  zh = "语音助手"; break;
+            case 9:  zh = "智能设备"; break;
+            default: zh = "该功能";   break;
+        }
+        char msg[80];
+        snprintf(msg, sizeof(msg), "请先连接 WiFi\n%s 需要联网", zh);
+        create_result_dialog(msg, 0xffaa00);
+        return;
+    }
+
+    switch (act->command_id) {
+        case 1:  /* 打开环境监测 */
+            create_result_dialog("环境监测\n功能开发中", 0x00cfff);
+            break;
+        case 2:  /* 打开天气和日期 */
+            if (weather_fetching) return;
+            s_weather_cancelled = false;
+            { weather_result_t drained; while (xQueueReceive(weather_result_queue, &drained, 0) == pdTRUE) {} }
+            weather_fetching = true;
+            weather_spinner_cont = create_loading_dialog("Fetching Weather...", weather_cancel_btn_cb);
+            xTaskCreatePSRAM(weather_fetch_task, "weather_task", 16384, NULL, 3, NULL);
+            break;
+        case 3:  /* 打开游戏 */
+            show_game_screen();
+            break;
+        case 4:  /* 打开聊天助手 */
+            show_chat_screen();
+            break;
+        case 5:  /* 打开语音助手 */
+            show_asr_screen();
+            break;
+        case 6:  /* 打开蓝牙 */
+            show_ble_screen();
+            break;
+        case 7:  /* 打开音乐 */
+            show_music_screen();
+            break;
+        case 8:  /* 打开音量 */
+            show_volume_screen();
+            break;
+        case 9:  /* 打开智能设备 */
+            show_bemfa_screen();
+            break;
+        default:
+            ESP_LOGW("SR_CMD", "未知命令 ID=%d", act->command_id);
+            break;
+    }
+}
+
+/* LVGL timer：轮询三个队列：
+ *   - 启动结果（start_task → 显示成功/失败弹窗）
+ *   - 识别结果（detect_task → 触发 dispatch task）
+ *   - 待执行命令（dispatch_task → 真正打开功能） */
+static void sr_cmd_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+
+    /* 启动结果 */
+    if (sr_start_result_queue) {
+        sr_start_result_t sr_res;
+        if (xQueueReceive(sr_start_result_queue, &sr_res, 0) == pdTRUE) {
+            if (sr_status_dialog && lv_obj_is_valid(sr_status_dialog)) {
+                lv_obj_delete(sr_status_dialog);
+                sr_status_dialog = NULL;
+            }
+            switch (sr_res) {
+                case SR_START_OK:
+                    sr_state = SR_STATE_ACTIVE;
+                    sr_status_dialog = create_result_dialog(
+                        "语音命令已开启\n请说出命令", 0x00cfff);
+                    break;
+                case SR_START_FAIL_INIT:
+                    sr_status_dialog = create_result_dialog(
+                        "语音识别初始化失败\n检查 model 分区", 0xff0000);
+                    /* 启动失败需要把 WiFi 还原回去 */
+                    sr_state = SR_STATE_STOPPING;
+                    sr_kick_stop();
+                    break;
+                case SR_START_FAIL_LISTEN:
+                    sr_status_dialog = create_result_dialog(
+                        "语音监听启动失败", 0xff0000);
+                    sr_state = SR_STATE_STOPPING;
+                    sr_kick_stop();
+                    break;
+            }
+            if (sr_status_dialog) {
+                lv_obj_add_event_cb(sr_status_dialog, sr_status_dialog_delete_cb,
+                                    LV_EVENT_DELETE, NULL);
+            }
         }
     }
 
-    lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
-    indev_set_group(group);
+    /* 识别结果 → 触发 dispatch */
+    if (sr_cmd_result_queue) {
+        sr_cmd_result_t res;
+        if (xQueueReceive(sr_cmd_result_queue, &res, 0) == pdTRUE) {
+            /* 只在 ACTIVE 状态下接受新命令；其他状态丢弃（防止 dispatch
+             * 进行中又收到第二条识别结果导致并发） */
+            if (sr_state == SR_STATE_ACTIVE) {
+                ESP_LOGI("SR_CMD", "命令分发: id=%d, str=%s, prob=%.2f",
+                         res.command_id, res.command_str, res.probability);
+                sr_state = SR_STATE_DISPATCH;
+                sr_kick_dispatch(res.command_id);
+            } else {
+                ESP_LOGW("SR_CMD", "状态=%d，忽略识别结果 id=%d",
+                         (int)sr_state, res.command_id);
+            }
+        }
+    }
+
+    /* 待执行命令 → 切换到目标功能 */
+    if (sr_pending_action_queue) {
+        sr_pending_action_t act;
+        if (xQueueReceive(sr_pending_action_queue, &act, 0) == pdTRUE) {
+            sr_execute_action(&act);
+            /* 执行完才切回 IDLE。这一步必须在 LVGL 线程做，避免与
+             * show_sr_cmd_screen 的 state 检查竞态（dispatch worker
+             * 提前设 IDLE 会导致 toggle 重开 → 屏幕被 action 抢走）。 */
+            sr_state = SR_STATE_IDLE;
+        }
+    }
+}
+
+/* SR 异步启动任务：避免 wifi_suspend + esp_sr_init 阻塞 LVGL 线程。
+ * 总耗时可达 ~2.5s（300ms wifi 释放 + 2s 模型加载 + AFE 创建）。 */
+static void sr_start_task(void *arg)
+{
+    (void)arg;
+
+    /* 1. 暂停 WiFi（如在跑）：ESP-SR + WiFi 共存时内部 DRAM 紧张
+     * esp_timer_create 会 ESP_ERR_NO_MEM 崩溃。 */
+    if (sr_wifi_was_active) {
+        ESP_LOGI("SR_CMD", "WiFi 活跃，先挂起以释放 DRAM");
+        wifi_suspend_for_game();
+        vTaskDelay(pdMS_TO_TICKS(300));  /* 等 WiFi buffer 归还 */
+    }
+
+    /* 2. esp_sr_init：加载模型 + 创建 AFE + MultiNet */
+    if (!esp_sr_init()) {
+        sr_start_result_t r = SR_START_FAIL_INIT;
+        if (sr_start_result_queue) xQueueSend(sr_start_result_queue, &r, 0);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* 3. start_listening：创建 read/feed/detect 任务 */
+    if (!esp_sr_start_listening(sr_cmd_result_cb)) {
+        sr_start_result_t r = SR_START_FAIL_LISTEN;
+        if (sr_start_result_queue) xQueueSend(sr_start_result_queue, &r, 0);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    sr_start_result_t r = SR_START_OK;
+    if (sr_start_result_queue) xQueueSend(sr_start_result_queue, &r, 0);
+    vTaskDelete(NULL);
+}
+
+/* 菜单点击"语音命令"：toggle 开关。
+ * 状态机保证 STARTING/DISPATCH/STOPPING 中点击不会导致并发。 */
+static void show_sr_cmd_screen(void)
+{
+    /* 中间态：忽略点击，避免双击竞态（Bug 4） */
+    if (sr_state == SR_STATE_STARTING ||
+        sr_state == SR_STATE_DISPATCH ||
+        sr_state == SR_STATE_STOPPING) {
+        ESP_LOGW("SR_CMD", "SR 忙(state=%d)，忽略 toggle", (int)sr_state);
+        return;
+    }
+
+    if (sr_state == SR_STATE_ACTIVE) {
+        /* 关闭 */
+        sr_state = SR_STATE_STOPPING;
+        sr_kick_stop();
+        if (sr_status_dialog && lv_obj_is_valid(sr_status_dialog)) {
+            lv_obj_delete(sr_status_dialog);
+            sr_status_dialog = NULL;
+        }
+        sr_status_dialog = create_result_dialog("语音命令已关闭", 0x888888);
+        if (sr_status_dialog) {
+            lv_obj_add_event_cb(sr_status_dialog, sr_status_dialog_delete_cb,
+                                LV_EVENT_DELETE, NULL);
+        }
+        return;
+    }
+
+    /* 开启：先创建结果队列（懒加载，避免常驻 RAM）*/
+    if (!sr_cmd_result_queue) {
+        sr_cmd_result_queue = xQueueCreate(4, sizeof(sr_cmd_result_t));
+    }
+    if (!sr_start_result_queue) {
+        sr_start_result_queue = xQueueCreate(2, sizeof(sr_start_result_t));
+    }
+    if (!sr_pending_action_queue) {
+        sr_pending_action_queue = xQueueCreate(2, sizeof(sr_pending_action_t));
+    }
+    if (!sr_cmd_result_queue || !sr_start_result_queue || !sr_pending_action_queue) {
+        create_result_dialog("内存不足", 0xff0000);
+        return;
+    }
+
+    /* 记录 WiFi 状态用于后续恢复 */
+    wifi_status_t wst = wifi_get_status();
+    sr_wifi_was_active = (wst == WIFI_STATUS_CONNECTED ||
+                          wst == WIFI_STATUS_CONNECTING ||
+                          wst == WIFI_STATUS_RECONNECTING);
+
+    sr_state = SR_STATE_STARTING;
+
+    if (xTaskCreate(sr_start_task, "sr_start", 4096, NULL, 3, NULL) != pdPASS) {
+        sr_state = SR_STATE_IDLE;
+        create_result_dialog("启动任务创建失败", 0xff0000);
+        return;
+    }
+
+    const char *msg = sr_wifi_was_active
+        ? "正在启动语音识别...\n(暂停 WiFi 中)"
+        : "正在启动语音识别...";
+    sr_status_dialog = create_result_dialog(msg, 0x1E90FF);
+    if (sr_status_dialog) {
+        lv_obj_add_event_cb(sr_status_dialog, sr_status_dialog_delete_cb,
+                            LV_EVENT_DELETE, NULL);
+    }
 }
 
 // ================================================================
@@ -934,100 +1330,6 @@ static void show_ble_screen(void)
     if (ble_result_dialog) {
         lv_obj_add_event_cb(ble_result_dialog, ble_result_dialog_delete_cb, LV_EVENT_DELETE, NULL);
     }
-}
-
-static void show_sr_cmd_screen(void)
-{
-    /* ESP-SR 和 WiFi 驱动共存会让内部 DRAM 紧张，esp_timer_create 会
-     * ESP_ERR_NO_MEM 崩溃。进入前先暂停 WiFi，退出时恢复。 */
-    wifi_status_t wst = wifi_get_status();
-    sr_wifi_was_active = (wst == WIFI_STATUS_CONNECTED ||
-                          wst == WIFI_STATUS_CONNECTING ||
-                          wst == WIFI_STATUS_RECONNECTING);
-    if (sr_wifi_was_active) {
-        ESP_LOGI("SR_CMD", "WiFi 活跃，先挂起以释放 DRAM");
-        wifi_suspend_for_game();
-        vTaskDelay(pdMS_TO_TICKS(300));  /* 等 WiFi buffer 归还 */
-    }
-
-    /* 懒加载 ESP-SR：仅在进入此界面时初始化，退出时释放 */
-    if (!esp_sr_init()) {
-        /* init 失败了，把 WiFi 状态还原 */
-        if (sr_wifi_was_active) {
-            wifi_resume_after_game();
-            sr_wifi_was_active = false;
-        }
-        create_result_dialog("ESP-SR 初始化失败\n检查 model 分区", 0xff0000);
-        return;
-    }
-
-    sr_cmd_scr = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(sr_cmd_scr, lv_color_hex(0x0f3460), 0);
-    lv_obj_set_style_pad_all(sr_cmd_scr, 0, 0);
-
-    /* 标题 */
-    lv_obj_t *title = lv_label_create(sr_cmd_scr);
-    lv_label_set_text(title, "语音命令");
-    lv_obj_set_style_text_color(title, lv_color_hex(0xe94560), 0);
-    lv_obj_set_style_text_font(title, &lv_font_simhei_16, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
-
-    /* 返回按钮 */
-    lv_obj_t *back_btn = lv_button_create(sr_cmd_scr);
-    lv_obj_set_size(back_btn, 40, 24);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 4, 4);
-    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0xe94560), 0);
-    lv_obj_add_event_cb(back_btn, sr_cmd_back_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *back_lbl = lv_label_create(back_btn);
-    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT);
-    lv_obj_center(back_lbl);
-
-    /* 结果显示区 */
-    lv_obj_t *result_cont = lv_obj_create(sr_cmd_scr);
-    lv_obj_set_size(result_cont, LCD_W - 10, 160);
-    lv_obj_align(result_cont, LV_ALIGN_TOP_MID, 0, 36);
-    lv_obj_set_style_bg_color(result_cont, lv_color_hex(0x16213e), 0);
-    lv_obj_set_style_border_width(result_cont, 0, 0);
-    lv_obj_set_style_pad_all(result_cont, 6, 0);
-
-    sr_cmd_result_lbl = lv_label_create(result_cont);
-    lv_label_set_text(sr_cmd_result_lbl, "按下方按钮开始识别\n支持命令: 返回/确认/查看天气/打开游戏 等");
-    lv_obj_set_style_text_color(sr_cmd_result_lbl, lv_color_hex(0xffffff), 0);
-    lv_obj_set_style_text_font(sr_cmd_result_lbl, &lv_font_simhei_16, 0);
-    lv_label_set_long_mode(sr_cmd_result_lbl, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(sr_cmd_result_lbl, LCD_W - 22);
-
-    /* 状态标签 */
-    sr_cmd_status_lbl = lv_label_create(sr_cmd_scr);
-    lv_label_set_text(sr_cmd_status_lbl, "就绪");
-    lv_obj_set_style_text_color(sr_cmd_status_lbl, lv_color_hex(0x888888), 0);
-    lv_obj_set_style_text_font(sr_cmd_status_lbl, &lv_font_simhei_16, 0);
-    lv_obj_align(sr_cmd_status_lbl, LV_ALIGN_BOTTOM_MID, 0, -50);
-
-    /* 操作按钮 */
-    sr_cmd_btn = lv_button_create(sr_cmd_scr);
-    lv_obj_set_size(sr_cmd_btn, 120, 40);
-    lv_obj_align(sr_cmd_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
-    lv_obj_set_style_bg_color(sr_cmd_btn, lv_color_hex(0x16213e), 0);
-    lv_obj_set_style_border_color(sr_cmd_btn, lv_color_hex(0xe94560), 0);
-    lv_obj_set_style_border_width(sr_cmd_btn, 2, 0);
-    lv_obj_add_event_cb(sr_cmd_btn, sr_cmd_btn_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *btn_txt = lv_label_create(sr_cmd_btn);
-    lv_label_set_text(btn_txt, "开始识别");
-    lv_obj_set_style_text_color(btn_txt, lv_color_hex(0xffffff), 0);
-    lv_obj_set_style_text_font(btn_txt, &lv_font_simhei_16, 0);
-    lv_obj_center(btn_txt);
-
-    /* 编码器 group */
-    lv_group_t *sg = lv_group_create();
-    lv_group_add_obj(sg, sr_cmd_btn);
-    lv_group_add_obj(sg, back_btn);
-    indev_set_group(sg);
-    lv_group_focus_obj(sr_cmd_btn);
-    lv_obj_add_event_cb(sr_cmd_scr, group_delete_cb, LV_EVENT_DELETE, sg);
-
-    lv_timer_create(sr_cmd_timer_cb, 50, NULL);
-    lv_screen_load_anim(sr_cmd_scr, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
 }
 
 static void show_asr_screen(void)
@@ -2420,6 +2722,9 @@ void my_demo(void)
 
 
     lv_timer_create(wifi_status_timer_cb, 500, NULL);
+    /* SR 命令分发 timer：每 100ms 轮询启动结果队列 + 识别结果队列。
+     * 即使 SR 未启用也跑（cheap，只查队列），无需根据 sr_cmd_active 启停。 */
+    lv_timer_create(sr_cmd_timer_cb, 100, NULL);
 }
 
 lv_group_t *my_demo_get_group(void)
