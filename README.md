@@ -73,12 +73,12 @@ A/B 相由 PCNT 硬件正交解码，SW 按键 5ms 轮询状态机（20ms 防抖
 
 | 功能 | ESP32-S3 引脚 | MPU6050 引脚 |
 |------|---------------|--------------|
-| SDA  | GPIO13 | SDA |
+| SDA  | GPIO20 | SDA |
 | SCL  | GPIO7  | SCL |
 | 3.3V | 3.3V   | VCC |
 | GND  | GND    | GND、AD0（地址 0x68）|
 
-400kHz I2C，±2g 量程，DLPF 44Hz。仅在进入 2048 游戏时初始化，退出后释放总线。倾斜阈值 0.30g，X/Y 主导轴判定方向，平放时无输入。
+400kHz I2C，±2g 量程，DLPF 44Hz。仅在进入 2048 游戏时初始化，退出后释放总线。倾斜判定使用滞后阈值（ENTER=0.30g, EXIT=0.15g）+ 方向锁定，X/Y 主导轴决定方向，平放时无输入。该设计可消除"倾斜回弹到平放过程中误判反向"的抖动问题。
 
 ### MicroSD 卡（SPI3_HOST）
 
@@ -167,7 +167,7 @@ bot/
 - **游戏** — 内置 2048 游戏（无需 SD 卡）+ 扫描 SD 卡 `/sdcard/rom/` 中的 .gb/.gbc ROM 文件运行 Game Boy 模拟器
 - **聊天助手** — 屏幕键盘输入文字，调用 LLM API 获取回复，滚动对话记录
 - **语音助手** — 在线流程：录音 → 百度 ASR 识别 → LLM 回复 → 百度 TTS 合成播放
-- **语音命令** — 离线 ESP-SR 中文命令词识别（按钮触发，无需唤醒词）
+- **语音命令** — 离线 ESP-SR 中文命令词识别开关（类似蓝牙开关，菜单点击即 toggle 开/关，无独立界面）；识别到命令后自动关闭 SR 并跳转到对应功能
 - **蓝牙** — 开启 BLE 广播，手机发送 "SSID_xxx password_xxx" 配网后自动连接 WiFi；支持 BLE 远程音乐控制（`/music on` 列歌、`/序号` 播放、`/music off` 停止）
 - **音乐** — 扫描 SD 卡 `/sdcard/music/` 下的 WAV / MP3 文件，选择播放（支持暂停/切歌）
 - **音量** — 滑块调节音量（0-100%），对数增益曲线，NVS 持久化，重启自动恢复
@@ -210,12 +210,55 @@ MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 
 ### 5. 语音命令（离线 ESP-SR）
 
-使用 ESP-SR 的 MultiNet7 中文离线命令词识别，无需网络：
+使用 ESP-SR 的 MultiNet7 中文离线命令词识别，无需网络。功能为 toggle 开关式（同蓝牙开关），菜单点击"语音命令"即开启 / 关闭，识别到命令后自动跳转到对应功能。
 
-- 按键触发识别（无需唤醒词），AFE 噪声抑制 + VAD
-- 预定义 11 个中文命令：返回、确认、取消、连接网络、查看天气、打开游戏、打开聊天、语音助手、退出游戏、调大音量、调小音量
-- I2S_NUM_0 与在线 ASR 共享，通过 deinit/reinit 切换
-- 任务生命周期安全：graceful stop + 超时硬杀 + 资源泄漏保护
+**命令词列表（9 条，全部以"打开"前缀以提升识别区分度）：**
+
+| ID | 命令词（拼音） | 功能 | 需要 WiFi |
+|----|--------------|------|-----------|
+| 1 | dakai huanjing jiance（打开环境监测）| 环境监测占位 | 否 |
+| 2 | dakai tianqi he riqi（打开天气和日期）| 天气查询 | 是 |
+| 3 | dakai youxi（打开游戏）| 进入游戏列表 | 否 |
+| 4 | dakai liaotian zhushou（打开聊天助手）| 聊天助手 | 是 |
+| 5 | dakai yuyin zhushou（打开语音助手）| 在线 ASR + LLM + TTS | 是 |
+| 6 | dakai lanya（打开蓝牙）| BLE 配网 | 否 |
+| 7 | dakai yinyue（打开音乐）| SD 卡音乐播放器 | 否 |
+| 8 | dakai yinliang（打开音量）| 音量调节 | 否 |
+| 9 | dakai zhineng shebei（打开智能设备）| 巴法云控制 | 是 |
+
+**识别 → 跳转流程（5 状态机）：**
+
+```
+IDLE  ──toggle──▶ STARTING ──init+listen ok──▶ ACTIVE
+                     │                            │
+                     └─失败─▶ STOPPING ─▶ IDLE   ↓ 识别到命令词
+                                                DISPATCH
+                                                   │
+              ┌────────────────────────────────────┘
+              ▼
+   esp_sr_deinit (~2s 同步)
+              │
+   ┌─需 WiFi 但 SR 启动前未联网─▶ 弹"请连接 WiFi"提示
+   │
+   └─其他 ──▶ wifi_resume_after_game (若需要) ──▶ 等待 WiFi 就绪 (≤8s)
+                                                     │
+                              ┌──────────────────────┘
+                              ▼
+                  投递 sr_pending_action 到 LVGL ──▶ show_xxx_screen
+                                                       │
+                                                       ▼
+                                                     IDLE
+```
+
+**关键设计：**
+
+- **关闭降噪提升识别率**：禁用 NSNet2 降噪（官方建议：NS 会降低识别率）
+- **状态机由 LVGL 线程统一切换**：所有 `sr_state` 写入只在 LVGL 线程做，后台任务（启动/dispatch/stop）只读不写，避免双击 toggle 与异步任务竞态
+- **WiFi 守卫前置**：识别到需联网命令时若未连网，先弹提示再跳转，避免功能开启后才发现无网
+- **资源串行化**：识别 → 释放 SR 内存（~100KB）→ 恢复 WiFi → 等连上 → 跳转，确保跳转目标功能不与 SR 模型/任务争用 DRAM
+- **失败降级**：worker 任务（malloc/xTaskCreate）失败时投递 `dispatch_failed=true` 标志而非阻塞 LVGL 同步释放 SR；execute_action 看到该标志会保留"已关闭"弹窗并切回 IDLE
+- **AFE 警告抑制**：`esp_log_level_set("AFE", ESP_LOG_ERROR)` 屏蔽 deinit 时残留 ringbuf 的非致命警告
+- **I2S 与在线 ASR 共享**：通过 deinit/reinit 切换，使用 32bit STEREO Philips 配置（与 asr.c 一致），软件转 16bit MONO 喂入 AFE
 
 ### 6. BLE 蓝牙配网与远程音乐控制
 
@@ -292,11 +335,14 @@ SD 卡音乐播放，支持 WAV 和 MP3 格式：
 通过巴法云 TCP 设备云 HTTP REST API 控制已绑定的智能设备：
 
 - **设备列表**：GET `/vb/api/v2/allTopic` 拉取所有主题，兼容扁平 / 嵌套两种 JSON 响应结构
-- **设备控制**：POST `/va/postJsonMsg` 推送 "on" / "off" 消息，点击按钮自动 toggle
+- **单设备状态查询**：GET `/vb/api/v2/topicInfo` 仅查一个主题最新 msg / online，响应 < 200B，避免每次发送都重拉整表（10KB+）
+- **发送消息**：POST `/va/postJsonMsg` 推送 "on" / "off"（也支持自定义 msg），调用方完全决定要发送的内容，不依赖云端 msg 字段推断
+- **toggle 兼容封装**：`bemfa_toggle` 仍保留，根据 current_msg 自动取反；UI 默认走"明确发送"路径
+- **UI 交互**：点击设备弹出"开启 / 关闭 / 取消"三按钮对话框，由用户选要发的消息；发送后行 label 立即 optimistic 翻新状态，1.2 秒后单设备查询回填权威状态；发送失败自动整表刷新还原
 - **线程安全**：模块级 mutex 串行化 HTTPS 请求，避免两个 HTTP client 并发引发 mbedTLS 冲突
 - **PSRAM 动态缓冲**：HTTP 响应从 4KB 起步按需 2 倍扩容到最大 32KB，API 返回后立即释放
 - **异步 UI**：后台 PSRAM 任务执行 HTTPS 操作，通过 FreeRTOS Queue + lv_timer 轮询更新 UI，LVGL 线程零阻塞
-- **屏幕生命周期安全**：mutex + active 标志保护 Queue 句柄，退出屏幕时后台任务检测到 inactive 后丢弃结果而非写入已删除队列
+- **屏幕生命周期安全**：mutex + active 标志保护 list / send / info 三个 Queue 句柄，退出屏幕时后台任务检测到 inactive 后丢弃结果而非写入已删除队列
 
 ---
 
@@ -327,7 +373,8 @@ SD 卡音乐播放，支持 WAV 和 MP3 格式：
 | `esp_sr_detect` | 5 | 6144 B | ESP-SR MultiNet 命令检测（Core 1） |
 | `kpad_task` | 6 | 4096 B | 按键矩阵扫描（2ms 周期） |
 | `bemfa_list` | 3 | 8192 B (PSRAM) | 巴法云设备列表 HTTPS 请求（一次性） |
-| `bemfa_toggle` | 3 | 8192 B (PSRAM) | 巴法云设备 toggle HTTPS 请求（一次性） |
+| `bemfa_send` | 3 | 8192 B (PSRAM) | 巴法云推送 on/off HTTPS 请求（一次性） |
+| `bemfa_info` | 3 | 8192 B (PSRAM) | 巴法云单设备状态回填查询（一次性） |
 | `ble_mstop` | 3 | 2048 B (DRAM) | BLE 触发的异步音乐停止（一次性） |
 | `health` | 1 | 2048 B | 堆内存监控（60s 周期） |
 
@@ -406,8 +453,15 @@ cp user/bemfa_config.h.example user/bemfa_config.h
 ```bash
 idf.py set-target esp32s3
 idf.py build
+# Windows:
 idf.py -p COM5 -b 2000000 flash
+# Linux:
+idf.py -p /dev/ttyUSB0 -b 2000000 flash
 ```
+
+> Linux 下若提示 `/dev/ttyUSB0` 权限不足，将用户加入 dialout 组：`sudo usermod -aG dialout $USER` 后重新登录；或临时执行 `sudo chmod 666 /dev/ttyUSB0`。
+
+> 工程同时支持 Windows 与 Linux 开发：`.vscode/settings.json` 与 `.vscode/tasks.json` 中两套配置并存，Linux 路径默认生效，Windows 路径以注释保留。
 
 ---
 
@@ -427,7 +481,7 @@ idf.py -p COM5 -b 2000000 flash
 | mbedTLS | PSRAM 分配 | SSL 从 PSRAM 分配，减少内部 DRAM 碎片 |
 | Bluetooth LE | NimBLE | 比 Bluedroid 节省 ~40KB DRAM，仅外设角色 |
 | BT/WiFi 共存 | 启用 | BLE + WiFi 同时活跃时必需 |
-| ESP-SR | MultiNet7 CN | 离线中文命令词 + NSNet2 降噪 + VADNet1 |
+| ESP-SR | MultiNet7 CN | 离线中文命令词；NSNet2 降噪关闭以提升识别率；VADNet1 启用 |
 | FATFS 长文件名 | 启用（堆分配） | 支持中文文件名（UTF-8 API + GBK 代码页 936） |
 | FreeRTOS HZ | 1000 | 1ms tick 精度 |
 
@@ -532,7 +586,7 @@ I2S_NUM_0 被在线 ASR（`asr.c`）和离线 ESP-SR（`esp_sr.c`）共享，通
 - **WiFi 守护任务**：首次连接 EventGroup 等待 + 快速重试 3 次；运行期断线自动指数退避重连（5s → 5min），永不放弃；用户主动断开则停止守护；`wifi_full_shutdown_for_ble()` 通过 `GUARDIAN_NOTIFY_SHUTDOWN` 通知守护任务协作式退出，避免 `vTaskDelete` 硬杀导致 mutex 死锁
 - **BLE deinit 防护**：`s_deinit_in_progress` 门锁防止双拆；`s_pending_host_calls` 计数器等待跨任务 NimBLE API 调用完成后再拆 host；`s_adv_gen` 代际计数器防止 stop 后残留广播（ghost advertising）
 - **BLE timer 竞态修复**：`accumulate_rx` 的 `xTimerReset` 移入 LOCK 块内，与 deinit 路径的 `s_rx_timer = NULL` 互斥，消除 UAF 窗口
-- **任务生命周期安全**：ESP-SR 三个任务（read/feed/detect）通过 graceful stop + 2 秒超时硬杀 + ring buffer 残留保护，避免资源泄漏；音乐播放器的 `music_stop` 采用 10 轮 ×200ms 轮询确认旧任务退出，防止快速切歌产生僵尸任务
+- **任务生命周期安全**：ESP-SR 三个任务（read/feed/detect）通过 graceful stop + 2 秒超时硬杀 + ring buffer 残留保护，避免资源泄漏；ESP-SR 上层用 5 状态机（IDLE/STARTING/ACTIVE/DISPATCH/STOPPING）统一管理 toggle、识别分发、用户主动关闭三类异步流程，所有 `sr_state` 切换均在 LVGL 线程，杜绝双击竞态和 worker 提前置 IDLE 导致的 dialog 抢屏；音乐播放器的 `music_stop` 采用 10 轮 ×200ms 轮询确认旧任务退出，防止快速切歌产生僵尸任务
 - **NULL 指针防护**：所有 `malloc` / `xTaskCreatePSRAM` 返回值均检查，失败时安全回退（UI 提示"内存不足"）而非解引用崩溃
 - **异步取消语义**：天气查询支持真正的取消（`s_weather_cancelled` 标志 + drain queue + 双重检查），取消后后台任务完成也不会弹出界面
 - **LVGL 对象生命周期**：BLE 结果弹窗通过 `LV_EVENT_DELETE` 回调统一清零全局句柄，覆盖所有销毁路径（OK 按钮 / 父屏切换 / 显式 delete），消除悬空指针

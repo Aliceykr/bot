@@ -50,13 +50,18 @@ typedef struct {
 bool bemfa_list_devices(bemfa_device_t *out_list, int *out_count);
 
 /**
- * @brief 给指定主题推送消息
+ * @brief 给指定主题推送消息（POST /va/postJsonMsg）
+ *
+ * 文档：https://cloud.bemfa.com/docs/src/api_device.html#推送消息
  *
  * @param topic  主题值
  * @param msg    消息内容（"on" / "off" / 自定义）
  * @return true 推送成功；false HTTP 失败
  *
  * 阻塞时长：通常 1-2 秒
+ *
+ * 注意：msg 不会被 JSON 转义，调用方需保证不含 " 和 \。
+ *      固定值 "on" / "off" 安全，自定义场景消息要在调用前转义。
  */
 bool bemfa_push_msg(const char *topic, const char *msg);
 
@@ -73,5 +78,35 @@ bool bemfa_push_msg(const char *topic, const char *msg);
  * @return true 推送成功
  */
 bool bemfa_toggle(const char *topic, const char *current_msg, char *new_msg_out, size_t cap);
+
+/**
+ * @brief 查询单个主题最新状态（GET /vb/api/v2/topicInfo）
+ *
+ * 文档：https://cloud.bemfa.com/docs/src/api_device.html#获取单个主题信息
+ *
+ * 推送 on/off 后服务端 msg 字段需要 1-2 秒才会更新。比起重新拉
+ * allTopic 全表（响应可能 10KB+），单设备查询响应 < 200B，更快更省。
+ *
+ * @param topic  主题值
+ * @param out    调用方提供的设备结构，topic 字段会被写为传入值，
+ *               其余字段从 API 响应填充
+ * @return true 查询成功（HTTP 200 + code=0）
+ *
+ * 阻塞时长：通常 1-2 秒
+ */
+bool bemfa_get_topic_info(const char *topic, bemfa_device_t *out);
+
+/**
+ * @brief 语义化发送：等价于 bemfa_push_msg，但参数顺序更直观
+ *
+ * 发送任意消息到指定主题，不做"自动取反"那种推断，UI 调用方完全决定
+ * msg 内容（"on" / "off" / 自定义）。建议优先使用此 API 而非 toggle，
+ * 避免依赖云端 msg 字段同步状态。
+ *
+ * @param topic  主题值
+ * @param msg    要发送的消息
+ * @return true 成功
+ */
+bool bemfa_send(const char *topic, const char *msg);
 
 #endif

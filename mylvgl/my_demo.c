@@ -2255,12 +2255,19 @@ static void show_volume_screen(void)
 // 智能设备界面（巴法云 TCP 设备云）
 //
 // 流程：
-//   1. 进入界面 → 显示 "加载中..." spinner
-//   2. 后台任务 PSRAM 栈 bemfa_list_task 调 bemfa_list_devices（阻塞 HTTPS）
-//   3. 结果投进 queue，UI 定时 timer 消费 queue，绘制设备列表
-//   4. 每个设备是一个 list button，显示"名称  [on/off]"
-//   5. 点击 → 后台 bemfa_toggle_task 调 bemfa_toggle
-//   6. toggle 成功后再跑一次后台 list 刷新 UI
+//   1. 进入界面 → 后台 PSRAM 栈 bemfa_list_task 调 bemfa_list_devices
+//   2. 结果投 queue，UI 定时 timer 消费 → bemfa_render_list 绘制
+//   3. 点击设备 → 弹 "开启 / 关闭 / 取消" 对话框，由用户决定要发的 msg
+//   4. 用户选 on/off → 后台 bemfa_send_task 调 bemfa_send 推送
+//   5. 推送成功后做 optimistic 更新（行 label 立即翻状态），并触发后台
+//      bemfa_info_task 单设备查询，回填权威状态
+//
+// 设计要点（对比旧实现）：
+//   - 旧版只有"toggle"，依赖 list 返回的 msg 字段推断下一个发什么；
+//     msg 字段缺失时永远只能发 on，无法直接关。新版让用户明确选择。
+//   - 旧版 toggle 后整表 allTopic 重拉（响应可能 10KB+/2s），新版只查
+//     单设备（topicInfo，<200B），UI 反馈更快。
+//   - "返回"按钮和滚动刷新（手动）保留为整表刷新路径。
 //
 // 前提：
 //   WiFi 必须已连接，未连提示"请先连接 WiFi"
@@ -2273,16 +2280,18 @@ static lv_obj_t    *bemfa_list        = NULL;
 static lv_obj_t    *bemfa_spinner     = NULL;
 static lv_obj_t    *bemfa_status_lbl  = NULL;
 static lv_timer_t  *bemfa_poll_timer  = NULL;
-static QueueHandle_t bemfa_list_queue  = NULL;   /* bemfa_device_t 数组投递 */
-static QueueHandle_t bemfa_toggle_queue = NULL;  /* bool 结果投递 */
+static QueueHandle_t bemfa_list_queue  = NULL;   /* bemfa_list_result_t* */
+static QueueHandle_t bemfa_send_queue  = NULL;   /* bemfa_send_result_t */
+static QueueHandle_t bemfa_info_queue  = NULL;   /* bemfa_info_result_t* */
 static lv_group_t  *bemfa_group       = NULL;
+static lv_obj_t    *bemfa_action_dlg  = NULL;    /* 当前打开的发送选择对话框 */
 
 /* 后台任务与 LVGL 线程的同步（H1 防护）：
- *   bemfa_scr_delete_cb 置 active=false 并持锁删除 queue
+ *   bemfa_scr_delete_cb 置 active=false 并持锁清空 queue 句柄
  *   后台任务完成时锁内检查 active：
  *     active=true  → 把结果塞进 queue
- *     active=false → 屏幕已退出，直接丢弃（否则 xQueueSend 会对已释放队列操作崩溃）
- * 锁同时保护 bemfa_list_queue / bemfa_toggle_queue 指针，避免 TOCTOU */
+ *     active=false → 屏幕已退出，直接丢弃（否则 xQueueSend 会操作已删除 queue 崩溃）
+ * 锁同时保护 list/send/info 三个 queue 指针，避免 TOCTOU */
 static SemaphoreHandle_t bemfa_ui_mtx        = NULL;
 static volatile bool     bemfa_screen_active = false;
 
@@ -2296,14 +2305,39 @@ static inline void bemfa_ui_unlock(void)
     if (bemfa_ui_mtx) xSemaphoreGive(bemfa_ui_mtx);
 }
 
-/* 列表数据（PSRAM 动态分配）*/
+/* ----- 数据结构 ----- */
+
+/* 列表查询结果（PSRAM 动态分配）*/
 typedef struct {
     bool    ok;
     int     count;
     bemfa_device_t devices[BEMFA_MAX_DEVICES];
 } bemfa_list_result_t;
 
-/* 后台列表拉取任务 */
+/* 单设备发送任务参数 + 完成后投递的结果 */
+typedef struct {
+    char topic[BEMFA_MAX_TOPIC_LEN];
+    char msg[BEMFA_MAX_MSG_LEN];      /* 要发送的明确消息（"on" / "off"）*/
+} bemfa_send_args_t;
+
+typedef struct {
+    bool ok;
+    char topic[BEMFA_MAX_TOPIC_LEN];
+    char msg[BEMFA_MAX_MSG_LEN];      /* 已发送的消息，用于 status 文案 */
+} bemfa_send_result_t;
+
+/* 单设备查询参数 + 结果（PSRAM 动态分配 result，避免 queue 携带大结构）*/
+typedef struct {
+    char topic[BEMFA_MAX_TOPIC_LEN];
+    int  delay_ms;                     /* 发送后延迟多久查询，让服务端同步 */
+} bemfa_info_args_t;
+
+typedef struct {
+    bool           ok;
+    bemfa_device_t dev;
+} bemfa_info_result_t;
+
+/* ----- 后台 list 拉取任务 ----- */
 static void bemfa_list_task(void *arg)
 {
     (void)arg;
@@ -2313,8 +2347,6 @@ static void bemfa_list_task(void *arg)
 
     r->ok = bemfa_list_devices(r->devices, &r->count);
 
-    /* 投递 queue 前锁内检查屏幕是否还在。否则屏幕已退出的情况下
-     * xQueueSend 会操作已删除 queue → 崩溃（H1）。 */
     bemfa_ui_lock();
     bool delivered = false;
     if (bemfa_screen_active && bemfa_list_queue) {
@@ -2328,29 +2360,56 @@ static void bemfa_list_task(void *arg)
     vTaskDelete(NULL);
 }
 
-/* 后台 toggle 任务 */
-typedef struct {
-    char topic[BEMFA_MAX_TOPIC_LEN];
-    char current_msg[BEMFA_MAX_MSG_LEN];
-} bemfa_toggle_args_t;
-
-static void bemfa_toggle_task(void *arg)
+/* ----- 后台 send 任务（推送明确 msg） ----- */
+static void bemfa_send_task(void *arg)
 {
-    bemfa_toggle_args_t *a = (bemfa_toggle_args_t *)arg;
-    char new_msg[8];
-    bool ok = bemfa_toggle(a->topic, a->current_msg, new_msg, sizeof(new_msg));
+    bemfa_send_args_t *a = (bemfa_send_args_t *)arg;
+    bemfa_send_result_t res = {0};
+    res.ok = bemfa_send(a->topic, a->msg);
+    strncpy(res.topic, a->topic, sizeof(res.topic) - 1);
+    strncpy(res.msg,   a->msg,   sizeof(res.msg)   - 1);
     free(a);
 
-    /* 跟 list_task 同样的 H1 防护 */
     bemfa_ui_lock();
-    if (bemfa_screen_active && bemfa_toggle_queue) {
-        xQueueSend(bemfa_toggle_queue, &ok, 0);
+    if (bemfa_screen_active && bemfa_send_queue) {
+        xQueueSend(bemfa_send_queue, &res, 0);
     }
     bemfa_ui_unlock();
     vTaskDelete(NULL);
 }
 
-/* 启动后台 list 拉取（spinner 状态显示）*/
+/* ----- 后台 info 任务（查单设备最新状态） ----- */
+static void bemfa_info_task(void *arg)
+{
+    bemfa_info_args_t *a = (bemfa_info_args_t *)arg;
+
+    /* 推送后服务端 msg 字段需要 1-2 秒同步，等一下再查更可能拿到新状态 */
+    if (a->delay_ms > 0) {
+        vTaskDelay(pdMS_TO_TICKS(a->delay_ms));
+    }
+
+    bemfa_info_result_t *r = heap_caps_malloc(sizeof(*r), MALLOC_CAP_SPIRAM);
+    if (!r) { free(a); vTaskDelete(NULL); return; }
+    memset(r, 0, sizeof(*r));
+    r->ok = bemfa_get_topic_info(a->topic, &r->dev);
+    free(a);
+
+    bemfa_ui_lock();
+    bool delivered = false;
+    if (bemfa_screen_active && bemfa_info_queue) {
+        if (xQueueSend(bemfa_info_queue, &r, 0) == pdTRUE) {
+            delivered = true;
+        }
+    }
+    bemfa_ui_unlock();
+
+    if (!delivered) heap_caps_free(r);
+    vTaskDelete(NULL);
+}
+
+/* ----- UI 辅助 ----- */
+
+/* 启动后台整表 list 拉取（进入界面 + 用户主动刷新走这条路径）*/
 static void bemfa_kick_refresh(void)
 {
     if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
@@ -2365,7 +2424,7 @@ static void bemfa_kick_refresh(void)
     }
 }
 
-/* 销毁当前列表条目（保留 "返回" 按钮）*/
+/* 销毁当前列表条目（保留"返回"按钮）*/
 static void bemfa_clear_list(void)
 {
     if (!bemfa_list || !lv_obj_is_valid(bemfa_list)) return;
@@ -2380,16 +2439,61 @@ static void bemfa_clear_list(void)
     }
 }
 
+/* 列表按钮的 user_data：保存 topic + 上次已知 msg，便于点击时构造发送菜单 */
+typedef struct {
+    char topic[BEMFA_MAX_TOPIC_LEN];
+    char name[BEMFA_MAX_NAME_LEN];
+    char msg[BEMFA_MAX_MSG_LEN];
+} bemfa_btn_data_t;
+
 static void bemfa_device_click_cb(lv_event_t *e);
 
-/* 释放挂在列表按钮 user_data 上的 bemfa_toggle_args_t，LV_EVENT_DELETE 触发 */
-static void bemfa_btn_args_free_cb(lv_event_t *e)
+static void bemfa_btn_data_free_cb(lv_event_t *e)
 {
-    bemfa_toggle_args_t *args = (bemfa_toggle_args_t *)lv_event_get_user_data(e);
-    if (args) free(args);
+    bemfa_btn_data_t *d = (bemfa_btn_data_t *)lv_event_get_user_data(e);
+    if (d) free(d);
 }
 
-/* 把设备列表渲染到 LVGL */
+/* 把单行 label 文字按 "name  [state]" 格式重写。供 optimistic / info 回填使用。
+ * 同时同步更新挂在按钮上的 bemfa_btn_data_t.msg。 */
+static void bemfa_update_row(const char *topic, const char *new_msg)
+{
+    if (!bemfa_list || !lv_obj_is_valid(bemfa_list)) return;
+
+    uint32_t n = lv_obj_get_child_count(bemfa_list);
+    /* 跳过第 0 个"返回" */
+    for (uint32_t i = 1; i < n; ++i) {
+        lv_obj_t *btn = lv_obj_get_child(bemfa_list, i);
+        if (!btn) continue;
+
+        bemfa_btn_data_t *bd = NULL;
+        uint32_t cnt = lv_obj_get_event_count(btn);
+        for (uint32_t k = 0; k < cnt; ++k) {
+            lv_event_dsc_t *dsc = lv_obj_get_event_dsc(btn, k);
+            if (!dsc) continue;
+            if (lv_event_dsc_get_cb(dsc) == bemfa_device_click_cb) {
+                bd = (bemfa_btn_data_t *)lv_event_dsc_get_user_data(dsc);
+                break;
+            }
+        }
+        if (!bd || strcmp(bd->topic, topic) != 0) continue;
+
+        strncpy(bd->msg, new_msg ? new_msg : "", sizeof(bd->msg) - 1);
+        bd->msg[sizeof(bd->msg) - 1] = '\0';
+
+        /* 子 1 是文字 label */
+        lv_obj_t *txt_lbl = lv_obj_get_child(btn, 1);
+        if (txt_lbl) {
+            const char *state = (bd->msg[0]) ? bd->msg : "-";
+            char label[BEMFA_MAX_NAME_LEN + 24];
+            snprintf(label, sizeof(label), "%s  [%s]", bd->name, state);
+            lv_label_set_text(txt_lbl, label);
+        }
+        return;
+    }
+}
+
+/* 渲染整张设备列表（首次加载和用户手动刷新调用）*/
 static void bemfa_render_list(const bemfa_device_t *list, int count)
 {
     bemfa_clear_list();
@@ -2414,20 +2518,209 @@ static void bemfa_render_list(const bemfa_device_t *list, int count)
         lv_obj_t *txt_lbl = lv_obj_get_child(btn, 1);
         if (txt_lbl) lv_obj_set_style_text_font(txt_lbl, &lv_font_simhei_16, 0);
 
-        /* user_data：我们需要 topic + current_msg 两个，分配一个小结构，
-         * 由 LV_EVENT_DELETE 释放避免泄漏 */
-        bemfa_toggle_args_t *args = malloc(sizeof(*args));
-        if (args) {
-            memset(args, 0, sizeof(*args));
-            strncpy(args->topic, d->topic, sizeof(args->topic) - 1);
-            strncpy(args->current_msg, d->msg, sizeof(args->current_msg) - 1);
-            lv_obj_add_event_cb(btn, bemfa_device_click_cb, LV_EVENT_CLICKED, args);
-            /* 给 btn 挂 DELETE 回调，按钮销毁（切屏 / 刷新列表）时释放 args */
-            lv_obj_add_event_cb(btn, bemfa_btn_args_free_cb, LV_EVENT_DELETE, args);
+        bemfa_btn_data_t *bd = malloc(sizeof(*bd));
+        if (bd) {
+            memset(bd, 0, sizeof(*bd));
+            strncpy(bd->topic, d->topic, sizeof(bd->topic) - 1);
+            strncpy(bd->name,  d->name,  sizeof(bd->name)  - 1);
+            strncpy(bd->msg,   d->msg,   sizeof(bd->msg)   - 1);
+            lv_obj_add_event_cb(btn, bemfa_device_click_cb, LV_EVENT_CLICKED, bd);
+            lv_obj_add_event_cb(btn, bemfa_btn_data_free_cb, LV_EVENT_DELETE, bd);
         }
 
         if (bemfa_group) lv_group_add_obj(bemfa_group, btn);
     }
+}
+
+/* ----- 发送 ----- */
+
+/* 投递一个 send 任务：UI 立即把行翻成新状态，1.2s 后查实际状态回填 */
+static void bemfa_kick_send(const char *topic, const char *msg)
+{
+    bemfa_send_args_t *a = malloc(sizeof(*a));
+    if (!a) return;
+    memset(a, 0, sizeof(*a));
+    strncpy(a->topic, topic, sizeof(a->topic) - 1);
+    strncpy(a->msg,   msg,   sizeof(a->msg)   - 1);
+
+    if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "发送 %s ...", msg);
+        lv_label_set_text(bemfa_status_lbl, buf);
+    }
+
+    BaseType_t r = xTaskCreatePSRAM(bemfa_send_task, "bemfa_send", 8192, a, 3, NULL);
+    if (r != pdPASS) {
+        ESP_LOGE(BEMFA_DEVICE_TAG, "bemfa_send_task 创建失败");
+        free(a);
+        if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
+            lv_label_set_text(bemfa_status_lbl, "内存不足，请重试");
+        }
+        return;
+    }
+
+    /* Optimistic UI：立即翻状态，给用户即时反馈。
+     * 服务端如果实际没收到（HTTP 失败），send 结果回到 timer 后会改成"失败"
+     * 提示 + 触发整表刷新还原真实状态。 */
+    bemfa_update_row(topic, msg);
+}
+
+/* 单设备查询投递（发送成功后调用）*/
+static void bemfa_kick_info(const char *topic, int delay_ms)
+{
+    bemfa_info_args_t *a = malloc(sizeof(*a));
+    if (!a) return;
+    memset(a, 0, sizeof(*a));
+    strncpy(a->topic, topic, sizeof(a->topic) - 1);
+    a->delay_ms = delay_ms;
+
+    BaseType_t r = xTaskCreatePSRAM(bemfa_info_task, "bemfa_info", 8192, a, 3, NULL);
+    if (r != pdPASS) {
+        ESP_LOGE(BEMFA_DEVICE_TAG, "bemfa_info_task 创建失败");
+        free(a);
+    }
+}
+
+/* ----- 设备点击 → "开 / 关 / 取消" 对话框 ----- */
+
+typedef struct {
+    char topic[BEMFA_MAX_TOPIC_LEN];
+    char msg[BEMFA_MAX_MSG_LEN];
+} bemfa_action_btn_t;
+
+static void bemfa_action_btn_free_cb(lv_event_t *e)
+{
+    bemfa_action_btn_t *b = (bemfa_action_btn_t *)lv_event_get_user_data(e);
+    if (b) free(b);
+}
+
+static void bemfa_action_dlg_delete_cb(lv_event_t *e)
+{
+    (void)e;
+    bemfa_action_dlg = NULL;
+    /* 关闭对话框后 indev 焦点交回设备列表。
+     *
+     * 但屏幕销毁路径上不要切：scr_delete_cb 先把 active 置 false，再
+     * lv_obj_delete(dlg) 同步触发本回调；如果这里 indev_set_group(bemfa_group)
+     * 把焦点切回 bemfa_group，紧接着 scr_delete_cb 会 lv_group_delete(bemfa_group)
+     * 让 indev 持有悬空指针。 */
+    if (!bemfa_screen_active) return;
+    if (bemfa_group) indev_set_group(bemfa_group);
+}
+
+/* dlg 上挂的临时 group 由本回调统一释放，避免泄漏。
+ * 与 bemfa_action_dlg_delete_cb 分两个回调：一个清模块全局指针并切焦点，
+ * 一个负责销毁本对话框专属的 group，互不干扰。 */
+static void bemfa_action_dlg_group_free_cb(lv_event_t *e)
+{
+    lv_group_t *g = (lv_group_t *)lv_event_get_user_data(e);
+    if (g) lv_group_delete(g);
+}
+
+static void bemfa_action_close(void)
+{
+    if (bemfa_action_dlg && lv_obj_is_valid(bemfa_action_dlg)) {
+        lv_obj_delete(bemfa_action_dlg);
+    }
+    bemfa_action_dlg = NULL;
+}
+
+static void bemfa_action_send_cb(lv_event_t *e)
+{
+    bemfa_action_btn_t *b = (bemfa_action_btn_t *)lv_event_get_user_data(e);
+    if (!b) { bemfa_action_close(); return; }
+
+    bemfa_kick_send(b->topic, b->msg);
+    bemfa_action_close();
+}
+
+static void bemfa_action_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    bemfa_action_close();
+}
+
+/* 点击设备 → 弹出"开启 / 关闭 / 取消"对话框 */
+static void bemfa_device_click_cb(lv_event_t *e)
+{
+    const bemfa_btn_data_t *bd = (const bemfa_btn_data_t *)lv_event_get_user_data(e);
+    if (!bd || !bd->topic[0]) return;
+
+    /* 已有对话框先关掉，避免叠加 */
+    bemfa_action_close();
+
+    lv_obj_t *dlg = lv_obj_create(bemfa_scr ? bemfa_scr : lv_screen_active());
+    bemfa_action_dlg = dlg;
+    lv_obj_set_size(dlg, LCD_W - 40, 160);
+    lv_obj_center(dlg);
+    lv_obj_set_style_bg_color(dlg, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_border_color(dlg, lv_color_hex(0xe94560), 0);
+    lv_obj_set_style_border_width(dlg, 2, 0);
+    lv_obj_set_style_radius(dlg, 8, 0);
+    lv_obj_set_style_pad_all(dlg, 8, 0);
+    lv_obj_set_flex_flow(dlg, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(dlg, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_event_cb(dlg, bemfa_action_dlg_delete_cb, LV_EVENT_DELETE, NULL);
+
+    lv_obj_t *title = lv_label_create(dlg);
+    char title_buf[BEMFA_MAX_NAME_LEN + 16];
+    snprintf(title_buf, sizeof(title_buf), "%s", bd->name[0] ? bd->name : bd->topic);
+    lv_label_set_text(title, title_buf);
+    lv_obj_set_style_text_color(title, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(title, &lv_font_simhei_16, 0);
+
+    lv_obj_t *sub = lv_label_create(dlg);
+    char sub_buf[64];
+    snprintf(sub_buf, sizeof(sub_buf), "当前: %s", bd->msg[0] ? bd->msg : "-");
+    lv_label_set_text(sub, sub_buf);
+    lv_obj_set_style_text_color(sub, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_font(sub, &lv_font_simhei_16, 0);
+
+    /* 三个按钮：开 / 关 / 取消，作为对话框临时 group */
+    lv_group_t *dlg_group = lv_group_create();
+
+    static const struct {
+        const char *label;
+        const char *msg;        /* 要发送的内容；NULL = 取消 */
+        uint32_t    bg_color;
+    } actions[] = {
+        { "开启", "on",  0x00aa44 },
+        { "关闭", "off", 0xaa3344 },
+        { "取消", NULL,  0x444466 },
+    };
+
+    for (size_t i = 0; i < sizeof(actions) / sizeof(actions[0]); ++i) {
+        lv_obj_t *btn = lv_button_create(dlg);
+        lv_obj_set_width(btn, LV_PCT(90));
+        lv_obj_set_height(btn, 32);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(actions[i].bg_color), 0);
+        lv_obj_set_style_bg_color(btn, lv_color_hex(0xe94560), LV_STATE_FOCUSED);
+
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, actions[i].label);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0xffffff), 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_simhei_16, 0);
+        lv_obj_center(lbl);
+
+        if (actions[i].msg) {
+            bemfa_action_btn_t *abtn = malloc(sizeof(*abtn));
+            if (abtn) {
+                memset(abtn, 0, sizeof(*abtn));
+                strncpy(abtn->topic, bd->topic, sizeof(abtn->topic) - 1);
+                strncpy(abtn->msg,   actions[i].msg, sizeof(abtn->msg) - 1);
+                lv_obj_add_event_cb(btn, bemfa_action_send_cb, LV_EVENT_CLICKED, abtn);
+                lv_obj_add_event_cb(btn, bemfa_action_btn_free_cb, LV_EVENT_DELETE, abtn);
+            }
+        } else {
+            lv_obj_add_event_cb(btn, bemfa_action_cancel_cb, LV_EVENT_CLICKED, NULL);
+        }
+
+        lv_group_add_obj(dlg_group, btn);
+    }
+
+    indev_set_group(dlg_group);
+    /* group 跟着 dlg 走：dlg 被删除时一起释放 group。 */
+    lv_obj_add_event_cb(dlg, bemfa_action_dlg_group_free_cb, LV_EVENT_DELETE, dlg_group);
 }
 
 /* 定时轮询：检查后台任务结果是否到达 */
@@ -2436,14 +2729,14 @@ static void bemfa_poll_tick(lv_timer_t *t)
     (void)t;
     if (!bemfa_scr || !lv_obj_is_valid(bemfa_scr)) return;
 
-    /* 1) list 结果 */
-    bemfa_list_result_t *r = NULL;
-    if (bemfa_list_queue && xQueueReceive(bemfa_list_queue, &r, 0) == pdTRUE && r) {
-        if (r->ok) {
-            bemfa_render_list(r->devices, r->count);
+    /* 1) list 整表刷新结果 */
+    bemfa_list_result_t *lr = NULL;
+    if (bemfa_list_queue && xQueueReceive(bemfa_list_queue, &lr, 0) == pdTRUE && lr) {
+        if (lr->ok) {
+            bemfa_render_list(lr->devices, lr->count);
             if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
                 char buf[32];
-                snprintf(buf, sizeof(buf), "共 %d 个设备", r->count);
+                snprintf(buf, sizeof(buf), "共 %d 个设备", lr->count);
                 lv_label_set_text(bemfa_status_lbl, buf);
             }
         } else {
@@ -2451,44 +2744,38 @@ static void bemfa_poll_tick(lv_timer_t *t)
                 lv_label_set_text(bemfa_status_lbl, "加载失败，请重试");
             }
         }
-        heap_caps_free(r);
+        heap_caps_free(lr);
     }
 
-    /* 2) toggle 结果 */
-    bool ok;
-    if (bemfa_toggle_queue && xQueueReceive(bemfa_toggle_queue, &ok, 0) == pdTRUE) {
-        if (ok) {
-            /* toggle 成功 → 刷新列表展示新状态 */
-            bemfa_kick_refresh();
-        } else {
+    /* 2) send 推送结果 */
+    bemfa_send_result_t sr;
+    if (bemfa_send_queue && xQueueReceive(bemfa_send_queue, &sr, 0) == pdTRUE) {
+        if (sr.ok) {
             if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
-                lv_label_set_text(bemfa_status_lbl, "切换失败");
+                char buf[64];
+                snprintf(buf, sizeof(buf), "已发送 %s", sr.msg);
+                lv_label_set_text(bemfa_status_lbl, buf);
             }
+            /* 1.2 秒后单设备查询权威状态。延迟原因：服务端 msg 字段
+             * 异步同步，立即查可能返回旧值。 */
+            bemfa_kick_info(sr.topic, 1200);
+        } else {
+            /* 发送失败：optimistic 更新需要还原，整表重拉拿权威状态 */
+            if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
+                lv_label_set_text(bemfa_status_lbl, "发送失败");
+            }
+            bemfa_kick_refresh();
         }
     }
-}
 
-/* 点击设备条目 → 异步 toggle */
-static void bemfa_device_click_cb(lv_event_t *e)
-{
-    const bemfa_toggle_args_t *src = (const bemfa_toggle_args_t *)lv_event_get_user_data(e);
-    if (!src || !src->topic[0]) return;
-
-    /* 拷贝一份给任务用，原 args 跟 LVGL 对象生命周期绑定 */
-    bemfa_toggle_args_t *dup = malloc(sizeof(*dup));
-    if (!dup) return;
-    memcpy(dup, src, sizeof(*dup));
-
-    if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
-        lv_label_set_text(bemfa_status_lbl, "切换中...");
-    }
-    BaseType_t r = xTaskCreatePSRAM(bemfa_toggle_task, "bemfa_toggle", 8192, dup, 3, NULL);
-    if (r != pdPASS) {
-        ESP_LOGE(BEMFA_DEVICE_TAG, "bemfa_toggle_task 创建失败");
-        free(dup);
-        if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
-            lv_label_set_text(bemfa_status_lbl, "内存不足，请重试");
+    /* 3) info 单设备查询结果 */
+    bemfa_info_result_t *ir = NULL;
+    if (bemfa_info_queue && xQueueReceive(bemfa_info_queue, &ir, 0) == pdTRUE && ir) {
+        if (ir->ok) {
+            bemfa_update_row(ir->dev.topic, ir->dev.msg);
         }
+        /* 失败不弹错（用户已经看到 optimistic 状态），仅日志 */
+        heap_caps_free(ir);
     }
 }
 
@@ -2503,21 +2790,39 @@ static void bemfa_back_btn_cb(lv_event_t *e)
 static void bemfa_scr_delete_cb(lv_event_t *e)
 {
     (void)e;
+
+    /* 防御：屏幕销毁前先把 indev 强行切到主菜单 group。
+     *
+     * 正常 back_btn_cb 路径已经做过这一步，但如果对话框仍开着时屏幕被
+     * 外部销毁（动画 auto_del / 上层强切等假想路径），indev 此时指向
+     * dlg_group。下面的 lv_obj_delete(dlg) 会同步触发 group_free_cb 释放
+     * dlg_group，让 indev 悬空。这里先切走，确保被删的 group 都不再被
+     * 任何 indev 引用。 */
+    if (group) indev_set_group(group);
+
     /* 先取锁原子地置 inactive + 抓走 queue 句柄。
      * 锁后的时刻起，任何后台任务投递尝试都会因 active=false 放弃，
      * 不会再访问即将删除的 queue（H1 核心防护）。*/
     bemfa_ui_lock();
     bemfa_screen_active = false;
     QueueHandle_t lq = bemfa_list_queue;
-    QueueHandle_t tq = bemfa_toggle_queue;
-    bemfa_list_queue   = NULL;
-    bemfa_toggle_queue = NULL;
+    QueueHandle_t sq = bemfa_send_queue;
+    QueueHandle_t iq = bemfa_info_queue;
+    bemfa_list_queue = NULL;
+    bemfa_send_queue = NULL;
+    bemfa_info_queue = NULL;
     bemfa_ui_unlock();
 
     if (bemfa_poll_timer) {
         lv_timer_delete(bemfa_poll_timer);
         bemfa_poll_timer = NULL;
     }
+
+    /* 关掉可能还开着的发送对话框（dlg_group 一同被销毁）*/
+    if (bemfa_action_dlg && lv_obj_is_valid(bemfa_action_dlg)) {
+        lv_obj_delete(bemfa_action_dlg);
+    }
+    bemfa_action_dlg = NULL;
 
     /* drain + delete。此时后台任务不会再投递新消息，安全销毁。*/
     if (lq) {
@@ -2527,8 +2832,16 @@ static void bemfa_scr_delete_cb(lv_event_t *e)
         }
         vQueueDelete(lq);
     }
-    if (tq) {
-        vQueueDelete(tq);
+    if (sq) {
+        /* send_queue 投递的是 bemfa_send_result_t（栈值），无需 free */
+        vQueueDelete(sq);
+    }
+    if (iq) {
+        bemfa_info_result_t *r = NULL;
+        while (xQueueReceive(iq, &r, 0) == pdTRUE) {
+            if (r) heap_caps_free(r);
+        }
+        vQueueDelete(iq);
     }
     if (bemfa_group) {
         lv_group_delete(bemfa_group);
@@ -2588,7 +2901,8 @@ static void show_bemfa_screen(void)
 
     /* 创建 queue + 定时轮询 timer */
     bemfa_list_queue   = xQueueCreate(2, sizeof(bemfa_list_result_t *));
-    bemfa_toggle_queue = xQueueCreate(4, sizeof(bool));
+    bemfa_send_queue   = xQueueCreate(4, sizeof(bemfa_send_result_t));
+    bemfa_info_queue   = xQueueCreate(4, sizeof(bemfa_info_result_t *));
     bemfa_poll_timer   = lv_timer_create(bemfa_poll_tick, 200, NULL);
 
     indev_set_group(bemfa_group);

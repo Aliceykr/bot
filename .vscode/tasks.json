@@ -25,7 +25,7 @@
       "command": "bash",
       "args": [
         "-c",
-        "export IDF_TOOLS_PATH=/home/aliceykr/.espressif && source /home/aliceykr/.espressif/esp-idf/export.sh && idf.py -p /dev/ttyUSB0 flash"
+        "export IDF_TOOLS_PATH=/home/aliceykr/.espressif && source /home/aliceykr/.espressif/esp-idf/export.sh && idf.py -p /dev/ttyUSB0 -b 2000000 flash"
       ],
       "problemMatcher": []
     },

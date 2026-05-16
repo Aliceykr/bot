@@ -324,3 +324,107 @@ bool bemfa_toggle(const char *topic, const char *current_msg,
     snprintf(new_msg_out, cap, "%s", next);
     return true;
 }
+
+bool bemfa_send(const char *topic, const char *msg)
+{
+    /* 语义化包装：调用方 100% 决定 msg，不依赖云端状态推断。 */
+    return bemfa_push_msg(topic, msg);
+}
+
+bool bemfa_get_topic_info(const char *topic, bemfa_device_t *out)
+{
+    if (!topic || !out) return false;
+
+    if (wifi_get_status() != WIFI_STATUS_CONNECTED) {
+        ESP_LOGE(TAG, "WiFi 未连接，无法查询设备状态");
+        return false;
+    }
+
+    lock_init_once();
+    if (!s_mutex) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    char url[256];
+    snprintf(url, sizeof(url),
+        "https://apis.bemfa.com/vb/api/v2/topicInfo?openID=%s&type=%d&topic=%s",
+        BEMFA_UID, BEMFA_TYPE, topic);
+
+    resp_reset();
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .event_handler = http_event_cb,
+        .timeout_ms = 10000,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        ESP_LOGE(TAG, "http_client_init 失败");
+        xSemaphoreGive(s_mutex);
+        return false;
+    }
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    bool ret = false;
+    if (err != ESP_OK || status != 200) {
+        ESP_LOGE(TAG, "topicInfo GET 失败: err=%d status=%d", err, status);
+        goto out;
+    }
+    if (s_resp_overflow || !s_resp_buf) {
+        ESP_LOGE(TAG, "topicInfo 响应溢出或为空");
+        goto out;
+    }
+
+    ESP_LOGD(TAG, "topicInfo resp: %s", s_resp_buf);
+
+    cJSON *root = cJSON_Parse(s_resp_buf);
+    if (!root) { ESP_LOGE(TAG, "topicInfo JSON 解析失败"); goto out; }
+
+    cJSON *code = cJSON_GetObjectItem(root, "code");
+    if (!code || code->valueint != 0) {
+        ESP_LOGE(TAG, "topicInfo API 错误 code=%d",
+                 code ? code->valueint : -1);
+        cJSON_Delete(root);
+        goto out;
+    }
+
+    /* 文档示例响应：data 是单 object（不是数组）：
+     *   {"code":0,"msg":"success","data":{"name":"客厅灯","msg":"on","online":true,...}}
+     * 但 allTopic 走的是嵌套 data.data 结构，两边不一致 —— 单 topic 这里
+     * 直接取 data 即可，不需要再下钻。 */
+    cJSON *data = cJSON_GetObjectItem(root, "data");
+    if (!data || !cJSON_IsObject(data)) {
+        ESP_LOGE(TAG, "topicInfo data 字段缺失或非对象");
+        cJSON_Delete(root);
+        goto out;
+    }
+
+    memset(out, 0, sizeof(*out));
+    strncpy(out->topic, topic, sizeof(out->topic) - 1);
+
+    cJSON *name = cJSON_GetObjectItem(data, "name");
+    cJSON *msg  = cJSON_GetObjectItem(data, "msg");
+    cJSON *online = cJSON_GetObjectItem(data, "online");
+
+    if (name && name->valuestring) {
+        strncpy(out->name, name->valuestring, sizeof(out->name) - 1);
+    } else {
+        strncpy(out->name, topic, sizeof(out->name) - 1);
+    }
+    if (msg && msg->valuestring) {
+        strncpy(out->msg, msg->valuestring, sizeof(out->msg) - 1);
+    }
+    out->online = (online && cJSON_IsTrue(online));
+
+    cJSON_Delete(root);
+    ret = true;
+
+out:
+    resp_free();
+    xSemaphoreGive(s_mutex);
+    return ret;
+}
