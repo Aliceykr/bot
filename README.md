@@ -1,5 +1,7 @@
 # Bot — ESP32-S3 AI 智能语音助手 & Game Boy 模拟器
 
+> 🌐 Language: **简体中文** | [English](README.en.md)
+
 基于 ESP-IDF + LVGL 的 ESP32-S3 嵌入式项目，集成 WiFi、天气查询、AI 聊天、在线/离线语音识别、语音合成、Game Boy 游戏模拟器（含音频）、BLE 蓝牙配网与远程音乐控制、MicroSD 卡音乐播放器（WAV + MP3）、音量控制、巴法云智能设备控制，配备 TFT LCD 图形界面与旋转编码器 + 按键矩阵交互。
 
 ---

@@ -89,3 +89,6 @@ BLE_APP/.flutter-plugins
 BLE_APP/.flutter-plugins-dependencies
 BLE_APP/android/.gradle/
 BLE_APP/ios/Pods/
+
+# AI assistant local settings (Claude Code etc.) — 本地工具配置不入版本库
+.claude/
