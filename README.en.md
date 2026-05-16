@@ -1,6 +1,6 @@
 # Bot — ESP32-S3 AI Voice Assistant & Game Boy Emulator
 
-> 🌐 Language: [简体中文](README.md) | **English**
+> 🌐 Language: [简体中文](README.md) | **English** | [Français](README.fr.md) | [Español](README.es.md) | [Русский](README.ru.md) | [العربية](README.ar.md)
 
 ESP-IDF + LVGL embedded project on ESP32-S3 that integrates WiFi, weather lookup, AI chat, online/offline speech recognition, text-to-speech, Game Boy emulator with audio, BLE provisioning with remote music control, a MicroSD music player (WAV + MP3), volume control, and Bemfa Cloud smart-device control. The device has a TFT LCD GUI driven by a rotary encoder plus a 3x3 keypad matrix.
 
