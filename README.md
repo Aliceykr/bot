@@ -642,3 +642,11 @@ I2S_NUM_0 被在线 ASR（`asr.c`）和离线 ESP-SR（`esp_sr.c`）共享，通
 | WiFi / LwIP / mbedTLS 运行时 | ~100 KB |
 | FreeRTOS 任务栈 + TCB | ~35 KB |
 | 剩余可用 | **~107 KB** |
+
+---
+
+## 开源协议
+
+本项目以 [MIT License](LICENSE) 发布。
+
+第三方组件各自遵循其原始协议（LVGL / Peanut-GB / MiniGB APU / cJSON — MIT；ESP-IDF — Apache 2.0；Helix MP3 — RealNetworks RPSL，非商业免费）。

@@ -251,3 +251,11 @@ Estructura de la tarjeta SD:
 | RingBuffer altavoz | 64 KB |
 | WiFi / LwIP / mbedTLS | ~100 KB |
 | Libre | **~107 KB** |
+
+---
+
+## Licencia
+
+Este proyecto se publica bajo la [Licencia MIT](LICENSE).
+
+Los componentes de terceros conservan sus licencias originales (LVGL / Peanut-GB / MiniGB APU / cJSON — MIT; ESP-IDF — Apache 2.0; Helix MP3 — RealNetworks RPSL, gratuito para uso no comercial).

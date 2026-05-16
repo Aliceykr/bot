@@ -642,3 +642,11 @@ I2S_NUM_0 is shared between online ASR (`asr.c`) and offline ESP-SR (`esp_sr.c`)
 | WiFi / LwIP / mbedTLS runtime | ~100 KB |
 | FreeRTOS task stacks + TCBs | ~35 KB |
 | Free | **~107 KB** |
+
+---
+
+## License
+
+This project is released under the [MIT License](LICENSE).
+
+Third-party components retain their original licenses (LVGL / Peanut-GB / MiniGB APU / cJSON — MIT; ESP-IDF — Apache 2.0; Helix MP3 — RealNetworks RPSL, free for non-commercial use).

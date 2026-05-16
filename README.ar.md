@@ -251,3 +251,11 @@ idf.py -p COM5 -b 2000000 flash
 | RingBuffer السماعة | 64 كيلوبايت |
 | WiFi / LwIP / mbedTLS | ~100 كيلوبايت |
 | متاح | **~107 كيلوبايت** |
+
+---
+
+## الرخصة
+
+يُصدَر هذا المشروع تحت [رخصة MIT](LICENSE).
+
+تحتفظ مكونات الطرف الثالث برخصها الأصلية (LVGL / Peanut-GB / MiniGB APU / cJSON — MIT؛ ESP-IDF — Apache 2.0؛ Helix MP3 — RealNetworks RPSL، مجاني للاستخدام غير التجاري).
