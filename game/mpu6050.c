@@ -12,7 +12,7 @@
  * 硬件配置
  * ================================================================ */
 #define MPU_I2C_PORT      I2C_NUM_0
-#define MPU_I2C_SDA_PIN   13
+#define MPU_I2C_SDA_PIN   20
 #define MPU_I2C_SCL_PIN   7
 #define MPU_I2C_FREQ_HZ   400000   /* 400kHz fast mode */
 
@@ -29,8 +29,14 @@
 /* ±2g 量程下的灵敏度：16384 LSB/g */
 #define ACCEL_SENS_2G        16384.0f
 
-/* 倾斜判定阈值（g）。X/Y 方向加速度绝对值超过此值才算"已倾斜" */
-#define TILT_THRESHOLD_G     0.30f
+/* 倾斜判定阈值（g）。使用滞后比较避免回弹抖动重复触发：
+ *   abs(ax/ay) > ENTER → 进入倾斜状态
+ *   abs(ax/ay) < EXIT  → 回到 NONE 状态
+ *   ENTER 和 EXIT 之间保持上一次的状态
+ * 设备从倾斜回到平放时加速度会有回弹（不是单调下降），
+ * 单一阈值会在回弹瞬间被误判为"再次倾斜"，触发多余的方向移动。 */
+#define TILT_ENTER_G   0.30f   /* 进入倾斜的门槛 */
+#define TILT_EXIT_G    0.15f   /* 退出倾斜的门槛 */
 
 /* I2C 操作超时（毫秒）。
  * 400kHz 下读写 6 字节 < 1ms，10ms 足够覆盖任何正常情况。
@@ -44,6 +50,10 @@
 static i2c_master_bus_handle_t s_bus    = NULL;
 static i2c_master_dev_handle_t s_dev    = NULL;
 static bool                    s_ready  = false;
+
+/* 倾斜方向滞后状态：mpu6050_get_direction 内部使用，
+ * 放在文件作用域便于 deinit 重置，避免下次进入游戏时残留旧方向。 */
+static mpu_dir_t               s_last_dir = MPU_DIR_NONE;
 
 /* 连续读取失败计数：用于游戏期间检测 MPU6050 掉线，
  * 静默失效时给用户一个 warning 提示 */
@@ -156,6 +166,7 @@ bool mpu6050_init(void)
 
     s_ready = true;
     s_read_fail_streak = 0;
+    s_last_dir = MPU_DIR_NONE;
     ESP_LOGI(TAG, "MPU6050 初始化完成 (SDA=%d SCL=%d ±2g 100Hz)",
              MPU_I2C_SDA_PIN, MPU_I2C_SCL_PIN);
     return true;
@@ -177,6 +188,7 @@ void mpu6050_deinit(void)
         s_bus = NULL;
     }
     s_read_fail_streak = 0;
+    s_last_dir = MPU_DIR_NONE;
     ESP_LOGI(TAG, "MPU6050 已释放");
 }
 
@@ -221,6 +233,9 @@ bool mpu6050_read_accel(float *ax, float *ay, float *az)
 mpu_dir_t mpu6050_get_direction(void)
 {
     float ax, ay, az;
+    /* I2C 失败时不更新 s_last_dir（保留滞后状态），但返回 NONE。
+     * 不返回 s_last_dir 是为了让游戏端 prev_tilt 能正确归零，
+     * 避免连续失败期间用户回正后再倾斜时边沿触发失效。 */
     if (!mpu6050_read_accel(&ax, &ay, &az)) return MPU_DIR_NONE;
 
     /* 取 X/Y 绝对值大的那个判方向。Z 轴用于检测设备朝向但不参与方向决策。
@@ -232,25 +247,45 @@ mpu_dir_t mpu6050_get_direction(void)
      *   设备前倾（前端低）  → ay 变负
      *   设备后倾（前端高）  → ay 变正
      *
-     * 实际安装时如果方向反了，调整下面的判断符号即可。
-     * 默认按"屏幕朝上、MPU 与屏幕同向"配置：
-     *   ax > 阈值 → 设备左倾 → 游戏 LEFT
-     *   ax < -阈值 → 设备右倾 → 游戏 RIGHT
-     *   ay > 阈值 → 设备后倾（屏幕顶部抬高）→ 游戏 UP
-     *   ay < -阈值 → 设备前倾（屏幕底部抬高）→ 游戏 DOWN
+     * 实际安装时如果方向反了，调整下面 dir 计算的三元运算符即可。
+     * 当前是按"MPU6050 与屏幕有 90° 旋转且坐标反向"实测调整的：
+     *   ax > 阈值 → 游戏 DOWN    ax < -阈值 → 游戏 UP
+     *   ay > 阈值 → 游戏 RIGHT   ay < -阈值 → 游戏 LEFT
      */
     float abs_x = fabsf(ax);
     float abs_y = fabsf(ay);
 
-    if (abs_x < TILT_THRESHOLD_G && abs_y < TILT_THRESHOLD_G) {
-        return MPU_DIR_NONE;  /* 平放，不动 */
+    /* 双重滞后：方向锁定 + NONE 切换。
+     *
+     * 一旦从 NONE 进入某方向（abs > ENTER），就锁定该方向，
+     * 直到 X/Y 都低于 EXIT 才回到 NONE。中间过程哪怕用户从
+     * 左倾慢慢转到下倾，X/Y 主导反复切换，也不会改变 s_last_dir。
+     *
+     * 这样保证：用户必须先回到平放，才能识别新方向。游戏端的边沿
+     * 触发（prev_tilt == 0 && tilt != 0）配合这个锁定，体验上是
+     * "倾一次动一次，回正后才能再倾"，不会有跳变误判。 */
+    if (s_last_dir != MPU_DIR_NONE) {
+        if (abs_x < TILT_EXIT_G && abs_y < TILT_EXIT_G) {
+            s_last_dir = MPU_DIR_NONE;
+            return MPU_DIR_NONE;
+        }
+        /* 仍处于倾斜状态，保持锁定方向，不重新计算 */
+        return s_last_dir;
     }
 
-    if (abs_x > abs_y) {
-        /* X 主导：左右 */
-        return (ax > 0) ? MPU_DIR_LEFT : MPU_DIR_RIGHT;
-    } else {
-        /* Y 主导：上下 */
-        return (ay > 0) ? MPU_DIR_UP : MPU_DIR_DOWN;
+    /* 当前是 NONE 状态：必须超过 ENTER 阈值才进入新方向 */
+    if (abs_x < TILT_ENTER_G && abs_y < TILT_ENTER_G) {
+        return MPU_DIR_NONE;
     }
+
+    mpu_dir_t dir;
+    if (abs_x > abs_y) {
+        /* X 主导：映射为上下 */
+        dir = (ax > 0) ? MPU_DIR_DOWN : MPU_DIR_UP;
+    } else {
+        /* Y 主导：映射为左右 */
+        dir = (ay > 0) ? MPU_DIR_RIGHT : MPU_DIR_LEFT;
+    }
+    s_last_dir = dir;
+    return dir;
 }

@@ -88,7 +88,12 @@
       "Bash(D:/ESP_IDF/ESP_IDF_5.4.3/Tool/tools/idf-python/3.11.2/python.exe D:/ESP_IDF/ESP_IDF_5.4.3/v5.4.3/esp-idf/tools/idf.py fullclean)",
       "Bash(find \"D:/ESP_IDF/ESP_IDF_5.4.3/v5.4.3/esp-idf/components/bt\" -name \"nimble_port.h\" 2>/dev/null | head -3)",
       "Read(//d/ESP_IDF/ESP_IDF_5.4.3/v5.4.3/esp-idf/components/bt/**)",
-      "Bash(idf.py set-target *)"
+      "Bash(idf.py set-target *)",
+      "mcp__MCPControl__press_key_combination",
+      "mcp__MCPControl__get_screen_size",
+      "mcp__MCPControl__click_at",
+      "mcp__MCPControl__type_text",
+      "mcp__MCPControl__get_active_window"
     ]
   }
 }

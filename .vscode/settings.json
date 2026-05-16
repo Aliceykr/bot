@@ -1,5 +1,5 @@
 {
-  "idf.currentSetup": "D:\\ESP_IDF\\ESP_IDF_5.4.3\\v5.4.3\\esp-idf",
+  "idf.currentSetup": "/home/aliceykr/.espressif/esp-idf",
   "idf.openOcdConfigs": [
     "board/esp32s3-bridge.cfg"
   ],
@@ -13,5 +13,7 @@
     "--compile-commands-dir=c:\\Users\\Aliceykr\\Desktop\\bot\\build"
   ],
   "idf.flashType": "UART",
-  "idf.portWin": "COM13"
+  "idf.flashBaudRate": "2000000",
+  "idf.portWin": "COM13",
+  "idf.port": "/dev/ttyUSB0"
 }
