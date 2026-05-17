@@ -27,6 +27,7 @@
 #include "music.h"
 #include "speaker.h"
 #include "bemfa.h"
+#include "dht11.h"
 
 /* 业务临时任务（weather / chat / asr / tts）均为一次性任务，末尾调
  * vTaskDelete(NULL) 后由 IDLE 自动回收栈和 TCB，必须使用 xTaskCreate
@@ -43,6 +44,7 @@ static void game_back_btn_cb(lv_event_t *e);
 static void ble_cred_cb(const char *ssid, const char *password);
 static void show_music_screen(void);
 static void show_volume_screen(void);
+static void show_env_screen(void);
 static void show_bemfa_screen(void);
 static void show_chat_screen(void);
 static void show_asr_screen(void);
@@ -1013,7 +1015,7 @@ static void sr_execute_action(const sr_pending_action_t *act)
 
     switch (act->command_id) {
         case 1:  /* 打开环境监测 */
-            create_result_dialog("环境监测\n功能开发中", 0x00cfff);
+            show_env_screen();
             break;
         case 2:  /* 打开天气和日期 */
             if (weather_fetching) return;
@@ -2252,6 +2254,265 @@ static void show_volume_screen(void)
 }
 
 // ================================================================
+// 环境监测界面（DHT11 温湿度传感器）
+//
+// 流程：
+//   1. 进入界面：显示"读取中..."占位
+//   2. LVGL timer 每 2s 触发一次后台读取任务（dht11_read 单次约 25ms 阻塞，
+//      不能直接在 LVGL 线程做，否则会丢帧）
+//   3. 后台任务读完后投递 queue，timer 取出更新 UI
+//   4. 屏幕销毁：停 timer + 删除 queue + 标记 active=false 让 in-flight
+//      任务投递时丢弃（防 use-after-free）
+//
+// DHT11 内部已有 1s 缓存：温度和湿度两次独立调用共享同一次实测，
+// 这里只调一次 read_temp + 一次 read_humi 实际只触发一次握手。
+// ================================================================
+
+typedef struct {
+    bool ok;
+    int  temp;
+    int  humi;
+} env_result_t;
+
+static lv_obj_t       *env_scr         = NULL;
+static lv_obj_t       *env_temp_label  = NULL;
+static lv_obj_t       *env_humi_label  = NULL;
+static lv_obj_t       *env_status_lbl  = NULL;
+static lv_timer_t     *env_poll_timer  = NULL;
+static QueueHandle_t   env_result_queue = NULL;
+
+/* 防重入：DHT11 mutex 拿不到（极端情况）会让 read_task 阻塞最多 2 秒，
+ * 此时 timer 仍然每 2s 触发一次，会堆积多个任务 → DRAM 浪费。
+ * inflight 标志：true 表示已有 read_task 在跑，timer 跳过本次启动。 */
+static volatile bool   env_inflight    = false;
+
+/* H1 防护：屏幕销毁路径会清空 queue 句柄；后台任务投递前在锁内
+ * 检查 active=true && queue!=NULL，否则丢弃结果，防止写已删队列。 */
+static SemaphoreHandle_t env_ui_mtx        = NULL;
+static volatile bool     env_screen_active = false;
+
+static inline void env_ui_lock(void)
+{
+    if (!env_ui_mtx) env_ui_mtx = xSemaphoreCreateMutex();
+    if (env_ui_mtx) xSemaphoreTake(env_ui_mtx, portMAX_DELAY);
+}
+static inline void env_ui_unlock(void)
+{
+    if (env_ui_mtx) xSemaphoreGive(env_ui_mtx);
+}
+
+static void env_read_task(void *arg)
+{
+    (void)arg;
+    env_result_t r = { .ok = false, .temp = 0, .humi = 0 };
+    int t = 0, h = 0;
+    bool ok_t = dht11_read_temp(&t);
+    bool ok_h = dht11_read_humi(&h);
+    if (ok_t && ok_h) {
+        r.ok = true;
+        r.temp = t;
+        r.humi = h;
+    }
+
+    env_ui_lock();
+    if (env_screen_active && env_result_queue) {
+        xQueueSend(env_result_queue, &r, 0);
+    }
+    env_inflight = false;
+    env_ui_unlock();
+
+    vTaskDelete(NULL);
+}
+
+static void env_poll_tick(lv_timer_t *t)
+{
+    (void)t;
+    if (!env_scr || !lv_obj_is_valid(env_scr)) return;
+
+    env_result_t r;
+    if (env_result_queue && xQueueReceive(env_result_queue, &r, 0) == pdTRUE) {
+        if (r.ok) {
+            char buf[16];
+            if (env_temp_label && lv_obj_is_valid(env_temp_label)) {
+                snprintf(buf, sizeof(buf), "%d C", r.temp);
+                lv_label_set_text(env_temp_label, buf);
+            }
+            if (env_humi_label && lv_obj_is_valid(env_humi_label)) {
+                snprintf(buf, sizeof(buf), "%d %%", r.humi);
+                lv_label_set_text(env_humi_label, buf);
+            }
+            if (env_status_lbl && lv_obj_is_valid(env_status_lbl)) {
+                lv_label_set_text(env_status_lbl, "读取正常");
+                lv_obj_set_style_text_color(env_status_lbl, lv_color_hex(0x00cc88), 0);
+            }
+        } else {
+            if (env_status_lbl && lv_obj_is_valid(env_status_lbl)) {
+                lv_label_set_text(env_status_lbl, "读取失败 检查接线/上拉");
+                lv_obj_set_style_text_color(env_status_lbl, lv_color_hex(0xff6666), 0);
+            }
+        }
+    }
+
+    /* 启动下一次后台读取。inflight 检查防止任务堆积（极端 mutex 等待
+     * 场景下，前一个 task 还没退出就启动新 task，会浪费 DRAM）。 */
+    bool start_new = false;
+    env_ui_lock();
+    if (!env_inflight) {
+        env_inflight = true;
+        start_new = true;
+    }
+    env_ui_unlock();
+
+    if (start_new) {
+        BaseType_t r2 = xTaskCreate(env_read_task, "env_read", 3072, NULL, 3, NULL);
+        if (r2 != pdPASS) {
+            ESP_LOGW("ENV", "env_read_task 创建失败（栈不足）");
+            env_ui_lock();
+            env_inflight = false;
+            env_ui_unlock();
+        }
+    }
+}
+
+static void env_back_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
+    indev_set_group(group);
+}
+
+static void env_scr_delete_cb(lv_event_t *e)
+{
+    (void)e;
+
+    env_ui_lock();
+    env_screen_active = false;
+    QueueHandle_t q = env_result_queue;
+    env_result_queue = NULL;
+    env_ui_unlock();
+
+    if (env_poll_timer) {
+        lv_timer_delete(env_poll_timer);
+        env_poll_timer = NULL;
+    }
+    if (q) {
+        env_result_t drained;
+        while (xQueueReceive(q, &drained, 0) == pdTRUE) {}
+        vQueueDelete(q);
+    }
+
+    env_scr        = NULL;
+    env_temp_label = NULL;
+    env_humi_label = NULL;
+    env_status_lbl = NULL;
+}
+
+static void show_env_screen(void)
+{
+    env_scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(env_scr, lv_color_hex(0x1a1a2e), 0);
+
+    lv_obj_t *title = lv_label_create(env_scr);
+    lv_label_set_text(title, "环境监测");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xe94560), 0);
+    lv_obj_set_style_text_font(title, &lv_font_simhei_16, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    lv_obj_t *temp_card = lv_obj_create(env_scr);
+    lv_obj_set_size(temp_card, LCD_W - 30, 90);
+    lv_obj_align(temp_card, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_style_bg_color(temp_card, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_border_color(temp_card, lv_color_hex(0xff8844), 0);
+    lv_obj_set_style_border_width(temp_card, 2, 0);
+    lv_obj_set_style_radius(temp_card, 8, 0);
+    lv_obj_clear_flag(temp_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *temp_title = lv_label_create(temp_card);
+    lv_label_set_text(temp_title, "温度");
+    lv_obj_set_style_text_color(temp_title, lv_color_hex(0xff8844), 0);
+    lv_obj_set_style_text_font(temp_title, &lv_font_simhei_16, 0);
+    lv_obj_align(temp_title, LV_ALIGN_TOP_LEFT, 4, 4);
+
+    env_temp_label = lv_label_create(temp_card);
+    lv_label_set_text(env_temp_label, "-- C");
+    lv_obj_set_style_text_color(env_temp_label, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(env_temp_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(env_temp_label, LV_ALIGN_CENTER, 0, 6);
+
+    lv_obj_t *humi_card = lv_obj_create(env_scr);
+    lv_obj_set_size(humi_card, LCD_W - 30, 90);
+    lv_obj_align(humi_card, LV_ALIGN_TOP_MID, 0, 140);
+    lv_obj_set_style_bg_color(humi_card, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_border_color(humi_card, lv_color_hex(0x44aaff), 0);
+    lv_obj_set_style_border_width(humi_card, 2, 0);
+    lv_obj_set_style_radius(humi_card, 8, 0);
+    lv_obj_clear_flag(humi_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *humi_title = lv_label_create(humi_card);
+    lv_label_set_text(humi_title, "湿度");
+    lv_obj_set_style_text_color(humi_title, lv_color_hex(0x44aaff), 0);
+    lv_obj_set_style_text_font(humi_title, &lv_font_simhei_16, 0);
+    lv_obj_align(humi_title, LV_ALIGN_TOP_LEFT, 4, 4);
+
+    env_humi_label = lv_label_create(humi_card);
+    lv_label_set_text(env_humi_label, "-- %");
+    lv_obj_set_style_text_color(env_humi_label, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(env_humi_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(env_humi_label, LV_ALIGN_CENTER, 0, 6);
+
+    env_status_lbl = lv_label_create(env_scr);
+    lv_label_set_text(env_status_lbl, "读取中...");
+    lv_obj_set_style_text_color(env_status_lbl, lv_color_hex(0xcccccc), 0);
+    lv_obj_set_style_text_font(env_status_lbl, &lv_font_simhei_16, 0);
+    lv_obj_align(env_status_lbl, LV_ALIGN_BOTTOM_MID, 0, -28);
+
+    lv_obj_t *tip = lv_label_create(env_scr);
+    lv_label_set_text(tip, "按键：返回");
+    lv_obj_set_style_text_color(tip, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_font(tip, &lv_font_simhei_16, 0);
+    lv_obj_align(tip, LV_ALIGN_BOTTOM_MID, 0, -8);
+
+    lv_obj_t *back_btn = lv_button_create(env_scr);
+    lv_obj_set_size(back_btn, 1, 1);
+    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_style_opa(back_btn, LV_OPA_TRANSP, 0);
+    lv_obj_add_event_cb(back_btn, env_back_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_group_t *eg = lv_group_create();
+    lv_group_add_obj(eg, back_btn);
+    indev_set_group(eg);
+    lv_obj_add_event_cb(env_scr, group_delete_cb, LV_EVENT_DELETE, eg);
+
+    env_result_queue = xQueueCreate(2, sizeof(env_result_t));
+    env_poll_timer   = lv_timer_create(env_poll_tick, 1000, NULL);
+
+    lv_obj_add_event_cb(env_scr, env_scr_delete_cb, LV_EVENT_DELETE, NULL);
+
+    env_ui_lock();
+    env_screen_active = true;
+    /* 检查上一个屏幕销毁后是否还有 read_task 没退出。如果有
+     * （inflight=true），就让它跑完投递结果到本次新建的 queue，避免
+     * 同时两个 read_task 占双份 DRAM。 */
+    bool need_kick = !env_inflight;
+    if (need_kick) env_inflight = true;
+    env_ui_unlock();
+
+    lv_screen_load_anim(env_scr, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+
+    if (need_kick) {
+        BaseType_t r = xTaskCreate(env_read_task, "env_read", 3072, NULL, 3, NULL);
+        if (r != pdPASS) {
+            ESP_LOGW("ENV", "首次 env_read_task 创建失败");
+            env_ui_lock();
+            env_inflight = false;
+            env_ui_unlock();
+        }
+    }
+    /* 如果 need_kick=false，先等 timer 1s 后触发；用户会先看到"读取中..."
+     * 然后被旧 task 投递的结果或新 task 的结果填充。可接受。 */
+}
+
+// ================================================================
 // 智能设备界面（巴法云 TCP 设备云）
 //
 // 流程：
@@ -2926,9 +3187,7 @@ static void list_event_cb(lv_event_t *e)
     const char *txt = lv_label_get_text(label);
 
     if (strstr(txt, "环境监测")) {
-        /* TODO: 接入 DHT22 / WS2812 等传感器，显示温湿度/光照等环境数据。
-         * 占位：先弹提示窗。 */
-        create_result_dialog("环境监测\n功能开发中", 0x00cfff);
+        show_env_screen();
     } else if (strstr(txt, "天气")) {
         /* 天气依赖 HTTP API，必须联网 */
         if (wifi_get_status() != WIFI_STATUS_CONNECTED) {
