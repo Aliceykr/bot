@@ -92,7 +92,7 @@ I2C 400 kHz, plage ±2 g, DLPF 44 Hz. Initialisé uniquement pour le jeu 2048, l
 
 Au démarrage, la liste des fonctions s'affiche. Navigation par encodeur rotatif, confirmation par pression :
 
-- **Surveillance environnementale** — Espace réservé (en développement)
+- **Surveillance environnementale** — Capteur DHT11 (GPIO13), écran dédié affichant température et humidité, rafraîchi toutes les secondes
 - **Météo & date** — Récupération météo HTTP en temps réel
 - **Jeux** — 2048 intégré + émulateur Game Boy (ROMs depuis `/sdcard/rom/`)
 - **Assistant chat** — Clavier à l'écran, appel API LLM, historique défilant

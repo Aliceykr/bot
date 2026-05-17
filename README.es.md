@@ -92,7 +92,7 @@ I2C 400 kHz, rango ±2 g, DLPF 44 Hz. Inicializado solo para el juego 2048, libe
 
 Al arrancar se muestra la lista de funciones. Navegación con encoder rotativo, confirmación con pulsación:
 
-- **Monitor ambiental** — Marcador de posición (en desarrollo)
+- **Monitor ambiental** — Sensor DHT11 (GPIO13), pantalla dedicada con temperatura y humedad, actualización cada segundo
 - **Tiempo y fecha** — Consulta meteorológica HTTP en tiempo real
 - **Juegos** — 2048 integrado + emulador Game Boy (ROMs desde `/sdcard/rom/`)
 - **Asistente de chat** — Teclado en pantalla, llamada API LLM, historial desplazable

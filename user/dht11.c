@@ -112,7 +112,9 @@ static bool dht11_sample_locked(int *out_humi, int *out_temp)
     /* 6. 校验和：前四字节累加低 8 位 == 第五字节 */
     uint8_t sum = (uint8_t)(data[0] + data[1] + data[2] + data[3]);
     if (sum != data[4]) {
-        ESP_LOGW(TAG, "checksum 错误: %02x %02x %02x %02x sum=%02x recv=%02x",
+        /* warmup / 偶发毛刺都会到这里。降到 DEBUG 级别避免污染日志，
+         * 上层会重试，最终失败才在 env UI 显示一次"读取失败"。 */
+        ESP_LOGD(TAG, "checksum 错误: %02x %02x %02x %02x sum=%02x recv=%02x",
                  data[0], data[1], data[2], data[3], sum, data[4]);
         return false;
     }
@@ -152,12 +154,29 @@ static bool dht11_get_locked(int *out_humi, int *out_temp)
         }
     }
 
-    /* 实测一次。DHT11 偶尔会有时序毛刺，重试一次容忍 */
+    /* 首次实测前做一次静默 warmup：DHT11 第一次被握手后需要 ~100ms
+     * 才能回稳定数据，加上 ESP-IDF GPIO driver 第一次调用的冷启动开销，
+     * 真正的第一次实测大概率失败。这里先做一次握手把传感器和驱动都
+     * 唤醒，结果丢弃（不日志、不算失败），用户看不到这次"哑读"。 */
+    static bool s_warmup_done = false;
+    if (!s_warmup_done) {
+        int dh = 0, dt = 0;
+        (void)dht11_sample_locked(&dh, &dt);
+        s_warmup_done = true;
+        vTaskDelay(pdMS_TO_TICKS(150));  /* 让 DHT11 充分恢复 */
+    }
+
+    /* 实测重试：最多 3 次，间隔逐步拉长。这套节奏对市面上各种 DHT11
+     * 仿品兼容性最好（部分仿品时序偏离 datasheet ~10%）。 */
     int humi = 0, temp = 0;
-    bool ok = dht11_sample_locked(&humi, &temp);
-    if (!ok) {
-        vTaskDelay(pdMS_TO_TICKS(50));   /* 失败间隔，让 DHT 复位 */
+    bool ok = false;
+    static const int retry_delays_ms[3] = { 0, 80, 200 };
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        if (retry_delays_ms[attempt] > 0) {
+            vTaskDelay(pdMS_TO_TICKS(retry_delays_ms[attempt]));
+        }
         ok = dht11_sample_locked(&humi, &temp);
+        if (ok) break;
     }
     if (!ok) return false;
 

@@ -82,6 +82,16 @@ A/B 相由 PCNT 硬件正交解码，SW 按键 5ms 轮询状态机（20ms 防抖
 
 400kHz I2C，±2g 量程，DLPF 44Hz。仅在进入 2048 游戏时初始化，退出后释放总线。倾斜判定使用滞后阈值（ENTER=0.30g, EXIT=0.15g）+ 方向锁定，X/Y 主导轴决定方向，平放时无输入。该设计可消除"倾斜回弹到平放过程中误判反向"的抖动问题。
 
+### DHT11 温湿度传感器
+
+| 功能 | ESP32-S3 引脚 | DHT11 模块引脚 |
+|------|---------------|----------------|
+| DATA | GPIO13 | S（Signal）|
+| 3.3V | 3.3V   | +（VCC）|
+| GND  | GND    | -（GND）|
+
+单总线协议，1 秒/次采样（DHT11 物理上限）。使用模块板时板上已有上拉电阻，无需外加。精度：±2℃ / ±5%RH，分辨率 1℃ / 1%RH。
+
 ### MicroSD 卡（SPI3_HOST）
 
 | 功能 | ESP32-S3 引脚 | SD 卡模块引脚 |
@@ -129,6 +139,7 @@ bot/
 │   ├── bemfa.c / bemfa.h         # 巴法云智能设备 HTTP REST 控制（拉取列表 / 推送 on/off）
 │   ├── bemfa_config.h            # 巴法云私钥（已 gitignore）
 │   ├── bemfa_config.h.example    # 配置模板
+│   ├── dht11.c / dht11.h         # DHT11 温湿度传感器单总线驱动（GPIO13，1s 采样）
 │   ├── wifi.c / wifi.h           # WiFi STA 连接 + 守护任务 + mutex 线程安全
 │   ├── sntp_time.c / sntp_time.h # SNTP 网络时间同步（阿里云 NTP）
 │   ├── health.c / health.h       # 堆内存健康监控（60s 周期打印水位）
@@ -160,11 +171,23 @@ bot/
 
 ## 功能说明
 
-### 1. 主菜单界面
+### 1. 环境监测（DHT11）
+
+通过 DHT11 温湿度传感器（GPIO13 单总线）实时显示室内温湿度：
+
+- 独立屏幕，上下两张卡片分别显示温度（℃）和湿度（%RH）
+- 1 秒刷新一次（DHT11 物理上限）
+- 首次读取自动静默 warmup（哑读一次 + 等待 150ms），消除冷启动时"读取失败"闪烁
+- 连续 ≥2 次失败才显示"读取失败"红字，单次偶发毛刺不影响 UI
+- 后台 `env_read` 任务异步读取，LVGL 线程零阻塞
+- `inflight` 标志防止任务堆积（极端 mutex 等待时不会启动第二个 task）
+- 编码器按键返回主菜单
+
+### 2. 主菜单界面
 
 开机后显示功能列表，通过旋转编码器上下选择、按键确认：
 
-- **环境监测** — 占位（开发中）
+- **环境监测** — DHT11 温湿度传感器（GPIO13），独立屏幕显示温度和湿度，1 秒刷新一次；首次读取自动静默 warmup，不会闪烁"读取失败"
 - **天气与日期** — HTTP 拉取实时天气，展示温度、湿度、风力、实时时钟
 - **游戏** — 内置 2048 游戏（无需 SD 卡）+ 扫描 SD 卡 `/sdcard/rom/` 中的 .gb/.gbc ROM 文件运行 Game Boy 模拟器
 - **聊天助手** — 屏幕键盘输入文字，调用 LLM API 获取回复，滚动对话记录
@@ -374,6 +397,7 @@ SD 卡音乐播放，支持 WAV 和 MP3 格式：
 | `esp_sr_feed` | 5 | 5120 B | ESP-SR AFE 音频喂入（Core 0） |
 | `esp_sr_detect` | 5 | 6144 B | ESP-SR MultiNet 命令检测（Core 1） |
 | `kpad_task` | 6 | 4096 B | 按键矩阵扫描（2ms 周期） |
+| `env_read` | 3 | 3072 B | DHT11 温湿度读取（一次性，1s 周期） |
 | `bemfa_list` | 3 | 8192 B (PSRAM) | 巴法云设备列表 HTTPS 请求（一次性） |
 | `bemfa_send` | 3 | 8192 B (PSRAM) | 巴法云推送 on/off HTTPS 请求（一次性） |
 | `bemfa_info` | 3 | 8192 B (PSRAM) | 巴法云单设备状态回填查询（一次性） |
@@ -531,6 +555,7 @@ ROM 和音乐文件存放在 MicroSD 卡，不再使用 Flash SPIFFS 存储。
 ## 注意事项
 
 - **凭证安全**：`asr_config.h`、`model_config.h` 和 `bemfa_config.h` 含 API Key / 私钥，已加入 `.gitignore`
+- **DHT11 模块**：使用带模块板的版本（板上已有上拉电阻），DATA 接 GPIO13，无需外加上拉；裸传感器需在 DATA 与 3.3V 之间加 4.7kΩ 上拉
 - **PSRAM 必须选 Octal Mode**：录音缓冲、ROM 数据、HTTP 响应、音乐解码缓冲均分配于 PSRAM
 - **I2S 资源分配**：I2S_NUM_0 = 麦克风（RX），I2S_NUM_1 = 扬声器（TX），互不干扰
 - **I2S_NUM_0 共享**：在线 ASR 和离线 ESP-SR 通过 deinit/reinit + taskNotify 握手切换
@@ -604,7 +629,7 @@ I2S_NUM_0 被在线 ASR（`asr.c`）和离线 ESP-SR（`esp_sr.c`）共享，通
 
 | 类别 | 行数 |
 |------|------|
-| 纯手写代码 | ~6,400 行 |
+| 纯手写代码 | ~6,600 行 |
 | 字体数据（lv_font_simhei_16 + lcdfont）| ~385,000 行 |
 | 模拟器库（walnut_cgb.h + minigb_apu.c）| ~10,500 行 |
 | LVGL 库 | 未计入 |

@@ -2286,6 +2286,10 @@ static QueueHandle_t   env_result_queue = NULL;
  * inflight 标志：true 表示已有 read_task 在跑，timer 跳过本次启动。 */
 static volatile bool   env_inflight    = false;
 
+/* 失败计数：连续多少次 read 失败。<2 次时不显示"读取失败"，避免
+ * 冷启动 / 偶发毛刺时屏幕先闪一下错误再变正常的体验抖动。 */
+static int             env_fail_count  = 0;
+
 /* H1 防护：屏幕销毁路径会清空 queue 句柄；后台任务投递前在锁内
  * 检查 active=true && queue!=NULL，否则丢弃结果，防止写已删队列。 */
 static SemaphoreHandle_t env_ui_mtx        = NULL;
@@ -2332,6 +2336,7 @@ static void env_poll_tick(lv_timer_t *t)
     env_result_t r;
     if (env_result_queue && xQueueReceive(env_result_queue, &r, 0) == pdTRUE) {
         if (r.ok) {
+            env_fail_count = 0;
             char buf[16];
             if (env_temp_label && lv_obj_is_valid(env_temp_label)) {
                 snprintf(buf, sizeof(buf), "%d C", r.temp);
@@ -2346,7 +2351,10 @@ static void env_poll_tick(lv_timer_t *t)
                 lv_obj_set_style_text_color(env_status_lbl, lv_color_hex(0x00cc88), 0);
             }
         } else {
-            if (env_status_lbl && lv_obj_is_valid(env_status_lbl)) {
+            /* 偶尔一次失败不报错（容忍冷启动握手失败 / 偶发毛刺），
+             * 连续 ≥2 次才显示"读取失败"。"读取中..."保持原样。 */
+            env_fail_count++;
+            if (env_fail_count >= 2 && env_status_lbl && lv_obj_is_valid(env_status_lbl)) {
                 lv_label_set_text(env_status_lbl, "读取失败 检查接线/上拉");
                 lv_obj_set_style_text_color(env_status_lbl, lv_color_hex(0xff6666), 0);
             }
@@ -2490,6 +2498,7 @@ static void show_env_screen(void)
 
     env_ui_lock();
     env_screen_active = true;
+    env_fail_count = 0;             /* 进屏重置失败计数 */
     /* 检查上一个屏幕销毁后是否还有 read_task 没退出。如果有
      * （inflight=true），就让它跑完投递结果到本次新建的 queue，避免
      * 同时两个 read_task 占双份 DRAM。 */

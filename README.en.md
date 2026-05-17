@@ -82,6 +82,16 @@ A/B phases are decoded by hardware PCNT, the SW button uses a 5 ms polled state 
 
 400 kHz I2C, ±2 g range, DLPF 44 Hz. Initialised only when entering 2048, the bus is released on exit. Tilt detection uses hysteresis thresholds (ENTER 0.30 g, EXIT 0.15 g) plus direction lock with X/Y dominant axis to choose the move direction. Flat orientation produces no input. The hysteresis design eliminates the "spurious opposite move when returning to flat" jitter.
 
+### DHT11 temperature & humidity sensor
+
+| Function | ESP32-S3 pin | DHT11 module pin |
+|----------|--------------|-----------------|
+| DATA | GPIO13 | S (Signal) |
+| 3.3V | 3.3V   | + (VCC) |
+| GND  | GND    | - (GND) |
+
+Single-wire protocol, 1 sample/second (DHT11 physical limit). Module boards already include a pull-up resistor — no external resistor needed. Accuracy: ±2 °C / ±5 %RH, resolution 1 °C / 1 %RH.
+
 ### MicroSD card (SPI3_HOST)
 
 | Function | ESP32-S3 pin | SD module pin |
@@ -164,7 +174,7 @@ bot/
 
 The boot screen shows the feature list. Scroll with the rotary encoder, confirm with push:
 
-- **Environment monitor** — placeholder (work in progress)
+- **Environment monitor** — DHT11 temperature & humidity sensor (GPIO13), dedicated screen showing temperature and humidity, refreshed every 1 second; silent warmup on first read eliminates the "read failed" flash
 - **Weather & date** — fetch live weather over HTTP, show temperature, humidity, wind, real-time clock
 - **Game** — the built-in 2048 (no SD card required) plus any `.gb` / `.gbc` ROMs scanned from `/sdcard/rom/` running on the Game Boy emulator
 - **Chat assistant** — on-screen keyboard, calls an LLM API, scrolling chat history
@@ -374,6 +384,7 @@ Controls smart devices bound to your Bemfa Cloud TCP account via HTTP REST:
 | `esp_sr_feed` | 5 | 5120 B | ESP-SR AFE feed (Core 0) |
 | `esp_sr_detect` | 5 | 6144 B | ESP-SR MultiNet detect (Core 1) |
 | `kpad_task` | 6 | 4096 B | Keypad scan (2 ms period) |
+| `env_read` | 3 | 3072 B | DHT11 read (one-shot, 1 s period) |
 | `bemfa_list` | 3 | 8192 B (PSRAM) | Bemfa device list HTTPS (one-shot) |
 | `bemfa_send` | 3 | 8192 B (PSRAM) | Bemfa send on/off HTTPS (one-shot) |
 | `bemfa_info` | 3 | 8192 B (PSRAM) | Bemfa single-device backfill (one-shot) |
