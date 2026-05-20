@@ -2556,6 +2556,19 @@ static QueueHandle_t bemfa_info_queue  = NULL;   /* bemfa_info_result_t* */
 static lv_group_t  *bemfa_group       = NULL;
 static lv_obj_t    *bemfa_action_dlg  = NULL;    /* 当前打开的发送选择对话框 */
 
+/* 语音控制 */
+static lv_obj_t       *bemfa_voice_btn   = NULL;
+static bool            bemfa_voice_rec    = false;
+static QueueHandle_t   bemfa_voice_queue  = NULL;
+static bemfa_device_t  bemfa_cached_devices[BEMFA_MAX_DEVICES];
+static int             bemfa_cached_count = 0;
+
+typedef struct {
+    bool ok;
+    char text[128];
+    bool need_refresh;
+} bemfa_voice_result_t;
+
 /* 后台任务与 LVGL 线程的同步（H1 防护）：
  *   bemfa_scr_delete_cb 置 active=false 并持锁清空 queue 句柄
  *   后台任务完成时锁内检查 active：
@@ -2698,10 +2711,10 @@ static void bemfa_kick_refresh(void)
 static void bemfa_clear_list(void)
 {
     if (!bemfa_list || !lv_obj_is_valid(bemfa_list)) return;
-    /* list 的第 0 个子是"返回"，从第 1 个开始删 */
+    /* 第 0/1 个子是"返回"和"按住说话"，从第 2 个开始删设备条目 */
     uint32_t n = lv_obj_get_child_count(bemfa_list);
-    while (n > 1) {
-        lv_obj_t *child = lv_obj_get_child(bemfa_list, 1);
+    while (n > 2) {
+        lv_obj_t *child = lv_obj_get_child(bemfa_list, 2);
         if (!child) break;
         if (bemfa_group) lv_group_remove_obj(child);
         lv_obj_delete(child);
@@ -2766,6 +2779,10 @@ static void bemfa_update_row(const char *topic, const char *new_msg)
 /* 渲染整张设备列表（首次加载和用户手动刷新调用）*/
 static void bemfa_render_list(const bemfa_device_t *list, int count)
 {
+    /* 缓存设备列表供语音匹配使用 */
+    bemfa_cached_count = count;
+    if (count > 0) memcpy(bemfa_cached_devices, list, count * sizeof(bemfa_device_t));
+
     bemfa_clear_list();
 
     if (count == 0) {
@@ -3037,8 +3054,17 @@ static void bemfa_poll_tick(lv_timer_t *t)
             bemfa_kick_refresh();
         }
     }
+    /* 3) 语音控制结果 */
+    bemfa_voice_result_t vr;
+    if (bemfa_voice_queue && xQueueReceive(bemfa_voice_queue, &vr, 0) == pdTRUE) {
+        if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
+            lv_label_set_text(bemfa_status_lbl, vr.text);
+        }
+        if (vr.need_refresh) bemfa_kick_refresh();
+    }
+}
 
-    /* 3) info 单设备查询结果 */
+    /* 4) info 单设备查询结果 */
     bemfa_info_result_t *ir = NULL;
     if (bemfa_info_queue && xQueueReceive(bemfa_info_queue, &ir, 0) == pdTRUE && ir) {
         if (ir->ok) {
@@ -3046,6 +3072,149 @@ static void bemfa_poll_tick(lv_timer_t *t)
         }
         /* 失败不弹错（用户已经看到 optimistic 状态），仅日志 */
         heap_caps_free(ir);
+    }
+}
+
+/* ================================================================
+ * 语音控制：按住说话 → ASR 识别 → 关键词匹配设备 → 执行开关
+ * ================================================================ */
+
+/* 关键词匹配 + 执行。运行在 bemfa_voice_task 上下文（PSRAM 栈）。*/
+static bool bemfa_voice_parse_and_execute(const char *asr_text, char *status_out, size_t cap)
+{
+    bool turn_on  = strstr(asr_text, "打开") || strstr(asr_text, "开");
+    bool turn_off = strstr(asr_text, "关闭") || strstr(asr_text, "关");
+    bool do_all   = strstr(asr_text, "所有") || strstr(asr_text, "全部");
+
+    if (!turn_on && !turn_off) {
+        snprintf(status_out, cap, "请说\"打开\"或\"关闭\"+设备名");
+        return false;
+    }
+    if (bemfa_cached_count == 0) {
+        snprintf(status_out, cap, "暂无设备列表");
+        return false;
+    }
+
+    /* 全量操作 */
+    if (do_all) {
+        const char *action = turn_off ? "off" : "on";
+        int ok_count = 0;
+        for (int i = 0; i < bemfa_cached_count; i++) {
+            if (bemfa_push_msg(bemfa_cached_devices[i].topic, action))
+                ok_count++;
+        }
+        snprintf(status_out, cap, "已%s %d/%d 个设备",
+                 turn_off ? "关闭" : "打开", ok_count, bemfa_cached_count);
+        return ok_count > 0;
+    }
+
+    /* 最长子串匹配单个设备名 */
+    int best_i = -1;
+    size_t best_len = 0;
+    for (int i = 0; i < bemfa_cached_count; i++) {
+        const char *found = strstr(asr_text, bemfa_cached_devices[i].name);
+        if (found) {
+            size_t n = strlen(bemfa_cached_devices[i].name);
+            if (n > best_len) { best_i = i; best_len = n; }
+        }
+    }
+
+    if (best_i < 0) {
+        snprintf(status_out, cap, "未找到匹配设备");
+        return false;
+    }
+
+    const char *action = turn_off ? "off" : "on";
+    if (!bemfa_push_msg(bemfa_cached_devices[best_i].topic, action)) {
+        snprintf(status_out, cap, "发送指令失败");
+        return false;
+    }
+    snprintf(status_out, cap, "已%s %s",
+             turn_off ? "关闭" : "打开", bemfa_cached_devices[best_i].name);
+    return true;
+}
+
+/* 后台任务：ASR 识别 + 匹配 + 执行 */
+static void bemfa_voice_task(void *arg)
+{
+    uint32_t audio_len = *(uint32_t *)arg;
+    free(arg);
+
+    bemfa_voice_result_t res = {0};
+
+    asr_result_t asr_res;
+    if (!asr_recognize(audio_len, &asr_res) || !asr_res.success || !asr_res.result[0]) {
+        snprintf(res.text, sizeof(res.text), "未识别到语音");
+        res.ok = false;
+    } else {
+        ESP_LOGI(BEMFA_DEVICE_TAG, "语音识别: %s", asr_res.result);
+        res.ok = bemfa_voice_parse_and_execute(asr_res.result, res.text, sizeof(res.text));
+        res.need_refresh = res.ok;
+    }
+
+    /* H1 防护：投递前检查屏幕是否还在 */
+    bemfa_ui_lock();
+    if (bemfa_screen_active && bemfa_voice_queue) {
+        xQueueSend(bemfa_voice_queue, &res, 0);
+    }
+    bemfa_ui_unlock();
+    vTaskDelete(NULL);
+}
+
+/* 按下：开始录音 */
+static void bemfa_voice_pressed_cb(lv_event_t *e)
+{
+    (void)e;
+    if (bemfa_voice_rec) return;
+    bemfa_voice_rec = true;
+    asr_record_start();
+    if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
+        lv_label_set_text(bemfa_status_lbl, "录音中...");
+    }
+    if (bemfa_voice_btn && lv_obj_is_valid(bemfa_voice_btn)) {
+        lv_obj_set_style_bg_color(bemfa_voice_btn, lv_color_hex(0xe94560), 0);
+    }
+}
+
+/* 松开：停止录音 → 后台识别 */
+static void bemfa_voice_released_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!bemfa_voice_rec) return;
+    bemfa_voice_rec = false;
+
+    uint32_t audio_len = asr_record_stop();
+
+    if (bemfa_voice_btn && lv_obj_is_valid(bemfa_voice_btn)) {
+        lv_obj_set_style_bg_color(bemfa_voice_btn, lv_color_hex(0x0f3460), 0);
+    }
+
+    /* 最短 0.5 秒（16000 samples）*/
+    if (audio_len < 16000) {
+        if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
+            lv_label_set_text(bemfa_status_lbl, "录音太短，请重试");
+        }
+        return;
+    }
+
+    if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
+        lv_label_set_text(bemfa_status_lbl, "识别中...");
+    }
+
+    uint32_t *len_arg = malloc(sizeof(uint32_t));
+    if (!len_arg) {
+        if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
+            lv_label_set_text(bemfa_status_lbl, "内存不足");
+        }
+        return;
+    }
+    *len_arg = audio_len;
+    BaseType_t r = xTaskCreatePSRAM(bemfa_voice_task, "bemfa_voice", 16384, len_arg, 3, NULL);
+    if (r != pdPASS) {
+        free(len_arg);
+        if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
+            lv_label_set_text(bemfa_status_lbl, "内存不足");
+        }
     }
 }
 
@@ -3073,14 +3242,22 @@ static void bemfa_scr_delete_cb(lv_event_t *e)
     /* 先取锁原子地置 inactive + 抓走 queue 句柄。
      * 锁后的时刻起，任何后台任务投递尝试都会因 active=false 放弃，
      * 不会再访问即将删除的 queue（H1 核心防护）。*/
+    /* 如果正在录音，先停止 */
+    if (bemfa_voice_rec) {
+        bemfa_voice_rec = false;
+        asr_record_stop();
+    }
+
     bemfa_ui_lock();
     bemfa_screen_active = false;
     QueueHandle_t lq = bemfa_list_queue;
     QueueHandle_t sq = bemfa_send_queue;
     QueueHandle_t iq = bemfa_info_queue;
-    bemfa_list_queue = NULL;
-    bemfa_send_queue = NULL;
-    bemfa_info_queue = NULL;
+    QueueHandle_t vq = bemfa_voice_queue;
+    bemfa_list_queue   = NULL;
+    bemfa_send_queue   = NULL;
+    bemfa_info_queue   = NULL;
+    bemfa_voice_queue  = NULL;
     bemfa_ui_unlock();
 
     if (bemfa_poll_timer) {
@@ -3113,6 +3290,11 @@ static void bemfa_scr_delete_cb(lv_event_t *e)
         }
         vQueueDelete(iq);
     }
+    if (vq) {
+        bemfa_voice_result_t drop;
+        while (xQueueReceive(vq, &drop, 0) == pdTRUE) { }
+        vQueueDelete(vq);
+    }
     if (bemfa_group) {
         lv_group_delete(bemfa_group);
         bemfa_group = NULL;
@@ -3121,6 +3303,8 @@ static void bemfa_scr_delete_cb(lv_event_t *e)
     bemfa_list       = NULL;
     bemfa_spinner    = NULL;
     bemfa_status_lbl = NULL;
+    bemfa_voice_btn  = NULL;
+    bemfa_cached_count = 0;
 }
 
 static void show_bemfa_screen(void)
@@ -3169,10 +3353,22 @@ static void show_bemfa_screen(void)
     lv_obj_add_event_cb(back_btn, bemfa_back_btn_cb, LV_EVENT_CLICKED, NULL);
     lv_group_add_obj(bemfa_group, back_btn);
 
+    /* 语音控制按钮（按住说话）*/
+    bemfa_voice_btn = lv_list_add_button(bemfa_list, LV_SYMBOL_AUDIO, "按住说话");
+    lv_obj_set_style_bg_color(bemfa_voice_btn, lv_color_hex(0x0f3460), 0);
+    lv_obj_set_style_bg_color(bemfa_voice_btn, lv_color_hex(0xe94560), LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(bemfa_voice_btn, lv_color_hex(0xffffff), 0);
+    lv_obj_t *voice_txt_lbl = lv_obj_get_child(bemfa_voice_btn, 1);
+    if (voice_txt_lbl) lv_obj_set_style_text_font(voice_txt_lbl, &lv_font_simhei_16, 0);
+    lv_obj_add_event_cb(bemfa_voice_btn, bemfa_voice_pressed_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(bemfa_voice_btn, bemfa_voice_released_cb, LV_EVENT_RELEASED, NULL);
+    lv_group_add_obj(bemfa_group, bemfa_voice_btn);
+
     /* 创建 queue + 定时轮询 timer */
     bemfa_list_queue   = xQueueCreate(2, sizeof(bemfa_list_result_t *));
     bemfa_send_queue   = xQueueCreate(4, sizeof(bemfa_send_result_t));
     bemfa_info_queue   = xQueueCreate(4, sizeof(bemfa_info_result_t *));
+    bemfa_voice_queue  = xQueueCreate(2, sizeof(bemfa_voice_result_t));
     bemfa_poll_timer   = lv_timer_create(bemfa_poll_tick, 200, NULL);
 
     indev_set_group(bemfa_group);
