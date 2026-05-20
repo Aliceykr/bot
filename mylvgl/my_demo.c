@@ -3062,7 +3062,6 @@ static void bemfa_poll_tick(lv_timer_t *t)
         }
         if (vr.need_refresh) bemfa_kick_refresh();
     }
-}
 
     /* 4) info 单设备查询结果 */
     bemfa_info_result_t *ir = NULL;
