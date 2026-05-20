@@ -196,7 +196,7 @@ bot/
 - **蓝牙** — 开启 BLE 广播，手机发送 "SSID_xxx password_xxx" 配网后自动连接 WiFi；支持 BLE 远程音乐控制（`/music on` 列歌、`/序号` 播放、`/music off` 停止）
 - **音乐** — 扫描 SD 卡 `/sdcard/music/` 下的 WAV / MP3 文件，选择播放（支持暂停/切歌）
 - **音量** — 滑块调节音量（0-100%），对数增益曲线，NVS 持久化，重启自动恢复
-- **智能设备** — 巴法云 TCP 设备云控制，拉取已绑定设备列表，点击按钮 toggle 开关
+- **智能设备** — 巴法云 TCP 设备云控制，拉取已绑定设备列表，点击按钮 toggle 开关；支持语音控制（按住录音 → ASR 识别 → 关键词匹配执行开关）
 
 ### 2. Game Boy 模拟器
 
@@ -367,7 +367,8 @@ SD 卡音乐播放，支持 WAV 和 MP3 格式：
 - **线程安全**：模块级 mutex 串行化 HTTPS 请求，避免两个 HTTP client 并发引发 mbedTLS 冲突
 - **PSRAM 动态缓冲**：HTTP 响应从 4KB 起步按需 2 倍扩容到最大 32KB，API 返回后立即释放
 - **异步 UI**：后台 PSRAM 任务执行 HTTPS 操作，通过 FreeRTOS Queue + lv_timer 轮询更新 UI，LVGL 线程零阻塞
-- **屏幕生命周期安全**：mutex + active 标志保护 list / send / info 三个 Queue 句柄，退出屏幕时后台任务检测到 inactive 后丢弃结果而非写入已删除队列
+- **语音控制**：设备列表顶部"按住说话"按钮，按住编码器按键开始录音，松开自动发送百度 ASR 识别；解析识别文本匹配关键词（打开/关闭 + 设备名称 或"所有设备"），调用巴法云 API 执行开关操作；录音缓冲和识别任务栈全在 PSRAM，与 WiFi 无 DRAM 竞争；结果通过 Queue 回传 UI 显示状态文字
+- **屏幕生命周期安全**：mutex + active 标志保护 list / send / info / voice 四个 Queue 句柄，退出屏幕时后台任务检测到 inactive 后丢弃结果而非写入已删除队列
 
 ---
 
@@ -401,6 +402,7 @@ SD 卡音乐播放，支持 WAV 和 MP3 格式：
 | `bemfa_list` | 3 | 8192 B (PSRAM) | 巴法云设备列表 HTTPS 请求（一次性） |
 | `bemfa_send` | 3 | 8192 B (PSRAM) | 巴法云推送 on/off HTTPS 请求（一次性） |
 | `bemfa_info` | 3 | 8192 B (PSRAM) | 巴法云单设备状态回填查询（一次性） |
+| `bemfa_voice` | 3 | 16384 B (PSRAM) | 语音控制识别 + 关键词匹配执行（一次性） |
 | `ble_mstop` | 3 | 2048 B (DRAM) | BLE 触发的异步音乐停止（一次性） |
 | `health` | 1 | 2048 B | 堆内存监控（60s 周期） |
 

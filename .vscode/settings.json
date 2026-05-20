@@ -15,5 +15,5 @@
   "idf.flashType": "UART",
   "idf.flashBaudRate": "2000000",
   "idf.portWin": "COM13",
-  "idf.port": "/dev/ttyACM0"
+  "idf.port": "/dev/ttyUSB0"
 }
