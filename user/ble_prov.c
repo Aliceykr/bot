@@ -322,7 +322,8 @@ static void handle_music_command(const char *cmd)
                  (int)(sizeof(match->name) - 1), match->name);
         ble_send_notify(line);
     } else {
-        ble_send_notify("播放失败");
+        snprintf(line, sizeof(line), "播放失败: %s", music_last_error_text());
+        ble_send_notify(line);
     }
 
 out:

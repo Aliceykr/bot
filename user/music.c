@@ -1,6 +1,7 @@
 #include "music.h"
 #include "speaker.h"
 #include "sdcard.h"
+#include "psram_task.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -114,6 +115,7 @@ static SemaphoreHandle_t      s_mtx             = NULL;
 static SemaphoreHandle_t      s_done_sem        = NULL;
 static TaskHandle_t           s_task            = NULL;
 static char                   s_current_name[96] = "";
+static volatile music_error_t s_last_error      = MUSIC_ERR_NONE;
 
 static inline void mp_lock(void)   { if (s_mtx) xSemaphoreTake(s_mtx, portMAX_DELAY); }
 static inline void mp_unlock(void) { if (s_mtx) xSemaphoreGive(s_mtx); }
@@ -220,7 +222,7 @@ static bool decode_wav_stream(FILE *fp)
     }
 
     uint8_t *file_buf = heap_caps_malloc(FREAD_CHUNK, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    int16_t *mono_buf = heap_caps_malloc(FREAD_CHUNK / 2, MALLOC_CAP_SPIRAM);
+    int16_t *mono_buf = heap_caps_malloc(FREAD_CHUNK, MALLOC_CAP_SPIRAM);
     if (!file_buf || !mono_buf) {
         ESP_LOGE(TAG, "缓冲分配失败 (file_buf DMA-DRAM=%p, mono_buf PSRAM=%p)",
                  file_buf, mono_buf);
@@ -345,6 +347,7 @@ static bool decode_mp3_stream(FILE *fp)
     }
 
     int in_left = 0;
+    uint8_t *read_ptr = in_buf;
     bool sample_rate_set = false;
     bool ok = true;
     uint32_t eof_consume_count = 0;
@@ -353,8 +356,10 @@ static bool decode_mp3_stream(FILE *fp)
     while (!s_stop_request) {
         /* 1. 补齐输入缓冲 */
         if (in_left < MP3_INPUT_CHUNK / 2) {
-            /* 把剩下的 in_left 字节搬到 buf 头部 */
-            if (in_left > 0) memmove(in_buf, in_buf + (MP3_INPUT_CHUNK - in_left), in_left);
+            /* Helix 会移动 read_ptr 并更新 in_left；剩余有效数据从 read_ptr 开始。
+             * 必须按 read_ptr 搬回缓冲头，不能假设剩余数据还在旧缓冲尾部。 */
+            if (in_left > 0 && read_ptr != in_buf) memmove(in_buf, read_ptr, in_left);
+            read_ptr = in_buf;
             size_t want = MP3_INPUT_CHUNK - in_left;
             size_t got  = fread(in_buf + in_left, 1, want, fp);
             if (got == 0) {
@@ -370,12 +375,11 @@ static bool decode_mp3_stream(FILE *fp)
         if (in_left <= 0) break;
 
         /* 2. 找 sync word */
-        /* memmove 后有效数据布局是 [in_buf, in_buf + in_left)，解码起点是 in_buf */
-        uint8_t *read_ptr = in_buf;
         int offset = MP3FindSyncWord(read_ptr, in_left);
         if (offset < 0) {
             /* 整块都没 sync：丢弃，重新 fread */
             in_left = 0;
+            read_ptr = in_buf;
             continue;
         }
         read_ptr += offset;
@@ -524,6 +528,9 @@ static void music_task(void *arg)
 
 done:
     /* 还原默认采样率，后续 TTS / GB 音频不会变调 */
+    if (!s_stop_request) {
+        speaker_wait_drain(30000, &s_stop_request);
+    }
     speaker_set_sample_rate(SPK_SAMPLE_RATE);
 
     mp_lock();
@@ -535,7 +542,7 @@ done:
     if (s_done_sem) xSemaphoreGive(s_done_sem);
     ESP_LOGI(TAG, "播放任务退出");
     free(path);
-    vTaskDelete(NULL);
+    return;
 }
 
 /* ================================================================
@@ -543,12 +550,19 @@ done:
  * ================================================================ */
 bool music_play(const char *path)
 {
-    if (!path) return false;
+    s_last_error = MUSIC_ERR_NONE;
+    if (!path) {
+        s_last_error = MUSIC_ERR_INVALID_ARG;
+        return false;
+    }
 
     /* 兜底：如果 music_init 未被调用过 */
     if (!s_mtx)       s_mtx = xSemaphoreCreateMutex();
     if (!s_done_sem)  s_done_sem = xSemaphoreCreateBinary();
-    if (!s_mtx || !s_done_sem) return false;
+    if (!s_mtx || !s_done_sem) {
+        s_last_error = MUSIC_ERR_INIT_FAILED;
+        return false;
+    }
 
     /* 按后缀识别格式 */
     const char *slash = strrchr(path, '/');
@@ -556,11 +570,13 @@ bool music_play(const char *path)
     music_fmt_t fmt   = fmt_from_name(name);
     if (fmt == MUSIC_FMT_UNKNOWN) {
         ESP_LOGE(TAG, "不支持的格式: %s", path);
+        s_last_error = MUSIC_ERR_UNSUPPORTED_FORMAT;
         return false;
     }
 #if !MUSIC_ENABLE_MP3
     if (fmt == MUSIC_FMT_MP3) {
         ESP_LOGE(TAG, "MP3 支持未编译，无法播放: %s", path);
+        s_last_error = MUSIC_ERR_UNSUPPORTED_FORMAT;
         return false;
     }
 #endif
@@ -571,10 +587,17 @@ bool music_play(const char *path)
     }
 
     char *path_dup = strdup(path);
-    if (!path_dup) return false;
+    if (!path_dup) {
+        s_last_error = MUSIC_ERR_NO_MEM;
+        return false;
+    }
 
     play_args_t *pa = malloc(sizeof(*pa));
-    if (!pa) { free(path_dup); return false; }
+    if (!pa) {
+        free(path_dup);
+        s_last_error = MUSIC_ERR_NO_MEM;
+        return false;
+    }
     pa->path = path_dup;
     pa->fmt  = fmt;
 
@@ -584,20 +607,21 @@ bool music_play(const char *path)
     /* 清一下 done_sem 可能的旧 signal */
     xSemaphoreTake(s_done_sem, 0);
 
-    /* 任务栈：
-     *   WAV 路径实际用 ~2KB（header 解析 + memcpy）
-     *   MP3 路径 helix decode 实测 ~6-7KB，加 fread(FATFS) 深调用余量
-     *   给 10KB 足够（helix 官方示例也是 10KB 档），比之前 12KB 省 2KB DRAM。
-     * 放内部 DRAM：helix 内部 const 表放 flash，关 cache 时不能访问→若
-     * 从 PSRAM 栈切换后被抢占 + 同时刷 flash 可能崩。*/
-    BaseType_t r = xTaskCreate(music_task, "music", 10240,
-                               pa, 4, &s_task);
+    /* 音乐任务栈较大；BLE 开启后内部 DRAM 紧张，继续用 xTaskCreate
+     * 很容易创建失败，手机端就会收到"播放失败"。解码输入/输出缓冲已显式
+     * 分配，任务栈放 PSRAM 可以显著降低 BLE + 音乐并发时的内部 DRAM 压力。 */
+    BaseType_t r = xTaskCreatePSRAM(music_task, "music", 12288,
+                                    pa, 4, &s_task);
     if (r != pdPASS) {
         free(pa);
         free(path_dup);
         s_task = NULL;
         mp_unlock();
-        ESP_LOGE(TAG, "任务创建失败");
+        s_last_error = MUSIC_ERR_TASK_CREATE;
+        ESP_LOGE(TAG, "任务创建失败 (DRAM free=%u largest=%u, PSRAM free=%u)",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
         return false;
     }
     mp_unlock();
@@ -674,3 +698,17 @@ void music_resume(void)
 
 music_state_t music_state(void)             { return s_state; }
 const char   *music_current_name(void)      { return s_current_name; }
+music_error_t music_last_error(void)        { return s_last_error; }
+
+const char *music_last_error_text(void)
+{
+    switch (s_last_error) {
+    case MUSIC_ERR_NONE:               return "ok";
+    case MUSIC_ERR_INVALID_ARG:        return "invalid arg";
+    case MUSIC_ERR_INIT_FAILED:        return "init failed";
+    case MUSIC_ERR_UNSUPPORTED_FORMAT: return "unsupported format";
+    case MUSIC_ERR_NO_MEM:             return "no mem";
+    case MUSIC_ERR_TASK_CREATE:        return "task create";
+    default:                           return "unknown";
+    }
+}

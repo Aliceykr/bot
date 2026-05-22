@@ -1604,8 +1604,9 @@ static void ble_cred_cb(const char *ssid, const char *password)
 static void close_btn_cb(lv_event_t *e)
 {
     lv_obj_t *mbox = lv_event_get_user_data(e);
+    lv_group_t *restore_group = (lv_group_t *)lv_obj_get_user_data(mbox);
     lv_obj_delete(mbox);  /* group_delete_cb 自动释放 popup_group */
-    indev_set_group(group);  /* 恢复主菜单编码器 */
+    indev_set_group(restore_group ? restore_group : group);
 }
 
 static void show_result_box(bool ok, bool cancelled, const char *ip)
@@ -1916,6 +1917,7 @@ static lv_obj_t    *music_scr        = NULL;
 static lv_obj_t    *music_list       = NULL;
 static lv_obj_t    *music_status_lbl = NULL;
 static lv_timer_t  *music_status_timer = NULL;
+static lv_group_t  *music_group      = NULL;
 static char         music_playing_name[96] = "";  /* 当前播放文件名（UI 用） */
 /* 扫描缓冲：music_entry_t * MUSIC_MAX_COUNT ≈ 4.8KB。
  * 用函数内 PSRAM 堆分配代替 BSS 静态数组，退出时 free，省内部 DRAM。*/
@@ -1977,6 +1979,7 @@ static void music_scan_buf_delete_cb(lv_event_t *e)
     music_status_lbl = NULL;
     music_list       = NULL;
     music_scr        = NULL;
+    music_group      = NULL;
     /* 状态 timer 理论上应该在 back_btn 里已经 delete，但保险起见再兜底一次：
      * timer 指针在 back_btn 里会清为 NULL，若因异常路径没清，这里 delete。 */
     if (music_status_timer) {
@@ -2021,7 +2024,8 @@ static void music_bg_stop_btn_cb(lv_event_t *e)
 {
     (void)e;
     if (music_state() == MUSIC_STATE_IDLE) {
-        create_result_dialog("无后台音乐", 0x888888);
+        lv_obj_t *dlg = create_result_dialog("无后台音乐", 0x888888);
+        lv_obj_set_user_data(dlg, music_group);
         return;
     }
 
@@ -2031,7 +2035,8 @@ static void music_bg_stop_btn_cb(lv_event_t *e)
         ESP_LOGW("DEMO", "music_stop_task 创建失败，降级同步 stop");
         music_stop();
     }
-    create_result_dialog("已关闭后台音乐", 0x1E90FF);
+    lv_obj_t *dlg = create_result_dialog("已关闭后台音乐", 0x1E90FF);
+    lv_obj_set_user_data(dlg, music_group);
 }
 
 /* 点击列表项：
@@ -2137,6 +2142,7 @@ static void show_music_screen(void)
     lv_obj_set_style_radius(music_list, 4, 0);
 
     lv_group_t *mg = lv_group_create();
+    music_group = mg;
 
     /* 返回按钮 */
     lv_obj_t *back_btn = lv_list_add_button(music_list, LV_SYMBOL_LEFT, "返回");

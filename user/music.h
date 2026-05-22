@@ -50,6 +50,15 @@ typedef enum {
     MUSIC_STATE_PAUSED,
 } music_state_t;
 
+typedef enum {
+    MUSIC_ERR_NONE = 0,
+    MUSIC_ERR_INVALID_ARG,
+    MUSIC_ERR_INIT_FAILED,
+    MUSIC_ERR_UNSUPPORTED_FORMAT,
+    MUSIC_ERR_NO_MEM,
+    MUSIC_ERR_TASK_CREATE,
+} music_error_t;
+
 /* 扫描 /sdcard/music/ 下的支持文件，写入 list + 实际数量。
  * 返回 true 表示扫描成功（0 首歌也返回 true）；SD 未挂载返回 false。*/
 bool music_scan(music_entry_t *list, int *count);
@@ -73,5 +82,7 @@ void music_resume(void);
 
 music_state_t music_state(void);
 const char   *music_current_name(void);
+music_error_t music_last_error(void);
+const char   *music_last_error_text(void);
 
 #endif

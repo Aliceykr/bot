@@ -359,55 +359,80 @@ int speaker_play(const int16_t *pcm, size_t len_bytes)
     const uint8_t *bytes = (const uint8_t *)pcm;
     size_t bytes_left = len_bytes;
 
-    /* 计算要写入 ring 的字节数，提前判断空间
-     * - 若有 tail_valid：合并出 1 个样本 → 2 字节
-     * - 剩余 (bytes_left - 1) 字节中 ((bytes_left-1) & ~1) 字节是完整样本，
-     *   按原样处理后写入 ring（每 2 字节 → 1 个 int16 → 2 字节输出）
-     * - 最后可能有 1 个奇数字节保留到下次 */
     bool will_consume_tail = (s_pcm_tail_valid && bytes_left >= 1);
-    size_t input_after_tail = bytes_left - (will_consume_tail ? 1 : 0);
-    size_t full_samples_in  = input_after_tail / 2;  /* 完整样本数（来自输入）*/
-    size_t ring_bytes_need  = (will_consume_tail ? 2 : 0) + full_samples_in * 2;
-
-    size_t free_size = xRingbufferGetCurFreeSize(s_ringbuf);
-    if (free_size < ring_bytes_need) {
-        /* 空间不足：调用方重试，不改状态 */
-        xSemaphoreGive(s_play_mtx);
-        return 0;
-    }
-
     size_t consumed = 0;
     int16_t proc[PROC_BATCH];
     size_t  proc_n = 0;
+    size_t  proc_input_bytes = 0;
+    bool ring_full = false;
+    bool batch_snapshot_valid = false;
+    uint8_t batch_tail = 0;
+    bool batch_tail_valid = false;
+    float batch_hp_x1 = 0.0f;
+    float batch_hp_y1 = 0.0f;
+    uint16_t batch_fade = 0;
 
-    /* 刷 proc 到 ring；空间已提前预留，portMAX_DELAY 会立即成功 */
-    #define FLUSH_PROC() do {                                                  \
-        if (proc_n > 0) {                                                      \
-            xRingbufferSend(s_ringbuf, proc,                                   \
-                            proc_n * sizeof(int16_t), portMAX_DELAY);          \
-            proc_n = 0;                                                        \
-        }                                                                      \
+    /* 只在 ringbuffer 真正接收后才算消费输入。
+     * Byte ringbuffer 每个 item 有头部开销，单看 xRingbufferGetCurFreeSize()
+     * 容易误判可写空间；以前发送失败仍返回已消费，音乐 PCM 会被静默丢掉。
+     * 若发送失败，必须回滚 HPF/fade/tail 状态，因为调用方会重试同一段 PCM。 */
+    #define START_BATCH() do {                                                  \
+        if (!batch_snapshot_valid) {                                            \
+            batch_tail = s_pcm_tail;                                            \
+            batch_tail_valid = s_pcm_tail_valid;                                \
+            batch_hp_x1 = s_hp_x1;                                              \
+            batch_hp_y1 = s_hp_y1;                                              \
+            batch_fade = s_fade_count;                                          \
+            batch_snapshot_valid = true;                                        \
+        }                                                                       \
+    } while (0)
+
+    #define FLUSH_PROC() do {                                                   \
+        if (proc_n > 0) {                                                       \
+            if (xRingbufferSend(s_ringbuf, proc,                                \
+                                proc_n * sizeof(int16_t), 0) != pdTRUE) {       \
+                s_pcm_tail = batch_tail;                                        \
+                s_pcm_tail_valid = batch_tail_valid;                            \
+                s_hp_x1 = batch_hp_x1;                                          \
+                s_hp_y1 = batch_hp_y1;                                          \
+                s_fade_count = batch_fade;                                      \
+                ring_full = true;                                               \
+            } else {                                                            \
+                consumed += proc_input_bytes;                                   \
+            }                                                                   \
+            proc_n = 0;                                                         \
+            proc_input_bytes = 0;                                               \
+            batch_snapshot_valid = false;                                       \
+        }                                                                       \
     } while (0)
 
     /* 1) 合并上次遗留的 tail 字节 */
     if (will_consume_tail) {
+        START_BATCH();
         int16_t s = (int16_t)((uint16_t)s_pcm_tail |
                               ((uint16_t)bytes[0] << 8));
         proc[proc_n++] = process_sample(s);
+        proc_input_bytes += 1;
         s_pcm_tail_valid = false;
         bytes      += 1;
         bytes_left -= 1;
-        consumed   += 1;
+
+        FLUSH_PROC();
+        if (ring_full) {
+            s_pcm_tail_valid = true;
+            goto out;
+        }
     }
 
     /* 2) 按 2 字节一个样本处理剩余字节 */
-    while (bytes_left >= 2) {
+    while (bytes_left >= 2 && !ring_full) {
+        START_BATCH();
         int16_t s = (int16_t)((uint16_t)bytes[0] |
                               ((uint16_t)bytes[1] << 8));
         proc[proc_n++] = process_sample(s);
+        proc_input_bytes += 2;
         bytes      += 2;
         bytes_left -= 2;
-        consumed   += 2;
 
         if (proc_n >= PROC_BATCH) {
             FLUSH_PROC();
@@ -415,6 +440,7 @@ int speaker_play(const int16_t *pcm, size_t len_bytes)
     }
 
     FLUSH_PROC();
+    if (ring_full) goto out;
 
     /* 3) 末尾若剩 1 个奇数字节，保留到下一次 */
     if (bytes_left == 1) {
@@ -424,7 +450,9 @@ int speaker_play(const int16_t *pcm, size_t len_bytes)
     }
 
     #undef FLUSH_PROC
+    #undef START_BATCH
 
+out:
     xSemaphoreGive(s_play_mtx);
     return (int)consumed;
 }
@@ -504,6 +532,36 @@ bool speaker_set_sample_rate(uint32_t hz)
 uint32_t speaker_get_sample_rate(void)
 {
     return s_sample_rate;
+}
+
+bool speaker_wait_drain(uint32_t timeout_ms, volatile const bool *cancel_flag)
+{
+    if (!s_ringbuf) return true;
+
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+    while (xRingbufferGetCurFreeSize(s_ringbuf) < SPK_RINGBUF_SIZE) {
+        if (cancel_flag && *cancel_flag) return false;
+        if (timeout_ms != portMAX_DELAY &&
+            (xTaskGetTickCount() - start) >= timeout_ticks) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    /* tx_task 可能刚从 ring 取走最后一块，给 DMA 一点时间把当前 chunk 推完。
+     * DMA 帧数固定，按当前采样率估算，低采样率下等待要比 80ms 更久。 */
+    uint32_t sr = s_sample_rate ? s_sample_rate : SPK_SAMPLE_RATE;
+    uint32_t dma_ms = (DMA_DESC_NUM * DMA_FRAME_NUM * 1000U + sr - 1U) / sr;
+    uint32_t settle_ms = dma_ms + 20U;
+    uint32_t waited_ms = 0;
+    while (waited_ms < settle_ms) {
+        if (cancel_flag && *cancel_flag) return false;
+        uint32_t step = (settle_ms - waited_ms) > 10U ? 10U : (settle_ms - waited_ms);
+        vTaskDelay(pdMS_TO_TICKS(step));
+        waited_ms += step;
+    }
+    return true;
 }
 
 /* ================================================================

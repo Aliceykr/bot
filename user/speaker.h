@@ -83,4 +83,15 @@ uint8_t speaker_get_volume(void);
  */
 void speaker_flush(void);
 
+/**
+ * @brief 等待已经送入 RingBuffer 的音频尽量播放完成
+ *
+ * 主要用于音乐自然播完后再切回默认采样率，避免 speaker_set_sample_rate()
+ * 的 flush 把还在缓冲里的尾段音乐直接清掉。
+ *
+ * @param timeout_ms 最长等待时间
+ * @return true 缓冲已排空；false 超时
+ */
+bool speaker_wait_drain(uint32_t timeout_ms, volatile const bool *cancel_flag);
+
 #endif /* __SPEAKER_H */
