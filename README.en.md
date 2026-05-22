@@ -80,7 +80,7 @@ A/B phases are decoded by hardware PCNT, the SW button uses a 5 ms polled state 
 | 3.3V | 3.3V   | VCC |
 | GND  | GND    | GND, AD0 (address 0x68) |
 
-400 kHz I2C, ±2 g range, DLPF 44 Hz. Initialised only when entering 2048, the bus is released on exit. Tilt detection uses hysteresis thresholds (ENTER 0.30 g, EXIT 0.15 g) plus direction lock with X/Y dominant axis to choose the move direction. Flat orientation produces no input. The hysteresis design eliminates the "spurious opposite move when returning to flat" jitter.
+400 kHz I2C, ±2 g range, DLPF 44 Hz. Initialised only when entering 2048, the bus is released on exit. On entry the current pose is sampled as the neutral baseline, then tilt detection uses hysteresis thresholds (ENTER 0.30 g, EXIT 0.15 g) plus direction lock with X/Y dominant axis to choose the move direction. This reduces false triggers caused by mounting angle, sensor offset, and return-to-flat jitter.
 
 ### DHT11 temperature & humidity sensor
 
@@ -193,7 +193,7 @@ The boot screen shows the feature list. Scroll with the rotary encoder, confirm 
 - 80 MHz async DMA double-line buffer rendering
 - ROMs are loaded from SD card to PSRAM (up to 4 MB); small ROMs (≤256 KB) are also copied to DRAM for speed
 - Built-in 2048 lives at the top of the list, always visible even with no SD card
-- 2048 tilt control: MPU6050 accelerometer maps device tilt to four directions and runs alongside the keypad (keypad takes priority; tilt is only used when no key is held)
+- 2048 tilt control: MPU6050 accelerometer calibrates the current pose as the neutral baseline when entering the game, then maps device tilt to four directions and runs alongside the keypad (keypad takes priority; tilt is only used when no key is held)
 - 3x3 keypad covers full GB inputs (A/B/dir/START/SELECT/EXIT)
 - Entering a game suspends WiFi and BLE; on exit only the services that were active before are resumed
 
