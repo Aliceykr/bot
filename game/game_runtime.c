@@ -2,6 +2,7 @@
 #include "rom_loader.h"
 #include "gb_emu.h"
 #include "game_2048.h"
+#include "game_dice.h"
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -13,11 +14,13 @@
 /* 内置游戏（非 ROM）使用的特殊 rom_name 前缀。
  * ROM 列表传入这些名字时不走 SPIFFS 加载，直接调对应的内置游戏。 */
 #define BUILTIN_2048_NAME "__builtin_2048"
+#define BUILTIN_DICE_NAME "__builtin_dice"
 
 void game_runtime_request_exit(void)
 {
     gb_emu_request_exit();
     game_2048_request_exit();
+    game_dice_request_exit();
 }
 
 void game_runtime_run(const char *rom_name)
@@ -27,6 +30,11 @@ void game_runtime_run(const char *rom_name)
     if (rom_name && strcmp(rom_name, BUILTIN_2048_NAME) == 0) {
         ESP_LOGI(TAG, "启动内置 2048");
         game_2048_run();
+        return;
+    }
+    if (rom_name && strcmp(rom_name, BUILTIN_DICE_NAME) == 0) {
+        ESP_LOGI(TAG, "启动内置摇骰子");
+        game_dice_run();
         return;
     }
 

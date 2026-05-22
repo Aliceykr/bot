@@ -1823,7 +1823,7 @@ static void show_game_screen(void)
 
     /* 标题 */
     lv_obj_t *title = lv_label_create(scr);
-    lv_label_set_text(title, "游戏 - 选择 ROM");
+    lv_label_set_text(title, "游戏 - 选择游戏");
     lv_obj_set_style_text_color(title, lv_color_hex(0xe94560), 0);
     lv_obj_set_style_text_font(title, &lv_font_simhei_16, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
@@ -1855,11 +1855,22 @@ static void show_game_screen(void)
     int count = 0;
     bool ok = rom_loader_scan(s_roms, &count);
 
-    /* 内置游戏"2048"：不走 ROM 扫描，手动加一条列表项。
-     * rom_item_cb 通过 user_data 传 __builtin_2048 触发 game_runtime_run
-     * 里的内置分派。放在列表顶部：即使 SD 卡上没有 ROM 也能玩 2048。
+    /* 内置游戏：不走 ROM 扫描，手动加列表项。
+     * rom_item_cb 通过 user_data 传特殊名字触发 game_runtime_run
+     * 里的内置分派。放在列表顶部：即使 SD 卡上没有 ROM 也能玩本地游戏。
      * 字符串是程序段常量，可长期作为 user_data。*/
     static const char *kBuiltin2048 = "__builtin_2048";
+    static const char *kBuiltinDice = "__builtin_dice";
+
+    lv_obj_t *btn_dice = lv_list_add_button(rlist, LV_SYMBOL_PLAY, "摇骰子 (内置)");
+    lv_obj_set_style_bg_color(btn_dice, lv_color_hex(0x16213e), 0);
+    lv_obj_set_style_bg_color(btn_dice, lv_color_hex(0xe94560), LV_STATE_FOCUSED);
+    lv_obj_set_style_text_color(btn_dice, lv_color_hex(0xffffff), 0);
+    lv_obj_t *lbl_dice = lv_obj_get_child(btn_dice, 1);
+    if (lbl_dice) lv_obj_set_style_text_font(lbl_dice, &lv_font_simhei_16, 0);
+    lv_obj_add_event_cb(btn_dice, rom_item_cb, LV_EVENT_CLICKED, (void *)kBuiltinDice);
+    lv_group_add_obj(gg, btn_dice);
+
     lv_obj_t *btn_2048 = lv_list_add_button(rlist, LV_SYMBOL_PLAY, "2048 (内置)");
     lv_obj_set_style_bg_color(btn_2048, lv_color_hex(0x16213e), 0);
     lv_obj_set_style_bg_color(btn_2048, lv_color_hex(0xe94560), LV_STATE_FOCUSED);
