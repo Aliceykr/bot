@@ -151,6 +151,7 @@ static IRAM_ATTR void lcd_draw_line_cb(struct gb_s *gb,
                                        const uint_fast8_t y)
 {
     if (s_exit_requested) return;
+    if (!s_spi) return;
 
     uint16_t *buf = s_group_buf[s_buf_idx];
 
@@ -190,6 +191,10 @@ static IRAM_ATTR void lcd_draw_line_cb(struct gb_s *gb,
 /* 等帧末尾的 DMA 完成 */
 static inline void flush_pending_dma(void)
 {
+    if (!s_spi) {
+        s_dma_busy = false;
+        return;
+    }
     if (s_dma_busy) {
         spi_transaction_t *ret;
         spi_device_get_trans_result(s_spi, &ret, portMAX_DELAY);

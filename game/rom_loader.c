@@ -10,7 +10,7 @@
 
 #define TAG "ROM_LOADER"
 
-/* ROM 现在全部从 SD 卡读取：/sdcard/roms/ 下的 .gb / .gbc 文件
+/* ROM 现在全部从 SD 卡读取：/sdcard/rom/ 下的 .gb / .gbc 文件
  *
  * 以前的 SPIFFS 方案已废弃，storage 分区从 partitions.csv 删除，app0/app1
  * 各扩到 6.5MB。
@@ -55,8 +55,8 @@ bool rom_loader_scan(rom_entry_t *list, int *count)
 
     DIR *d = opendir(ROM_DIR);
     if (!d) {
-        /* 用户可能还没建 roms 目录，这不是错误，返回空列表 */
-        ESP_LOGW(TAG, "%s 不存在，请在 SD 卡上创建 roms/ 目录", ROM_DIR);
+        /* 用户可能还没建 rom 目录，这不是错误，返回空列表 */
+        ESP_LOGW(TAG, "%s 不存在，请在 SD 卡上创建 rom/ 目录", ROM_DIR);
         return true;
     }
 

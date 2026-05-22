@@ -16,6 +16,7 @@ class BleService {
   BluetoothDevice? _device;
   BluetoothCharacteristic? _char;
   StreamSubscription? _notifySub;
+  StreamSubscription? _connStateSub;
 
   final _notifyController = StreamController<String>.broadcast();
   Stream<String> get onNotify => _notifyController.stream;
@@ -25,6 +26,8 @@ class BleService {
 
   bool get isConnected => _device != null && _device!.isConnected;
   String get deviceName => _device?.platformName ?? '';
+
+  Future<void>? _cleanupFuture;
 
   /// 判断 UUID 是否匹配（兼容 16-bit 短格式和 128-bit 长格式）
   bool _uuidMatches(Guid uuid, String short16) {
@@ -36,15 +39,16 @@ class BleService {
 
   /// 连接设备并订阅 Notify
   Future<void> connect(BluetoothDevice device) async {
+    await _cleanup();
     _device = device;
     await device.connect(timeout: const Duration(seconds: 10));
     _connectionController.add(true);
 
     // 监听断连
-    device.connectionState.listen((state) {
+    _connStateSub = device.connectionState.listen((state) {
       if (state == BluetoothConnectionState.disconnected) {
         _connectionController.add(false);
-        _cleanup();
+        unawaited(_cleanup());
       }
     });
 
@@ -92,16 +96,33 @@ class BleService {
   /// 断开连接
   Future<void> disconnect() async {
     await _device?.disconnect();
-    _cleanup();
+    await _cleanup();
   }
 
-  void _cleanup() {
-    _notifySub?.cancel();
+  Future<void> _cleanup() async {
+    final running = _cleanupFuture;
+    if (running != null) return running;
+    final future = _doCleanup();
+    _cleanupFuture = future;
+    try {
+      await future;
+    } finally {
+      _cleanupFuture = null;
+    }
+  }
+
+  Future<void> _doCleanup() async {
+    await _notifySub?.cancel();
     _notifySub = null;
+    final connSub = _connStateSub;
+    _connStateSub = null;
+    await connSub?.cancel();
     _char = null;
+    _device = null;
   }
 
-  void dispose() {
+  Future<void> dispose() async {
+    await _cleanup();
     _notifyController.close();
     _connectionController.close();
   }

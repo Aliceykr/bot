@@ -1,12 +1,19 @@
 #include "lcd.h"
 #include "lcdfont.h"
+#include "esp_err.h"
+#include "esp_log.h"
 
 spi_device_handle_t s_spi = NULL;
+static const char *TAG = "LCD";
 static void lcd_delay_ms(uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
 
 static void lcd_spi_send(const uint8_t *data, size_t len)
 {
     if (len == 0) return;
+    if (!s_spi) {
+        ESP_LOGE(TAG, "SPI device not initialized");
+        return;
+    }
     spi_transaction_t t = { .length = len * 8, .tx_buffer = data };
     spi_device_polling_transmit(s_spi, &t);
 }
@@ -33,7 +40,12 @@ void LCD_GPIO_Init(void)
         .quadhd_io_num = -1,
         .max_transfer_sz = 4096,
     };
-    spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    esp_err_t ret = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "spi_bus_initialize failed: %s", esp_err_to_name(ret));
+        s_spi = NULL;
+        return;
+    }
 
     spi_device_interface_config_t devcfg = {
         .clock_speed_hz = 80 * 1000 * 1000,
@@ -41,7 +53,13 @@ void LCD_GPIO_Init(void)
         .spics_io_num   = -1,  // 无 CS
         .queue_size     = 7,
     };
-    spi_bus_add_device(SPI2_HOST, &devcfg, &s_spi);
+    ret = spi_bus_add_device(SPI2_HOST, &devcfg, &s_spi);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "spi_bus_add_device failed: %s", esp_err_to_name(ret));
+        spi_bus_free(SPI2_HOST);
+        s_spi = NULL;
+        return;
+    }
 }
 
 void LCD_Writ_Bus(uint8_t dat) { lcd_spi_send(&dat, 1); }
@@ -60,6 +78,10 @@ void LCD_WR_REG(uint8_t dat)
 
 void LCD_Send_Buf(const uint8_t *buf, uint32_t len)
 {
+    if (!s_spi) {
+        ESP_LOGE(TAG, "LCD_Send_Buf skipped: SPI device not initialized");
+        return;
+    }
     gpio_set_level(LCD_DC_PIN, 1);
     uint32_t remain = len;
     const uint8_t *p = buf;
@@ -89,6 +111,10 @@ void LCD_Backlight(uint8_t on)
 void LCD_Init(void)
 {
     LCD_GPIO_Init();
+    if (!s_spi) {
+        ESP_LOGE(TAG, "LCD init aborted: SPI device not initialized");
+        return;
+    }
     LCD_RES_Clr(); lcd_delay_ms(200);
     LCD_RES_Set(); lcd_delay_ms(200);
 
@@ -138,6 +164,10 @@ void LCD_Init(void)
 
 void LCD_Fill(uint16_t xsta, uint16_t ysta, uint16_t xend, uint16_t yend, uint16_t color)
 {
+    if (!s_spi) {
+        ESP_LOGE(TAG, "LCD_Fill skipped: SPI device not initialized");
+        return;
+    }
     uint8_t color_h = color >> 8;
     uint8_t color_l = color & 0xFF;
     static uint8_t fill_buf[LCD_W * 2];  // 一行缓冲

@@ -37,6 +37,8 @@
  * 单一阈值会在回弹瞬间被误判为"再次倾斜"，触发多余的方向移动。 */
 #define TILT_ENTER_G   0.30f   /* 进入倾斜的门槛 */
 #define TILT_EXIT_G    0.15f   /* 退出倾斜的门槛 */
+#define TILT_CONFIRM_SAMPLES  2 /* 连续同方向样本数，避免单帧噪声触发 */
+#define NEUTRAL_CALIB_SAMPLES 24
 
 /* I2C 操作超时（毫秒）。
  * 400kHz 下读写 6 字节 < 1ms，10ms 足够覆盖任何正常情况。
@@ -50,10 +52,14 @@
 static i2c_master_bus_handle_t s_bus    = NULL;
 static i2c_master_dev_handle_t s_dev    = NULL;
 static bool                    s_ready  = false;
+static float                   s_zero_ax = 0.0f;
+static float                   s_zero_ay = 0.0f;
 
 /* 倾斜方向滞后状态：mpu6050_get_direction 内部使用，
  * 放在文件作用域便于 deinit 重置，避免下次进入游戏时残留旧方向。 */
 static mpu_dir_t               s_last_dir = MPU_DIR_NONE;
+static mpu_dir_t               s_candidate_dir = MPU_DIR_NONE;
+static uint8_t                 s_candidate_count = 0;
 
 /* 连续读取失败计数：用于游戏期间检测 MPU6050 掉线，
  * 静默失效时给用户一个 warning 提示 */
@@ -167,8 +173,37 @@ bool mpu6050_init(void)
     s_ready = true;
     s_read_fail_streak = 0;
     s_last_dir = MPU_DIR_NONE;
+    s_candidate_dir = MPU_DIR_NONE;
+    s_candidate_count = 0;
+    s_zero_ax = 0.0f;
+    s_zero_ay = 0.0f;
+
+    /* 把进入游戏时的静止姿态当作中立点。
+     * 这样即使 MPU6050 模块安装不完全水平，或整机自然放置有一点倾角，
+     * 静止时的 X/Y 重力分量也不会直接被当成一次移动。 */
+    float sum_x = 0.0f;
+    float sum_y = 0.0f;
+    int samples = 0;
+    for (int i = 0; i < NEUTRAL_CALIB_SAMPLES; i++) {
+        float ax, ay, az;
+        if (mpu6050_read_accel(&ax, &ay, &az)) {
+            sum_x += ax;
+            sum_y += ay;
+            samples++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    if (samples > 0) {
+        s_zero_ax = sum_x / (float)samples;
+        s_zero_ay = sum_y / (float)samples;
+    } else {
+        ESP_LOGW(TAG, "中立姿态校准失败，使用 0g 基线");
+    }
+
     ESP_LOGI(TAG, "MPU6050 初始化完成 (SDA=%d SCL=%d ±2g 100Hz)",
              MPU_I2C_SDA_PIN, MPU_I2C_SCL_PIN);
+    ESP_LOGI(TAG, "倾斜中立基线 ax=%.3f ay=%.3f (%d samples)",
+             s_zero_ax, s_zero_ay, samples);
     return true;
 }
 
@@ -189,6 +224,10 @@ void mpu6050_deinit(void)
     }
     s_read_fail_streak = 0;
     s_last_dir = MPU_DIR_NONE;
+    s_candidate_dir = MPU_DIR_NONE;
+    s_candidate_count = 0;
+    s_zero_ax = 0.0f;
+    s_zero_ay = 0.0f;
     ESP_LOGI(TAG, "MPU6050 已释放");
 }
 
@@ -233,10 +272,17 @@ bool mpu6050_read_accel(float *ax, float *ay, float *az)
 mpu_dir_t mpu6050_get_direction(void)
 {
     float ax, ay, az;
-    /* I2C 失败时不更新 s_last_dir（保留滞后状态），但返回 NONE。
-     * 不返回 s_last_dir 是为了让游戏端 prev_tilt 能正确归零，
-     * 避免连续失败期间用户回正后再倾斜时边沿触发失效。 */
-    if (!mpu6050_read_accel(&ax, &ay, &az)) return MPU_DIR_NONE;
+    /* I2C 失败时清掉锁定方向和候选方向。否则游戏端 prev_tilt 会先归零，
+     * 下一次读取恢复后若仍返回旧锁定方向，会被当成新的边沿再次移动。 */
+    if (!mpu6050_read_accel(&ax, &ay, &az)) {
+        s_last_dir = MPU_DIR_NONE;
+        s_candidate_dir = MPU_DIR_NONE;
+        s_candidate_count = 0;
+        return MPU_DIR_NONE;
+    }
+
+    ax -= s_zero_ax;
+    ay -= s_zero_ay;
 
     /* 取 X/Y 绝对值大的那个判方向。Z 轴用于检测设备朝向但不参与方向决策。
      *
@@ -267,6 +313,8 @@ mpu_dir_t mpu6050_get_direction(void)
     if (s_last_dir != MPU_DIR_NONE) {
         if (abs_x < TILT_EXIT_G && abs_y < TILT_EXIT_G) {
             s_last_dir = MPU_DIR_NONE;
+            s_candidate_dir = MPU_DIR_NONE;
+            s_candidate_count = 0;
             return MPU_DIR_NONE;
         }
         /* 仍处于倾斜状态，保持锁定方向，不重新计算 */
@@ -275,6 +323,8 @@ mpu_dir_t mpu6050_get_direction(void)
 
     /* 当前是 NONE 状态：必须超过 ENTER 阈值才进入新方向 */
     if (abs_x < TILT_ENTER_G && abs_y < TILT_ENTER_G) {
+        s_candidate_dir = MPU_DIR_NONE;
+        s_candidate_count = 0;
         return MPU_DIR_NONE;
     }
 
@@ -286,6 +336,19 @@ mpu_dir_t mpu6050_get_direction(void)
         /* Y 主导：映射为左右 */
         dir = (ay > 0) ? MPU_DIR_RIGHT : MPU_DIR_LEFT;
     }
+    if (dir == s_candidate_dir) {
+        if (s_candidate_count < TILT_CONFIRM_SAMPLES) {
+            s_candidate_count++;
+        }
+    } else {
+        s_candidate_dir = dir;
+        s_candidate_count = 1;
+    }
+
+    if (s_candidate_count < TILT_CONFIRM_SAMPLES) {
+        return MPU_DIR_NONE;
+    }
+
     s_last_dir = dir;
     return dir;
 }

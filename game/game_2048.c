@@ -226,6 +226,7 @@ static void fb_draw_string(int x, int y, const char *p, uint16_t fc, uint16_t bc
 
 static void fb_flush(void)
 {
+    if (!s_spi) return;
     LCD_Address_Set(BOARD_SCREEN_X, BOARD_SCREEN_Y,
                     BOARD_SCREEN_X + FB_W - 1,
                     BOARD_SCREEN_Y + FB_H - 1);
@@ -706,6 +707,15 @@ void game_2048_run(void)
     render_header();
     render_footer();
 
+    /* MPU6050 倾斜控制（可选）：进入游戏时初始化并校准当前静止姿态。
+     * 放在开场动画前执行，避免动画期间用户操作导致中立基线偏移。 */
+    bool tilt_available = mpu6050_init();
+    if (tilt_available) {
+        ESP_LOGI(TAG, "倾斜控制已启用，请以当前姿态作为中立点");
+    } else {
+        ESP_LOGW(TAG, "MPU6050 不可用，仅按键控制");
+    }
+
     /* 开场 pop-in：把起始两方块依次从 40% 长到 100% */
     fb_clear(BG_COLOR);
     for (int r = 0; r < GRID_N; r++)
@@ -719,14 +729,6 @@ void game_2048_run(void)
     for (int r = 0; r < GRID_N; r++)
         for (int c = 0; c < GRID_N; c++)
             if (s_board[r][c] != 0) play_popin_animation(r, c);
-
-    /* MPU6050 倾斜控制（可选）：进入游戏时初始化，失败则降级到纯按键 */
-    bool tilt_available = mpu6050_init();
-    if (tilt_available) {
-        ESP_LOGI(TAG, "倾斜控制已启用");
-    } else {
-        ESP_LOGW(TAG, "MPU6050 不可用，仅按键控制");
-    }
 
     /* 输入主循环 */
     TickType_t last_move_tick = 0;

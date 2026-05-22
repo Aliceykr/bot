@@ -47,6 +47,10 @@ static volatile bool s_flush_suspended = false;
 /* 等待所有已入队的 DMA 事务完成 */
 static void wait_all_dma(void)
 {
+    if (!s_spi) {
+        s_pending = 0;
+        return;
+    }
     while (s_pending > 0) {
         spi_transaction_t *ret;
         spi_device_get_trans_result(s_spi, &ret, portMAX_DELAY);
@@ -59,6 +63,10 @@ static void disp_flush(lv_display_t *disp_drv, const lv_area_t *area, uint8_t *p
     /* 暂停模式：不发送 SPI，直接告诉 LVGL 已完成。游戏模式下用这种方式
      * 让出 SPI 总线，避免 polling 和 queue 两种传输模式互相冲突 */
     if (s_flush_suspended) {
+        lv_display_flush_ready(disp_drv);
+        return;
+    }
+    if (!s_spi) {
         lv_display_flush_ready(disp_drv);
         return;
     }
@@ -113,6 +121,10 @@ static void disp_flush(lv_display_t *disp_drv, const lv_area_t *area, uint8_t *p
 
 void lv_port_disp_init(void)
 {
+    if (!s_spi) {
+        ESP_LOGE("DISP", "display init skipped: LCD SPI device not initialized");
+        return;
+    }
     /* 两个 buffer 都放在内部 DRAM（MALLOC_CAP_DMA）：
      * SPI DMA 可直接读取，避免 PSRAM 的 bounce 开销 */
     buf1 = heap_caps_malloc(DISP_BUF_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);

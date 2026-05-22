@@ -17,7 +17,7 @@ typedef struct {
  * 返回 SD 卡是否已挂载。*/
 bool rom_loader_init(void);
 
-/* 扫描 /sdcard/roms/ 下的 .gb / .gbc 文件。
+/* 扫描 /sdcard/rom/ 下的 .gb / .gbc 文件。
  * 结果写入 list（调用方分配），实际数量写入 *count（<=ROM_MAX_COUNT）。
  * 返回 true 表示扫描成功（即使数量为 0 也返回 true）；SD 未挂载返回 false。 */
 bool rom_loader_scan(rom_entry_t *list, int *count);

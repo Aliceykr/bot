@@ -1,6 +1,7 @@
 #include "esp_sr.h"
 #include "asr.h"
 #include "asr_config.h"
+#include "esp_err.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "driver/i2s_std.h"
@@ -75,7 +76,12 @@ static inline void sr_task_unlock(void) { if (s_task_mutex) xSemaphoreGive(s_tas
 static esp_err_t sr_i2s_init(void)
 {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &s_sr_rx_chan));
+    esp_err_t err = i2s_new_channel(&chan_cfg, NULL, &s_sr_rx_chan);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "sr i2s_new_channel failed: %s", esp_err_to_name(err));
+        s_sr_rx_chan = NULL;
+        return err;
+    }
 
     /* INMP441 输出 24bit 数据，左对齐到 32bit 槽位中。
      * 与 asr.c 保持一致：32bit stereo Philips 模式，软件层取左声道并右移 16 位
@@ -93,8 +99,21 @@ static esp_err_t sr_i2s_init(void)
             .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
         },
     };
-    ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_sr_rx_chan, &std_cfg));
-    ESP_ERROR_CHECK(i2s_channel_enable(s_sr_rx_chan));
+    err = i2s_channel_init_std_mode(s_sr_rx_chan, &std_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "sr i2s init std failed: %s", esp_err_to_name(err));
+        i2s_del_channel(s_sr_rx_chan);
+        s_sr_rx_chan = NULL;
+        return err;
+    }
+
+    err = i2s_channel_enable(s_sr_rx_chan);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "sr i2s enable failed: %s", esp_err_to_name(err));
+        i2s_del_channel(s_sr_rx_chan);
+        s_sr_rx_chan = NULL;
+        return err;
+    }
     ESP_LOGI(TAG, "I2S NUM 0 初始化 (32bit stereo INMP441 → 软件转 16bit mono)");
     return ESP_OK;
 }

@@ -9,6 +9,7 @@
 #include "tts.h"
 #include "esp_sr.h"
 #include "ble_prov.h"
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include "freertos/FreeRTOS.h"
@@ -29,10 +30,9 @@
 #include "bemfa.h"
 #include "dht11.h"
 
-/* 业务临时任务（weather / chat / asr / tts）均为一次性任务，末尾调
- * vTaskDelete(NULL) 后由 IDLE 自动回收栈和 TCB，必须使用 xTaskCreate
- * （动态分配），不要用 xTaskCreateStatic 否则永久泄漏。
- * 16KB 栈放内部 DRAM，HTTPS+cJSON 访问更快，这些任务互斥且短命。 */
+/* 业务临时任务（weather / chat / asr / tts）均为一次性任务。
+ * 使用 xTaskCreatePSRAM 创建的任务必须通过 return 正常结束，让包装器
+ * 回收 PSRAM 栈和 TCB。普通 xTaskCreate 任务仍可 vTaskDelete(NULL)。 */
 
 LV_FONT_DECLARE(lv_font_simhei_16);
 
@@ -169,13 +169,14 @@ static lv_obj_t *create_result_dialog(const char *text, uint32_t text_color)
 
 // 天气查询队列
 typedef struct {
+    uint32_t req_id;
     bool success;
     weather_data_t data;
 } weather_result_t;
 
 static QueueHandle_t weather_result_queue = NULL;
 static bool weather_fetching = false;
-static volatile bool s_weather_cancelled = false;
+static volatile uint32_t s_weather_req_id = 0;
 
 /* BLE 异步启动结果（task → LVGL timer 消费）*/
 typedef enum {
@@ -328,24 +329,66 @@ static void show_weather_screen(const weather_data_t *d)
 
 static void weather_cancel_btn_cb(lv_event_t *e)
 {
-    s_weather_cancelled = true;
+    s_weather_req_id++;
     weather_fetching = false;
     safe_delete_loading_dialog(&weather_spinner_cont);
     indev_set_group(group);
     /* drain 已有结果，避免迟到的旧结果污染下一次 fetch */
     weather_result_t drained;
-    while (xQueueReceive(weather_result_queue, &drained, 0) == pdTRUE) {}
+    while (weather_result_queue &&
+           xQueueReceive(weather_result_queue, &drained, 0) == pdTRUE) {}
 }
+
+typedef struct {
+    uint32_t req_id;
+} weather_task_args_t;
 
 static void weather_fetch_task(void *arg)
 {
+    weather_task_args_t *args = (weather_task_args_t *)arg;
+    uint32_t req_id = args ? args->req_id : 0;
+    free(args);
+
     weather_result_t res;
+    memset(&res, 0, sizeof(res));
+    res.req_id = req_id;
     res.success = weather_fetch(&res.data);
-    /* 取消后不投递结果，避免主循环弹出天气界面 */
-    if (!s_weather_cancelled) {
+    /* 只投递当前 generation 的结果，取消/重试后的旧任务自然失效 */
+    if (req_id == s_weather_req_id && weather_result_queue) {
         xQueueSend(weather_result_queue, &res, 0);
     }
-    psram_task_exit();
+}
+
+static void start_weather_fetch(void)
+{
+    if (weather_fetching) return;
+    if (!weather_result_queue) {
+        create_result_dialog("系统资源不足，无法查询天气", 0xff0000);
+        return;
+    }
+
+    weather_result_t drained;
+    while (weather_result_queue &&
+           xQueueReceive(weather_result_queue, &drained, 0) == pdTRUE) {}
+
+    uint32_t req_id = ++s_weather_req_id;
+    weather_task_args_t *args = malloc(sizeof(*args));
+    if (!args) {
+        create_result_dialog("内存不足，无法查询天气", 0xff0000);
+        return;
+    }
+    args->req_id = req_id;
+
+    weather_fetching = true;
+    weather_spinner_cont = create_loading_dialog("Fetching Weather...", weather_cancel_btn_cb);
+
+    BaseType_t ret = xTaskCreatePSRAM(weather_fetch_task, "weather_task", 16384, args, 3, NULL);
+    if (ret != pdPASS) {
+        free(args);
+        weather_fetching = false;
+        safe_delete_loading_dialog(&weather_spinner_cont);
+        create_result_dialog("内存不足，无法查询天气", 0xff0000);
+    }
 }
 
 // ================================================================
@@ -406,8 +449,7 @@ static void chat_fetch_task(void *arg)
     chat_result_t res;
     res.success = model_chat(msg, &res.data);
     free(msg);
-    xQueueSend(chat_result_queue, &res, 0);
-    psram_task_exit();
+    if (chat_result_queue) xQueueSend(chat_result_queue, &res, 0);
 }
 
 static void chat_send_cb(lv_event_t *e)
@@ -426,6 +468,7 @@ static void chat_send_cb(lv_event_t *e)
     char *msg = malloc(MODEL_MAX_INPUT);
     if (!msg) return;
     strncpy(msg, txt, MODEL_MAX_INPUT - 1);
+    msg[MODEL_MAX_INPUT - 1] = '\0';
     lv_textarea_set_text(chat_input, "");
 
     // 显示加载动画
@@ -543,8 +586,7 @@ static void asr_recognize_task(void *arg)
     free(arg);
     asr_task_result_t res;
     res.success = asr_recognize(audio_len, &res.data);
-    xQueueSend(asr_result_queue, &res, 0);
-    psram_task_exit();
+    if (asr_result_queue) xQueueSend(asr_result_queue, &res, 0);
 }
 
 /* ASR→LLM 后台任务：将 ASR 识别文字送入模型，结果通过队列返回 LVGL 线程 */
@@ -558,8 +600,7 @@ static void asr_llm_task(void *arg)
     if (res.success && strlen(res.data.output) > 0) {
         tts_speak(res.data.output);
     }
-    xQueueSend(asr_llm_result_queue, &res, 0);
-    psram_task_exit();
+    if (asr_llm_result_queue) xQueueSend(asr_llm_result_queue, &res, 0);
 }
 
 static void asr_btn_cb(lv_event_t *e)
@@ -1018,12 +1059,7 @@ static void sr_execute_action(const sr_pending_action_t *act)
             show_env_screen();
             break;
         case 2:  /* 打开天气和日期 */
-            if (weather_fetching) return;
-            s_weather_cancelled = false;
-            { weather_result_t drained; while (xQueueReceive(weather_result_queue, &drained, 0) == pdTRUE) {} }
-            weather_fetching = true;
-            weather_spinner_cont = create_loading_dialog("Fetching Weather...", weather_cancel_btn_cb);
-            xTaskCreatePSRAM(weather_fetch_task, "weather_task", 16384, NULL, 3, NULL);
+            start_weather_fetch();
             break;
         case 3:  /* 打开游戏 */
             show_game_screen();
@@ -1466,6 +1502,7 @@ static void show_chat_screen(void)
     lv_obj_align(chat_input, LV_ALIGN_TOP_MID, 0, 162);
     lv_textarea_set_placeholder_text(chat_input, "Ask me...");
     lv_textarea_set_one_line(chat_input, true);
+    lv_textarea_set_max_length(chat_input, MODEL_MAX_INPUT - 1);
     lv_obj_set_style_bg_color(chat_input, lv_color_hex(0x16213e), 0);
     lv_obj_set_style_text_color(chat_input, lv_color_hex(0xffffff), 0);
     lv_obj_set_style_border_color(chat_input, lv_color_hex(0xe94560), 0);
@@ -1512,9 +1549,8 @@ static void wifi_connect_task(void *arg)
     if (ok) wifi_copy_ip(result.ip, sizeof(result.ip));
     else result.ip[0] = '\0';
     // 只有队列还空才发（取消时队列已有cancelled消息）
-    xQueueSend(wifi_result_queue, &result, 0);
+    if (wifi_result_queue) xQueueSend(wifi_result_queue, &result, 0);
     wifi_task_handle = NULL;
-    psram_task_exit();
 }
 
 /* 启动 WiFi 连接流程（弹 spinner + 起后台任务）。
@@ -1601,12 +1637,9 @@ static void wifi_status_timer_cb(lv_timer_t *timer)
 
     // 检查天气查询结果
     weather_result_t wresp;
-    if (xQueueReceive(weather_result_queue, &wresp, 0) == pdTRUE) {
-        if (s_weather_cancelled) {
-            /* 防御：drain 漏过的迟到结果，取消后不显示天气界面 */
-            weather_fetching = false;
-            return;
-        }
+    if (weather_result_queue &&
+        xQueueReceive(weather_result_queue, &wresp, 0) == pdTRUE &&
+        wresp.req_id == s_weather_req_id) {
         weather_fetching = false;
         safe_delete_loading_dialog(&weather_spinner_cont);
         if (wresp.success) {
@@ -2625,7 +2658,7 @@ static void bemfa_list_task(void *arg)
 {
     (void)arg;
     bemfa_list_result_t *r = heap_caps_malloc(sizeof(*r), MALLOC_CAP_SPIRAM);
-    if (!r) { vTaskDelete(NULL); return; }
+    if (!r) return;
     memset(r, 0, sizeof(*r));
 
     r->ok = bemfa_list_devices(r->devices, &r->count);
@@ -2640,7 +2673,6 @@ static void bemfa_list_task(void *arg)
     bemfa_ui_unlock();
 
     if (!delivered) heap_caps_free(r);
-    vTaskDelete(NULL);
 }
 
 /* ----- 后台 send 任务（推送明确 msg） ----- */
@@ -2658,7 +2690,6 @@ static void bemfa_send_task(void *arg)
         xQueueSend(bemfa_send_queue, &res, 0);
     }
     bemfa_ui_unlock();
-    vTaskDelete(NULL);
 }
 
 /* ----- 后台 info 任务（查单设备最新状态） ----- */
@@ -2672,7 +2703,7 @@ static void bemfa_info_task(void *arg)
     }
 
     bemfa_info_result_t *r = heap_caps_malloc(sizeof(*r), MALLOC_CAP_SPIRAM);
-    if (!r) { free(a); vTaskDelete(NULL); return; }
+    if (!r) { free(a); return; }
     memset(r, 0, sizeof(*r));
     r->ok = bemfa_get_topic_info(a->topic, &r->dev);
     free(a);
@@ -2687,7 +2718,6 @@ static void bemfa_info_task(void *arg)
     bemfa_ui_unlock();
 
     if (!delivered) heap_caps_free(r);
-    vTaskDelete(NULL);
 }
 
 /* ----- UI 辅助 ----- */
@@ -3157,7 +3187,6 @@ static void bemfa_voice_task(void *arg)
         xQueueSend(bemfa_voice_queue, &res, 0);
     }
     bemfa_ui_unlock();
-    vTaskDelete(NULL);
 }
 
 /* 按下：开始录音 */
@@ -3341,6 +3370,18 @@ static void show_bemfa_screen(void)
     lv_obj_set_style_radius(bemfa_list, 4, 0);
 
     bemfa_group = lv_group_create();
+    if (!bemfa_group) {
+        ESP_LOGE(BEMFA_DEVICE_TAG, "智能设备页面 group 创建失败");
+        if (bemfa_scr && lv_obj_is_valid(bemfa_scr)) {
+            lv_obj_delete(bemfa_scr);
+        }
+        bemfa_scr = NULL;
+        bemfa_list = NULL;
+        bemfa_status_lbl = NULL;
+        bemfa_voice_btn = NULL;
+        create_result_dialog("内存不足，无法打开智能设备", 0xff0000);
+        return;
+    }
 
     /* 返回按钮（固定第一项）*/
     lv_obj_t *back_btn = lv_list_add_button(bemfa_list, LV_SYMBOL_LEFT, "返回");
@@ -3369,6 +3410,47 @@ static void show_bemfa_screen(void)
     bemfa_info_queue   = xQueueCreate(4, sizeof(bemfa_info_result_t *));
     bemfa_voice_queue  = xQueueCreate(2, sizeof(bemfa_voice_result_t));
     bemfa_poll_timer   = lv_timer_create(bemfa_poll_tick, 200, NULL);
+    if (!bemfa_list_queue || !bemfa_send_queue || !bemfa_info_queue ||
+        !bemfa_voice_queue || !bemfa_poll_timer) {
+        ESP_LOGE(BEMFA_DEVICE_TAG, "智能设备页面资源创建失败");
+        if (bemfa_poll_timer) {
+            lv_timer_delete(bemfa_poll_timer);
+            bemfa_poll_timer = NULL;
+        }
+        if (bemfa_list_queue) {
+            vQueueDelete(bemfa_list_queue);
+            bemfa_list_queue = NULL;
+        }
+        if (bemfa_send_queue) {
+            vQueueDelete(bemfa_send_queue);
+            bemfa_send_queue = NULL;
+        }
+        if (bemfa_info_queue) {
+            vQueueDelete(bemfa_info_queue);
+            bemfa_info_queue = NULL;
+        }
+        if (bemfa_voice_queue) {
+            vQueueDelete(bemfa_voice_queue);
+            bemfa_voice_queue = NULL;
+        }
+        indev_set_group(group);
+        if (bemfa_group) {
+            lv_group_delete(bemfa_group);
+            bemfa_group = NULL;
+        }
+        if (bemfa_scr && lv_obj_is_valid(bemfa_scr)) {
+            lv_obj_delete(bemfa_scr);
+        }
+        bemfa_ui_lock();
+        bemfa_screen_active = false;
+        bemfa_ui_unlock();
+        bemfa_scr = NULL;
+        bemfa_list = NULL;
+        bemfa_status_lbl = NULL;
+        bemfa_voice_btn = NULL;
+        create_result_dialog("内存不足，无法打开智能设备", 0xff0000);
+        return;
+    }
 
     indev_set_group(bemfa_group);
     lv_obj_add_event_cb(bemfa_scr, bemfa_scr_delete_cb, LV_EVENT_DELETE, NULL);
@@ -3398,12 +3480,7 @@ static void list_event_cb(lv_event_t *e)
             create_result_dialog("请先连接 WiFi\n天气查询需要联网", 0xffaa00);
             return;
         }
-        if (weather_fetching) return;
-        s_weather_cancelled = false;
-        { weather_result_t drained; while (xQueueReceive(weather_result_queue, &drained, 0) == pdTRUE) {} }
-        weather_fetching = true;
-        weather_spinner_cont = create_loading_dialog("Fetching Weather...", weather_cancel_btn_cb);
-        xTaskCreatePSRAM(weather_fetch_task, "weather_task", 16384, NULL, 3, NULL);
+        start_weather_fetch();
     } else if (strstr(txt, "聊天")) {
         show_chat_screen();
     } else if (strstr(txt, "语音助手")) {

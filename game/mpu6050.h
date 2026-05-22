@@ -8,7 +8,7 @@
  * MPU6050 六轴传感器驱动（I2C 接口）
  *
  * 硬件接线：
- *   SDA  → GPIO13
+ *   SDA  → GPIO20
  *   SCL  → GPIO7
  *   VCC  → 3.3V
  *   GND  → GND
@@ -22,7 +22,7 @@
  *    （I2C 总线驱动 + DMA 缓冲约 ~2KB DRAM，仅游戏期间临时占用）。
  *
  * 2. I2C_NUM_0 独占：
- *    本模块独占 I2C_NUM_0 端口和 GPIO13/7。如果将来其他模块（OLED、
+ *    本模块独占 I2C_NUM_0 端口和 GPIO20/7。如果将来其他模块（OLED、
  *    其他传感器等）需要使用 I2C，应该走 I2C_NUM_1 或者重构为共享
  *    I2C bus 设计（先创建 bus 再 add device）。当前 deinit 会
  *    完整销毁 bus，与"共享"模式不兼容。
@@ -67,8 +67,8 @@ bool mpu6050_is_ready(void);
 bool mpu6050_read_accel(float *ax, float *ay, float *az);
 
 /* 高层接口：读取一次加速度并返回当前倾斜方向。
- * 内部带阈值（0.30g）和优先级（绝对值大的轴优先）。
- * 平放时返回 MPU_DIR_NONE。 */
+ * 初始化时会把当前姿态校准为中立点；内部带阈值、滞后和连续样本确认。
+ * 回到中立姿态时返回 MPU_DIR_NONE。 */
 mpu_dir_t mpu6050_get_direction(void);
 
 #endif /* __MPU6050_H */
