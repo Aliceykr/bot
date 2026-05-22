@@ -198,7 +198,7 @@ bot/
 - **音量** — 滑块调节音量（0-100%），对数增益曲线，NVS 持久化，重启自动恢复
 - **智能设备** — 巴法云 TCP 设备云控制，拉取已绑定设备列表，点击按钮 toggle 开关；支持语音控制（按住录音 → ASR 识别 → 关键词匹配执行开关）
 
-### 2. Game Boy 模拟器
+### 3. Game Boy 模拟器
 
 - 基于 Walnut-CGB（Peanut-GB 高性能重写版），支持 DMG + CGB 游戏
 - 双取指链式架构 + 32 位 DMA 路径，专为 ESP32-S3 等 32 位 MCU 优化
@@ -210,14 +210,14 @@ bot/
 - 3x3 按键矩阵提供完整的 GB 控制输入（A/B/方向/START/SELECT/EXIT）
 - 进入游戏自动暂停 WiFi 和 BLE，退出后恢复进入前活跃的服务
 
-### 3. Game Boy 音频
+### 4. Game Boy 音频
 
 - MiniGB APU 模拟全部 4 个 GB 声道（方波x2 + 波形 + 噪声）
 - 每帧合成 ~268 个 mono 样本（16kHz），硬件 I2S MONO 槽输出
 - APU 在独立任务/Core 0 运行，主仿真在 Core 1，真正并行不占帧预算
 - 与游戏模拟器同步运行，非阻塞输出（缓冲满时丢帧保仿真帧率）
 
-### 4. 语音助手（在线）
+### 5. 语音助手（在线）
 
 ```
 用户按键开始录音
@@ -233,7 +233,7 @@ INMP441 I2S 采集（16kHz 16bit mono，最长10秒，缓存于 PSRAM）
 MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 ```
 
-### 5. 语音命令（离线 ESP-SR）
+### 6. 语音命令（离线 ESP-SR）
 
 使用 ESP-SR 的 MultiNet7 中文离线命令词识别，无需网络。功能为 toggle 开关式（同蓝牙开关），菜单点击"语音命令"即开启 / 关闭，识别到命令后自动跳转到对应功能。
 
@@ -241,7 +241,7 @@ MAX98357A 播放合成语音（RingBuffer + I2S DMA）
 
 | ID | 命令词（拼音） | 功能 | 需要 WiFi |
 |----|--------------|------|-----------|
-| 1 | dakai huanjing jiance（打开环境监测）| 环境监测占位 | 否 |
+| 1 | dakai huanjing jiance（打开环境监测）| 环境监测 | 否 |
 | 2 | dakai tianqi he riqi（打开天气和日期）| 天气查询 | 是 |
 | 3 | dakai youxi（打开游戏）| 进入游戏列表 | 否 |
 | 4 | dakai liaotian zhushou（打开聊天助手）| 聊天助手 | 是 |
@@ -285,7 +285,7 @@ IDLE  ──toggle──▶ STARTING ──init+listen ok──▶ ACTIVE
 - **AFE 警告抑制**：`esp_log_level_set("AFE", ESP_LOG_ERROR)` 屏蔽 deinit 时残留 ringbuf 的非致命警告
 - **I2S 与在线 ASR 共享**：通过 deinit/reinit 切换，使用 32bit STEREO Philips 配置（与 asr.c 一致），软件转 16bit MONO 喂入 AFE
 
-### 6. BLE 蓝牙配网与远程音乐控制
+### 7. BLE 蓝牙配网与远程音乐控制
 
 基于 NimBLE（比 Bluedroid 节省 ~40KB DRAM）的 HM-10 兼容配网功能 + BLE 远程音乐控制：
 
@@ -309,7 +309,7 @@ IDLE  ──toggle──▶ STARTING ──init+listen ok──▶ ACTIVE
 - 音乐 stop 通过独立一次性任务异步执行，避免阻塞 BLE worker（最多 2 秒）
 - 歌曲扫描缓冲动态分配到 PSRAM（~4.6KB），命令处理完毕即释放
 
-### 7. WiFi 守护
+### 8. WiFi 守护
 
 - 首次连接：EventGroup 等待结果，最多重试 3 次
 - 运行期断线：常驻守护任务自动重连，指数退避（5s → 5min）
@@ -318,7 +318,7 @@ IDLE  ──toggle──▶ STARTING ──init+listen ok──▶ ACTIVE
 - 所有共享状态（s_status / s_user_stopped / s_backoff_idx）由 mutex 保护
 - `wifi_copy_ip()` 提供带锁的 IP 快照，避免撕裂读取
 
-### 8. MicroSD 卡存储
+### 9. MicroSD 卡存储
 
 通过 SPI3_HOST 以 SPI 模式驱动 MicroSD 卡，挂载 FAT32 文件系统到 `/sdcard`：
 
@@ -330,7 +330,7 @@ IDLE  ──toggle──▶ STARTING ──init+listen ok──▶ ACTIVE
 - 存放 Game Boy ROM（`/sdcard/rom/`）和音乐文件（`/sdcard/music/`）
 - 游戏列表内置 2048（无需 ROM 文件），始终可见
 
-### 9. 音乐播放器
+### 10. 音乐播放器
 
 SD 卡音乐播放，支持 WAV 和 MP3 格式：
 
@@ -342,7 +342,7 @@ SD 卡音乐播放，支持 WAV 和 MP3 格式：
 - **错误容忍**：MP3 连续 32 帧解码失败自动放弃，防止垃圾数据把解码器推进非法状态
 - SD 卡目录：`/sdcard/music/`，支持中英文文件名
 
-### 10. 音频输出
+### 11. 音频输出
 
 基于 MAX98357A I2S D 类功放：
 
@@ -355,7 +355,7 @@ SD 卡音乐播放，支持 WAV 和 MP3 格式：
 - `speaker_set_sample_rate()`：动态切换 I2S 输出采样率（8k-48k Hz），通过 flush 协议确保旧速率数据播完再切，避免变调
 - **音量控制**：Q15 定点对数增益（0-100% → -60dB..0dB），volatile 原子写入无需持锁，NVS 持久化（500ms 防抖合并 slider 拖动写入）
 
-### 11. 智能设备（巴法云）
+### 12. 智能设备（巴法云）
 
 通过巴法云 TCP 设备云 HTTP REST API 控制已绑定的智能设备：
 
@@ -442,6 +442,8 @@ PARTIAL 模式 + DRAM 双缓冲 + 异步 DMA：
 - ESP-IDF v5.4+（推荐 v5.4.3）
 - ESP32-S3 目标芯片
 - MicroSD 卡（FAT32 格式化，用于存放 ROM 和音乐文件）
+- USB 串口驱动与可用串口（Linux 常见为 `/dev/ttyUSB0`，Windows 常见为 `COMx`）
+- 可选账号：百度智能云语音应用、OpenAI 兼容 LLM 服务、巴法云 TCP 设备云
 
 ### 步骤
 
@@ -463,6 +465,7 @@ cp user/bemfa_config.h.example user/bemfa_config.h
 编辑 `user/asr_config.h` 填入百度 AI 平台 API Key 和 Secret Key。
 编辑 `user/model_config.h` 填入 LLM API Key、接口 URL 和模型名称。
 编辑 `user/bemfa_config.h` 填入巴法云私钥（注册 cloud.bemfa.com → 个人中心 → 复制"私钥"）。
+如需开机后直接连接固定 WiFi，可修改 `user/wifi.h` 中的 `WIFI_SSID` / `WIFI_PASSWORD`；也可以保持默认值，烧录后通过 BLE 发送配网信息。
 
 **3. 准备 MicroSD 卡**
 
@@ -476,7 +479,14 @@ cp user/bemfa_config.h.example user/bemfa_config.h
 
 > 注意：实际 ROM 目录为 `/sdcard/rom`（不带 s），不是 `/sdcard/roms`。
 
-**4. 编译、烧录**
+**4. 检查硬件接线**
+
+- ESP32-S3-DevKitC-1 N16R8，Flash/PSRAM 规格需与 `sdkconfig.defaults` 一致
+- LCD、麦克风、功放、编码器、矩阵键盘、MPU6050、DHT11 和 MicroSD 按上文表格接线
+- SD 卡 CS 使用 GPIO0，上电和复位时不要按住 Boot 键
+- MAX98357A 建议先小音量测试，确认喇叭和供电稳定后再调高音量
+
+**5. 编译、烧录、监视串口**
 
 ```bash
 idf.py set-target esp32s3
@@ -485,11 +495,20 @@ idf.py build
 idf.py -p COM5 -b 2000000 flash
 # Linux:
 idf.py -p /dev/ttyUSB0 -b 2000000 flash
+idf.py -p /dev/ttyUSB0 monitor
 ```
 
 > Linux 下若提示 `/dev/ttyUSB0` 权限不足，将用户加入 dialout 组：`sudo usermod -aG dialout $USER` 后重新登录；或临时执行 `sudo chmod 666 /dev/ttyUSB0`。
 
 > 工程同时支持 Windows 与 Linux 开发：`.vscode/settings.json` 与 `.vscode/tasks.json` 中两套配置并存，Linux 路径默认生效，Windows 路径以注释保留。
+
+**6. 首次使用**
+
+- 主菜单用旋转编码器选择功能，按下编码器确认
+- 未预置 WiFi 时，先进入"蓝牙"，手机连接 BLE 设备 `ESP32-Bot`，发送 `SSID_你的WiFi password_你的密码`
+- 需要网络的功能包括天气、聊天助手、在线语音助手和智能设备
+- 离线语音命令、环境监测、音量、2048 游戏不依赖 WiFi
+- Game Boy ROM 放在 `/sdcard/rom/`，音乐放在 `/sdcard/music/`
 
 ---
 
@@ -554,6 +573,31 @@ ROM 和音乐文件存放在 MicroSD 卡，不再使用 Flash SPIFFS 存储。
 
 ---
 
+## SD 卡文件规范
+
+MicroSD 卡使用 FAT32 文件系统，挂载点固定为 `/sdcard`。工程启动时会尝试自动挂载，挂载失败不影响主菜单进入，但 ROM 和音乐功能会不可用。
+
+推荐目录结构：
+
+```
+/sdcard/
+├── rom/
+│   ├── tetris.gb
+│   └── zelda.gbc
+└── music/
+    ├── demo.wav
+    └── demo.mp3
+```
+
+| 目录 | 支持格式 | 说明 |
+|------|----------|------|
+| `/sdcard/rom/` | `.gb` / `.gbc` | Game Boy / Game Boy Color ROM，最大建议 4MB，优先使用合法自备 ROM |
+| `/sdcard/music/` | `.wav` / `.mp3` | WAV 需为 PCM 16bit，8k-48k Hz；MP3 使用 Helix 解码 |
+
+文件名支持 UTF-8 中文长文件名。若手机或读卡器复制后在设备上显示异常，建议先用英文文件名排查编码问题。
+
+---
+
 ## 注意事项
 
 - **凭证安全**：`asr_config.h`、`model_config.h` 和 `bemfa_config.h` 含 API Key / 私钥，已加入 `.gitignore`
@@ -569,6 +613,22 @@ ROM 和音乐文件存放在 MicroSD 卡，不再使用 Flash SPIFFS 存储。
 - **音频安全**：DC-block HPF 消除直流偏置，字节尾对齐防止 PCM 错位，DMA auto_clear 消除空闲噪声
 - **SD 卡必须插入**：Game Boy ROM 和音乐文件从 SD 卡读取，未插卡时音乐和 GB 游戏不可用（内置 2048 仍可玩）
 - **音乐文件格式**：WAV 需为 16bit PCM（8k-48k Hz），MP3 由 Helix 定点解码器支持（MPEG-1/2 Layer III）
+
+---
+
+## 常见问题
+
+| 现象 | 排查方向 |
+|------|----------|
+| 烧录后串口反复重启 | 确认开发板为 ESP32-S3 N16R8，`idf.py set-target esp32s3` 已执行，PSRAM 为 Octal 80MHz |
+| 提示 SD 卡未挂载 | 检查 FAT32 格式、SPI3 接线、GPIO0 CS 是否被 Boot 按键或外部电路拉低 |
+| GB ROM 列表为空 | 确认 ROM 放在 `/sdcard/rom/`，扩展名为 `.gb` 或 `.gbc`，目录名不是 `roms` |
+| 音乐列表为空或播放失败 | 确认文件在 `/sdcard/music/`；WAV 使用 PCM 16bit；MP3 不要使用损坏文件或过高码率文件先排查 |
+| WiFi 连接失败 | 检查 `user/wifi.h` 中默认 SSID/密码，或通过 BLE 发送 `SSID_名称 password_密码` 重新配网 |
+| 在线语音/聊天失败 | 先确认 WiFi 已连接，再检查百度 ASR/TTS Key、LLM API URL、模型名和账户余额 |
+| 离线语音识别不灵敏 | 确认 INMP441 接线与方向，距离麦克风近一些说完整命令词，避免同时播放较大音量 |
+| 智能设备列表为空 | 确认 `BEMFA_UID` 正确，巴法云账号已绑定 TCP 设备云主题，设备 topic 在线或有历史消息 |
+| 喇叭有爆音或底噪 | 先降低音量，检查 MAX98357A 供电和地线，确认没有与麦克风/SD 卡线束强干扰 |
 
 ---
 
