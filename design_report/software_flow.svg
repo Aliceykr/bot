@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1050" viewBox="0 0 1600 1050">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#365B7B"/>
+    </marker>
+    <style>
+      text { font-family: "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif; }
+    </style>
+  </defs>
+  <rect width="1600" height="1050" fill="#FFFFFF"/>
+  <text x="800" y="54" font-size="30" font-weight="700" text-anchor="middle" fill="#14324A">软件总体流程图</text>
+  
+    <rect x="650" y="90" width="300" height="92" rx="10" fill="#FFF8E6" stroke="#C27B16" stroke-width="2"/>
+    <text x="800" y="118" font-size="20" font-weight="700" text-anchor="middle" fill="#13324D">系统上电 / app_main</text>
+    <text x="666" y="154" font-size="15" fill="#233443">NVS、PSRAM 管理初始化</text><text x="666" y="176" font-size="15" fill="#233443">外设和业务模块初始化</text>
+  
+  
+    <rect x="650" y="220" width="300" height="100" rx="10" fill="#F6FBFF" stroke="#2B6CB0" stroke-width="2"/>
+    <text x="800" y="248" font-size="20" font-weight="700" text-anchor="middle" fill="#13324D">硬件与框架启动</text>
+    <text x="666" y="284" font-size="15" fill="#233443">LCD / I2S / SD / 键盘</text><text x="666" y="306" font-size="15" fill="#233443">LVGL 显示与输入注册</text>
+  
+  
+    <rect x="650" y="360" width="300" height="96" rx="10" fill="#F0FFF4" stroke="#2F855A" stroke-width="2"/>
+    <text x="800" y="388" font-size="20" font-weight="700" text-anchor="middle" fill="#13324D">主菜单循环</text>
+    <text x="666" y="424" font-size="15" fill="#233443">lv_timer_handler 周期调度</text><text x="666" y="446" font-size="15" fill="#233443">编码器选择功能并确认</text>
+  
+  
+    <line x1="800" y1="182" x2="800" y2="220" stroke="#365B7B" stroke-width="2.2" marker-end="url(#arrow)"/>
+    
+  
+  
+    <line x1="800" y1="320" x2="800" y2="360" stroke="#365B7B" stroke-width="2.2" marker-end="url(#arrow)"/>
+    
+  
+
+  
+    <rect x="70" y="520" width="250" height="120" rx="10" fill="#F7FAFC" stroke="#718096" stroke-width="2"/>
+    <text x="195" y="548" font-size="20" font-weight="700" text-anchor="middle" fill="#13324D">环境监测</text>
+    <text x="86" y="584" font-size="15" fill="#233443">创建 env_read 任务</text><text x="86" y="606" font-size="15" fill="#233443">DHT11 1s 采样</text><text x="86" y="628" font-size="15" fill="#233443">温湿度卡片刷新</text>
+  
+  
+    <rect x="350" y="520" width="250" height="120" rx="10" fill="#F7FAFC" stroke="#3182CE" stroke-width="2"/>
+    <text x="475" y="548" font-size="20" font-weight="700" text-anchor="middle" fill="#13324D">天气与时间</text>
+    <text x="366" y="584" font-size="15" fill="#233443">WiFi 检查/连接</text><text x="366" y="606" font-size="15" fill="#233443">HTTPS 获取天气 JSON</text><text x="366" y="628" font-size="15" fill="#233443">SNTP 实时时钟显示</text>
+  
+  
+    <rect x="630" y="520" width="250" height="120" rx="10" fill="#F7FAFC" stroke="#805AD5" stroke-width="2"/>
+    <text x="755" y="548" font-size="20" font-weight="700" text-anchor="middle" fill="#13324D">聊天助手</text>
+    <text x="646" y="584" font-size="15" fill="#233443">屏幕键盘输入</text><text x="646" y="606" font-size="15" fill="#233443">OpenAI 兼容接口请求</text><text x="646" y="628" font-size="15" fill="#233443">滚动对话记录更新</text>
+  
+  
+    <rect x="910" y="520" width="250" height="120" rx="10" fill="#F7FAFC" stroke="#D53F8C" stroke-width="2"/>
+    <text x="1035" y="548" font-size="20" font-weight="700" text-anchor="middle" fill="#13324D">在线语音助手</text>
+    <text x="926" y="584" font-size="15" fill="#233443">INMP441 录音</text><text x="926" y="606" font-size="15" fill="#233443">百度 ASR -&gt; LLM</text><text x="926" y="628" font-size="15" fill="#233443">百度 TTS -&gt; 扬声器</text>
+  
+  
+    <rect x="1190" y="520" width="250" height="120" rx="10" fill="#F7FAFC" stroke="#DD6B20" stroke-width="2"/>
+    <text x="1315" y="548" font-size="20" font-weight="700" text-anchor="middle" fill="#13324D">离线语音命令</text>
+    <text x="1206" y="584" font-size="15" fill="#233443">释放在线 ASR I2S</text><text x="1206" y="606" font-size="15" fill="#233443">ESP-SR AFE + MultiNet</text><text x="1206" y="628" font-size="15" fill="#233443">识别后分发菜单动作</text>
+  
+
+  
+    <rect x="70" y="760" width="250" height="120" rx="10" fill="#F7FAFC" stroke="#2C5282" stroke-width="2"/>
+    <text x="195" y="788" font-size="20" font-weight="700" text-anchor="middle" fill="#13324D">游戏</text>
+    <text x="86" y="824" font-size="15" fill="#233443">暂停 WiFi/BLE 与 LVGL flush</text><text x="86" y="846" font-size="15" fill="#233443">2048 或 GB ROM 运行</text><text x="86" y="868" font-size="15" fill="#233443">退出后恢复菜单</text>
+  
+  
+    <rect x="350" y="760" width="250" height="120" rx="10" fill="#F7FAFC" stroke="#2F855A" stroke-width="2"/>
+    <text x="475" y="788" font-size="20" font-weight="700" text-anchor="middle" fill="#13324D">音乐</text>
+    <text x="366" y="824" font-size="15" fill="#233443">扫描 /sdcard/music</text><text x="366" y="846" font-size="15" fill="#233443">WAV/MP3 解码</text><text x="366" y="868" font-size="15" fill="#233443">动态采样率 I2S 输出</text>
+  
+  
+    <rect x="630" y="760" width="250" height="120" rx="10" fill="#F7FAFC" stroke="#319795" stroke-width="2"/>
+    <text x="755" y="788" font-size="20" font-weight="700" text-anchor="middle" fill="#13324D">BLE 配网/控制</text>
+    <text x="646" y="824" font-size="15" fill="#233443">NimBLE 广播</text><text x="646" y="846" font-size="15" fill="#233443">SSID/password 配网</text><text x="646" y="868" font-size="15" fill="#233443">音乐与音色远程命令</text>
+  
+  
+    <rect x="910" y="760" width="250" height="120" rx="10" fill="#F7FAFC" stroke="#B7791F" stroke-width="2"/>
+    <text x="1035" y="788" font-size="20" font-weight="700" text-anchor="middle" fill="#13324D">智能设备</text>
+    <text x="926" y="824" font-size="15" fill="#233443">拉取巴法云设备列表</text><text x="926" y="846" font-size="15" fill="#233443">发送 on/off</text><text x="926" y="868" font-size="15" fill="#233443">语音控制关键词匹配</text>
+  
+  
+    <rect x="1190" y="760" width="250" height="120" rx="10" fill="#F7FAFC" stroke="#4A5568" stroke-width="2"/>
+    <text x="1315" y="788" font-size="20" font-weight="700" text-anchor="middle" fill="#13324D">音量与系统监控</text>
+    <text x="1206" y="824" font-size="15" fill="#233443">滑块调节音量并写 NVS</text><text x="1206" y="846" font-size="15" fill="#233443">健康任务周期打印堆水位</text>
+  
+
+  
+    <line x1="690" y1="456" x2="195" y2="520" stroke="#365B7B" stroke-width="2.2" marker-end="url(#arrow)"/>
+    
+  
+  
+    <line x1="740" y1="456" x2="475" y2="520" stroke="#365B7B" stroke-width="2.2" marker-end="url(#arrow)"/>
+    
+  
+  
+    <line x1="790" y1="456" x2="755" y2="520" stroke="#365B7B" stroke-width="2.2" marker-end="url(#arrow)"/>
+    
+  
+  
+    <line x1="840" y1="456" x2="1035" y2="520" stroke="#365B7B" stroke-width="2.2" marker-end="url(#arrow)"/>
+    
+  
+  
+    <line x1="890" y1="456" x2="1315" y2="520" stroke="#365B7B" stroke-width="2.2" marker-end="url(#arrow)"/>
+    
+  
+  
+    <line x1="690" y1="456" x2="195" y2="760" stroke="#365B7B" stroke-width="2.2" marker-end="url(#arrow)"/>
+    
+  
+  
+    <line x1="740" y1="456" x2="475" y2="760" stroke="#365B7B" stroke-width="2.2" marker-end="url(#arrow)"/>
+    
+  
+  
+    <line x1="800" y1="456" x2="755" y2="760" stroke="#365B7B" stroke-width="2.2" marker-end="url(#arrow)"/>
+    
+  
+  
+    <line x1="860" y1="456" x2="1035" y2="760" stroke="#365B7B" stroke-width="2.2" marker-end="url(#arrow)"/>
+    
+  
+  
+    <line x1="910" y1="456" x2="1315" y2="760" stroke="#365B7B" stroke-width="2.2" marker-end="url(#arrow)"/>
+    
+  
+
+  <path d="M 195 640 C 195 704, 600 700, 720 476" fill="none" stroke="#A0AEC0" stroke-width="1.8" stroke-dasharray="8 7" marker-end="url(#arrow)"/>
+  <path d="M 755 640 C 780 700, 825 700, 860 476" fill="none" stroke="#A0AEC0" stroke-width="1.8" stroke-dasharray="8 7" marker-end="url(#arrow)"/>
+  <path d="M 1035 880 C 1030 950, 770 960, 790 456" fill="none" stroke="#A0AEC0" stroke-width="1.8" stroke-dasharray="8 7" marker-end="url(#arrow)"/>
+  <text x="800" y="1008" font-size="18" text-anchor="middle" fill="#666666">后台任务通过 FreeRTOS Queue / lv_timer 回传结果，所有 LVGL 对象更新集中在 LVGL 线程执行</text>
+</svg>
