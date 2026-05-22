@@ -15,6 +15,17 @@
 
 #define TAG "TTS"
 
+/* 百度短文本在线合成基础音库 per 参数。
+ * BLE 命令使用 /v1.. /v4 的本地编号，真正请求百度时映射到 per。 */
+static const tts_voice_t s_voices[] = {
+    { .per = 0, .name = "度小美-标准女主播" },
+    { .per = 1, .name = "度小宇-亲切男声" },
+    { .per = 3, .name = "度逍遥-情感男声" },
+    { .per = 4, .name = "度丫丫-童声" },
+};
+
+static volatile int s_voice_index = 0;   /* 0-based, default: 度小美 */
+
 /* ================================================================
  * 模块内部状态（全部 static）
  * access_token 由 baidu_token 模块统一管理，带过期刷新
@@ -147,6 +158,8 @@ bool tts_speak(const char *text)
         goto out;
     }
 
+    int per = s_voices[s_voice_index].per;
+
     /* percent-encode 文本（中文每字3字节，编码后9字节，512字节文本最坏约4608字节）
      * 使用 static 避免在任务栈上分配大数组；mutex 保护并发 */
     static char encoded[4096];
@@ -155,8 +168,8 @@ bool tts_speak(const char *text)
     /* 构建 POST body */
     static char body[5120];
     int body_len = snprintf(body, sizeof(body),
-        "tex=%s&tok=%s&cuid=esp32s3_bot&ctp=1&lan=zh&spd=5&pit=5&vol=9&per=0&aue=6",
-        encoded, token_buf);
+        "tex=%s&tok=%s&cuid=esp32s3_bot&ctp=1&lan=zh&spd=5&pit=5&vol=9&per=%d&aue=6",
+        encoded, token_buf, per);
     if (body_len <= 0 || body_len >= (int)sizeof(body)) {
         ESP_LOGE(TAG, "body 构建失败或过长");
         goto out;
@@ -208,4 +221,36 @@ bool tts_speak(const char *text)
 out:
     if (s_mutex) xSemaphoreGive(s_mutex);
     return ret;
+}
+
+int tts_voice_count(void)
+{
+    return (int)(sizeof(s_voices) / sizeof(s_voices[0]));
+}
+
+const tts_voice_t *tts_voice_get(int index)
+{
+    if (index < 1 || index > tts_voice_count()) return NULL;
+    return &s_voices[index - 1];
+}
+
+int tts_voice_current_index(void)
+{
+    return s_voice_index + 1;
+}
+
+const tts_voice_t *tts_voice_current(void)
+{
+    return tts_voice_get(tts_voice_current_index());
+}
+
+bool tts_voice_set(int index)
+{
+    if (index < 1 || index > tts_voice_count()) return false;
+
+    s_voice_index = index - 1;
+
+    ESP_LOGI(TAG, "切换音色: v%d per=%d %s",
+             index, s_voices[index - 1].per, s_voices[index - 1].name);
+    return true;
 }

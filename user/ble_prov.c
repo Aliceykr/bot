@@ -1,6 +1,7 @@
 #include "ble_prov.h"
 #include "wifi.h"
 #include "music.h"
+#include "tts.h"
 #include "esp_log.h"
 #include "esp_bt.h"
 #include "nimble/nimble_port.h"
@@ -151,6 +152,7 @@ static void ble_send_notify(const char *msg)
  * ================================================================ */
 static void handle_wifi_prov(char *buf);
 static void handle_music_command(const char *cmd);
+static bool handle_tts_command(const char *cmd);
 
 static void parse_and_dispatch(char *buf)
 {
@@ -159,10 +161,61 @@ static void parse_and_dispatch(char *buf)
     /* 首字符 '/' 视为音乐 / 控制命令；否则走 WiFi 配网。
      * 优先级这样排：真实配网消息以 "SSID_" 开头，永远不是 '/'，安全 */
     if (buf[0] == '/') {
-        handle_music_command(buf + 1);  /* 跳过 '/' */
+        const char *cmd = buf + 1;  /* 跳过 '/' */
+        if (!handle_tts_command(cmd)) {
+            handle_music_command(cmd);
+        }
         return;
     }
     handle_wifi_prov(buf);
+}
+
+/* ================================================================
+ * TTS 音色命令
+ *
+ * "/voice" → 列出百度 TTS 4 个基础音库
+ * "/v1"    → 切到第 1 个基础音库（本地编号映射到百度 per 参数）
+ * ================================================================ */
+static bool handle_tts_command(const char *cmd)
+{
+    char line[128];
+
+    if (strcmp(cmd, "voice") == 0) {
+        int current = tts_voice_current_index();
+        int count = tts_voice_count();
+        ble_send_notify("百度基础音库:");
+        vTaskDelay(pdMS_TO_TICKS(30));
+        for (int i = 1; i <= count; ++i) {
+            const tts_voice_t *voice = tts_voice_get(i);
+            if (!voice) continue;
+            snprintf(line, sizeof(line), "%s/v%d %s",
+                     i == current ? "*" : " ", i, voice->name);
+            ble_send_notify(line);
+            vTaskDelay(pdMS_TO_TICKS(30));
+        }
+        ble_send_notify("发送 /v1-/v4 切换音色");
+        return true;
+    }
+
+    if (cmd[0] == 'v') {
+        char *endp = NULL;
+        long idx = strtol(cmd + 1, &endp, 10);
+        if (endp == cmd + 1 || *endp != '\0') return false;
+        if (!tts_voice_get((int)idx)) return false;
+
+        tts_voice_set((int)idx);
+
+        const tts_voice_t *voice = tts_voice_get((int)idx);
+        if (voice) {
+            snprintf(line, sizeof(line), "音色已切换: /v%ld %s", idx, voice->name);
+            ble_send_notify(line);
+        } else {
+            ble_send_notify("音色已切换");
+        }
+        return true;
+    }
+
+    return false;
 }
 
 /* 原 WiFi 配网解析，逻辑不变 */
