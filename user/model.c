@@ -30,6 +30,7 @@ void model_init(void)
     if (!s_mutex) s_mutex = xSemaphoreCreateMutex();
 }
 
+/* 兜底创建模型模块互斥锁，避免遗漏 model_init 时并发访问响应缓冲。 */
 static void ensure_mutex(void) {
     if (!s_mutex) {
         ESP_LOGW(TAG, "model_init 未在 app_main 阶段调用，回退 lazy-create");
@@ -49,6 +50,7 @@ static inline void resp_buf_release(void)
     s_resp_overflow = false;
 }
 
+/* HTTP 响应回调：把大模型接口返回的分片 JSON 追加到 PSRAM 缓冲。 */
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
     switch (evt->event_id) {
@@ -88,6 +90,8 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
+/* 调用兼容 OpenAI Chat Completions 格式的大模型接口。
+ * 输入和输出都复制到 out，便于 UI 在失败时也能展示本次提问内容。 */
 bool model_chat(const char *user_msg, model_result_t *out)
 {
     ensure_mutex();

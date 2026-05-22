@@ -8,7 +8,7 @@
  * Micro-SD 卡驱动（SPI 模式，挂载 FATFS）
  *
  * 硬件接线：
- *   CS    -> GPIO 48   (板载 RGB LED 脚，CS 对时序不敏感，适合脏脚)
+ *   CS    -> GPIO 0   (板载 RGB LED 脚，CS 对时序不敏感，适合脏脚)
  *   MOSI  -> GPIO 8    (SD 模块 DI / CMD)
  *   SCK   -> GPIO 18   (SD 模块 CLK)
  *   MISO  -> GPIO 21   (SD 模块 DO / DAT0)

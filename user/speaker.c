@@ -123,6 +123,7 @@ static int32_t volume_pct_to_q15(uint8_t pct)
     return q;
 }
 
+/* 从 NVS 读取上次保存的音量百分比。 */
 static void load_volume_from_nvs(void)
 {
     nvs_handle_t h;
@@ -136,6 +137,7 @@ static void load_volume_from_nvs(void)
     nvs_close(h);
 }
 
+/* 把音量百分比写入 NVS。实际调用通常经过防抖 timer。 */
 static void save_volume_to_nvs(uint8_t pct)
 {
     nvs_handle_t h;
@@ -150,6 +152,7 @@ static void save_volume_to_nvs(uint8_t pct)
 static TimerHandle_t s_nvs_debounce_timer = NULL;
 #define NVS_DEBOUNCE_MS   500
 
+/* 音量保存防抖回调：拖动停止一段时间后才真正写 flash。 */
 static void nvs_debounce_cb(TimerHandle_t t)
 {
     (void)t;
@@ -240,6 +243,7 @@ static void spk_tx_task(void *arg)
 /* ================================================================
  * 初始化
  * ================================================================ */
+/* 初始化扬声器 I2S TX、播放 ring buffer、后台发送任务和音量状态。 */
 void speaker_init(void)
 {
     s_play_mtx = xSemaphoreCreateMutex();
@@ -529,11 +533,14 @@ bool speaker_set_sample_rate(uint32_t hz)
     return true;
 }
 
+/* 获取当前 I2S 输出采样率。 */
 uint32_t speaker_get_sample_rate(void)
 {
     return s_sample_rate;
 }
 
+/* 等待 ring buffer 中的音频尽量播空。
+ * cancel_flag 可用于 stop 流程中提前打断等待。 */
 bool speaker_wait_drain(uint32_t timeout_ms, volatile const bool *cancel_flag)
 {
     if (!s_ringbuf) return true;
@@ -595,6 +602,7 @@ void speaker_set_volume(uint8_t percent)
              (unsigned)percent, (long)s_gain_q15);
 }
 
+/* 获取当前音量百分比。 */
 uint8_t speaker_get_volume(void)
 {
     return s_volume_pct;

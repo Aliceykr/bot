@@ -161,7 +161,9 @@ static IRAM_ATTR void lcd_draw_line_cb(struct gb_s *gb,
         return;
     }
 
-    /* 奇数行：完成 3 屏幕行 */
+    /* 奇数行：把两条 GB 扫描线合成 3 条 LCD 行。
+     * 1.5x 纵向缩放无法逐行等比，只能 2 行变 3 行；这里复制第二行
+     * 得到 A/B/B 的近似，避免维护一个整帧 framebuffer。 */
     scale_line_1p5x(line, buf + SCALED_W);
     memcpy(buf + SCALED_W * 2, buf + SCALED_W, SCALED_W * 2);
 
@@ -265,6 +267,9 @@ bool gb_emu_run(const uint8_t *rom_data, size_t rom_size)
     const int64_t period_us = 16743;  /* 59.7Hz GB 原生帧时长 */
 
     while (!s_exit_requested) {
+        /* 这一段是整机游戏模式的热路径：输入采样 → 仿真一帧 →
+         * LCD DMA flush → APU 产一帧音频 → 对齐 59.7Hz。
+         * 不要在循环里做 malloc、文件 IO 或 LVGL 调用。 */
         /* 读矩阵键盘位图 → 映射成 GB direct.joypad（0=按下，位布局见 walnut_cgb.h）
          * 布局：R0C0=B  R0C1=UP  R0C2=A
          *       R1C0=LEFT   R1C1=EXIT（长按退出，不映射按键）  R1C2=RIGHT

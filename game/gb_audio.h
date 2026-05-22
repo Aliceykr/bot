@@ -19,8 +19,14 @@ void gb_audio_deinit(void);
  * 在 gb_emu 主循环每帧末尾调用。实际合成由 Core0 的 apu_task 执行。 */
 void gb_audio_emit_frame(void);
 
-/* Walnut 从这些全局符号调用（在 peanut_gb.h 和 walnut_cgb.h 中引用）*/
+/* audio_read：供 Walnut-CGB 读取 Game Boy APU 寄存器。
+ *
+ * 由模拟器核心按地址调用，不应由业务层直接调用。 */
 uint8_t audio_read(const uint16_t addr);
+
+/* audio_write：供 Walnut-CGB 写入 Game Boy APU 寄存器。
+ *
+ * 由模拟器核心按地址调用，不应由业务层直接调用。 */
 void    audio_write(const uint16_t addr, const uint8_t val);
 
 #endif

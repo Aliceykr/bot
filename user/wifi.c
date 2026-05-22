@@ -354,6 +354,8 @@ bool wifi_connect(void)
     return false;
 }
 
+/* 用户主动断开 WiFi。
+ * 设置 s_user_stopped 后守护任务不会再自动重连。 */
 void wifi_disconnect(void)
 {
     WIFI_LOCK();
@@ -367,12 +369,15 @@ void wifi_disconnect(void)
     WIFI_UNLOCK();
 }
 
+/* 快速读取 WiFi 状态快照，供 UI/HTTP 守卫高频调用。 */
 wifi_status_t wifi_get_status(void)
 {
     /* 单字段读取，volatile 语义足够，不加锁避免高频调用开销 */
     return s_status;
 }
 
+/* 拷贝当前 IP 字符串。
+ * 这里加锁读取，避免事件回调正在更新 s_ip_str 时读到半截字符串。 */
 void wifi_copy_ip(char *out, size_t cap)
 {
     if (!out || cap == 0) return;
@@ -405,6 +410,8 @@ void wifi_suspend_for_game(void)
     ESP_LOGI(TAG, "WiFi 已为游戏暂停");
 }
 
+/* 游戏退出后恢复 WiFi 驱动运行。
+ * 不阻塞等待连接完成，后续连接状态由事件回调和守护任务推进。 */
 void wifi_resume_after_game(void)
 {
     if (!s_initialized) return;
@@ -469,6 +476,8 @@ void wifi_full_shutdown_for_ble(void)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
 }
 
+/* 更新 WiFi 凭据。
+ * BLE 配网写入后调用；如果驱动已初始化，会同步更新 STA 配置。 */
 void wifi_set_credentials(const char *ssid, const char *password)
 {
     if (!ssid || !password) return;

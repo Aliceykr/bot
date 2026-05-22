@@ -30,7 +30,9 @@ static size_t  s_resp_cap = 0;
 static size_t  s_resp_len = 0;
 static bool    s_resp_overflow = false;
 
-/* 开机初始化：在 app_main 里单线程调用一次，消除 lock_init_once 的 TOCTOU 窗口。
+/* bemfa_init：创建巴法云模块内部互斥锁。
+ *
+ * 开机初始化：在 app_main 里单线程调用一次，消除 lock_init_once 的 TOCTOU 窗口。
  * 如果忘了调也无伤大雅——lock_init_once 仍会兜底，但并发首次调用可能泄漏一个
  * mutex 或死锁（极窄窗口）。*/
 void bemfa_init(void)
@@ -38,18 +40,30 @@ void bemfa_init(void)
     if (!s_mutex) s_mutex = xSemaphoreCreateMutex();
 }
 
+/* lock_init_once：公开 API 的懒初始化兜底。
+ *
+ * 正常情况下 app_main 已调用 bemfa_init；这里处理遗漏初始化的情况。
+ * 仅做最小创建，不负责并发首次调用的完美串行化。 */
 static inline void lock_init_once(void)
 {
     /* 兜底路径。正常流程 main 已经调 bemfa_init()。 */
     if (!s_mutex) s_mutex = xSemaphoreCreateMutex();
 }
 
+/* resp_reset：开始一次新的 HTTP 请求前清空响应写入位置。
+ *
+ * 不释放 s_resp_buf，只重置长度和溢出标志，便于同一次 API 内复用已分配
+ * 缓冲；API 出口会统一 resp_free() 释放。调用方必须持有 s_mutex。 */
 static void resp_reset(void)
 {
     s_resp_len = 0;
     s_resp_overflow = false;
 }
 
+/* resp_free：释放本次 HTTP 响应缓冲并恢复到空闲状态。
+ *
+ * 巴法云响应可能扩到十几 KB，API 返回前释放，避免 PSRAM 常驻占用。
+ * 调用方必须持有 s_mutex。 */
 static void resp_free(void)
 {
     if (s_resp_buf) {
@@ -61,6 +75,10 @@ static void resp_free(void)
     s_resp_overflow = false;
 }
 
+/* http_event_cb：esp_http_client 的响应收集回调。
+ *
+ * HTTP_EVENT_ON_DATA 分块到达时把数据累积到 PSRAM 动态缓冲；
+ * HTTP_EVENT_ON_FINISH 时补 '\0'，供后续 cJSON_Parse 直接解析。 */
 static esp_err_t http_event_cb(esp_http_client_event_t *evt)
 {
     switch (evt->event_id) {
@@ -105,6 +123,10 @@ static esp_err_t http_event_cb(esp_http_client_event_t *evt)
  * 公共 API
  * ================================================================ */
 
+/* bemfa_list_devices：拉取账号下所有巴法云 TCP 设备主题。
+ *
+ * 同步阻塞 HTTPS GET，成功时把设备 topic/name/msg/online 写入 out_list。
+ * 该函数会持有模块全局 mutex，调用方应放在后台任务中，不能放 LVGL 热路径。 */
 bool bemfa_list_devices(bemfa_device_t *out_list, int *out_count)
 {
     if (!out_list || !out_count) return false;
@@ -230,6 +252,10 @@ out:
     return ret;
 }
 
+/* bemfa_push_msg：向指定 topic 推送一条消息。
+ *
+ * 主要用于发送 "on"/"off" 控制设备，也可发送调用方保证已 JSON 安全的
+ * 自定义 msg。内部同步阻塞 HTTPS POST，并解析 code==0 作为成功。 */
 bool bemfa_push_msg(const char *topic, const char *msg)
 {
     if (!topic || !msg) return false;
@@ -308,6 +334,10 @@ out:
     return ret;
 }
 
+/* bemfa_toggle：根据当前 msg 推断下一条开关命令并发送。
+ *
+ * current_msg 为 "on" 时发送 "off"，其他情况发送 "on"。成功后把实际发送
+ * 的新状态写入 new_msg_out，方便 UI 做乐观更新。 */
 bool bemfa_toggle(const char *topic, const char *current_msg,
                   char *new_msg_out, size_t cap)
 {
@@ -325,12 +355,20 @@ bool bemfa_toggle(const char *topic, const char *current_msg,
     return true;
 }
 
+/* bemfa_send：语义化发送接口。
+ *
+ * 与 bemfa_push_msg 等价，只保留“向 topic 发送 msg”的直观名字，供 UI 或
+ * 语音控制在已决定目标状态时调用，避免走 toggle 的状态推断。 */
 bool bemfa_send(const char *topic, const char *msg)
 {
     /* 语义化包装：调用方 100% 决定 msg，不依赖云端状态推断。 */
     return bemfa_push_msg(topic, msg);
 }
 
+/* bemfa_get_topic_info：查询单个 topic 的权威最新状态。
+ *
+ * 用于推送 on/off 后延迟回读，避免重新拉 allTopic 大响应。成功时填充 out，
+ * 其中 topic 字段保留调用方传入值，name/msg/online 来自服务端。 */
 bool bemfa_get_topic_info(const char *topic, bemfa_device_t *out)
 {
     if (!topic || !out) return false;

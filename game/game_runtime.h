@@ -3,15 +3,16 @@
 
 #include <stdbool.h>
 
-/* 启动模拟器运行一个 ROM。
- * 当前为占位实现：仅显示运行状态，等待返回信号。
- * 后续阶段会加入 Peanut-GB 核心，真正执行游戏。
+/* game_runtime_run：运行一个游戏条目直到退出。
  *
- * 这个函数阻塞调用者直到玩家请求退出。
- * 调用方负责准备好屏幕资源（已从 LVGL 接管），本函数不访问 LVGL。 */
+ * rom_name 为内置游戏特殊名时直接进入对应实现；否则从 SD 卡加载 GB/GBC ROM，
+ * 再启动 Walnut-CGB 模拟器。这个函数阻塞调用者直到玩家请求退出。
+ * 调用方负责先暂停 LVGL 显示并接管 LCD/SPI，本函数不访问 LVGL 对象。 */
 void game_runtime_run(const char *rom_name);
 
-/* 请求 game_runtime_run 退出（可从另一个任务调用，例如响应退出按键）*/
+/* game_runtime_request_exit：请求当前运行中的内置游戏或 GB 模拟器退出。
+ *
+ * 可从另一个任务调用，例如 UI 取消、矩阵键盘退出事件或系统切换模式。 */
 void game_runtime_request_exit(void);
 
 #endif

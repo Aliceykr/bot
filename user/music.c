@@ -45,6 +45,7 @@
 /* ================================================================
  * 扫描 / 路径工具
  * ================================================================ */
+/* 根据文件扩展名判断音乐格式，只接受 wav/mp3。 */
 static music_fmt_t fmt_from_name(const char *name)
 {
     size_t len = strlen(name);
@@ -53,6 +54,7 @@ static music_fmt_t fmt_from_name(const char *name)
     return MUSIC_FMT_UNKNOWN;
 }
 
+/* 扫描 SD 卡 /music 目录，把可播放文件填入列表。 */
 bool music_scan(music_entry_t *list, int *count)
 {
     if (!list || !count) return false;
@@ -99,6 +101,7 @@ bool music_scan(music_entry_t *list, int *count)
     return true;
 }
 
+/* 拼出 SD 卡 music 目录下指定文件的完整路径。 */
 void music_full_path(const char *name, char *out, size_t cap)
 {
     if (!name || !out || cap == 0) return;
@@ -120,6 +123,7 @@ static volatile music_error_t s_last_error      = MUSIC_ERR_NONE;
 static inline void mp_lock(void)   { if (s_mtx) xSemaphoreTake(s_mtx, portMAX_DELAY); }
 static inline void mp_unlock(void) { if (s_mtx) xSemaphoreGive(s_mtx); }
 
+/* 初始化音乐播放器的互斥锁和播放完成信号量。 */
 void music_init(void)
 {
     if (!s_mtx)      s_mtx = xSemaphoreCreateMutex();
@@ -129,6 +133,9 @@ void music_init(void)
  * 返回 false 表示被 stop 请求打断，调用方应立即返回。*/
 static bool push_pcm_mono_blocking(const int16_t *pcm, size_t bytes)
 {
+    /* speaker_play 是非阻塞入口：ring 满时返回 0。
+     * 音乐播放需要“尽量不丢样本”，所以这里在解码任务内阻塞重试；
+     * TTS / GB 音频那类实时源则可以选择丢帧保实时性。 */
     const uint8_t *p = (const uint8_t *)pcm;
     size_t left = bytes;
     while (left > 0) {
@@ -153,6 +160,7 @@ static bool push_pcm_mono_blocking(const int16_t *pcm, size_t bytes)
 /* ================================================================
  * WAV 解码器
  * ================================================================ */
+/* 解析 WAV 头，找到 fmt/data chunk，并返回采样率、声道数和数据长度。 */
 static bool wav_parse_header(FILE *fp, uint32_t *sample_rate,
                              uint16_t *channels, uint16_t *bits,
                              uint32_t *data_bytes_out)
@@ -203,6 +211,7 @@ static bool wav_parse_header(FILE *fp, uint32_t *sample_rate,
     return true;
 }
 
+/* 流式解码 WAV 文件，必要时把双声道混成 mono 后推给 speaker。 */
 static bool decode_wav_stream(FILE *fp)
 {
     uint32_t sample_rate = 0, data_bytes = 0;
@@ -296,6 +305,8 @@ static bool decode_wav_stream(FILE *fp)
 #define MP3_INPUT_CHUNK       (2 * 1024)    /* 输入环形缓冲：每次 fread 填满 */
 #define MP3_MAX_PCM_SAMPLES   2304           /* helix 单帧最大 */
 
+/* 流式解码 MP3 文件。
+ * 负责跳过 ID3、查找同步字、逐帧解码、采样率切换和 stereo→mono。 */
 static bool decode_mp3_stream(FILE *fp)
 {
     HMP3Decoder dec = MP3InitDecoder();
@@ -473,6 +484,7 @@ out_free:
 }
 
 #else
+/* 未编译 MP3 支持时的占位实现，统一给上层返回失败。 */
 static bool decode_mp3_stream(FILE *fp)
 {
     (void)fp;
@@ -489,6 +501,8 @@ typedef struct {
     music_fmt_t fmt;
 } play_args_t;
 
+/* 音乐播放任务入口。
+ * 打开文件、选择对应解码器、等待音频播空，并在退出时恢复默认采样率。 */
 static void music_task(void *arg)
 {
     play_args_t *pa = (play_args_t *)arg;
@@ -527,6 +541,9 @@ static void music_task(void *arg)
     fclose(fp);
 
 done:
+    /* 播放结束时先等 speaker ring 尽量播空，再还原默认采样率。
+     * 如果 stop_request 已置位，说明用户要求立刻停，不等待 drain，
+     * 直接切回 16kHz 并由 speaker_flush/下一路音频覆盖残留。 */
     /* 还原默认采样率，后续 TTS / GB 音频不会变调 */
     if (!s_stop_request) {
         speaker_wait_drain(30000, &s_stop_request);
@@ -548,6 +565,8 @@ done:
 /* ================================================================
  * 公共 API
  * ================================================================ */
+/* 启动播放指定路径的音乐文件。
+ * 如果已有播放任务，会先停止旧任务，再创建 PSRAM 栈的新播放任务。 */
 bool music_play(const char *path)
 {
     s_last_error = MUSIC_ERR_NONE;
@@ -676,6 +695,7 @@ void music_stop(void)
     }
 }
 
+/* 暂停当前音乐播放；解码任务会停在 push_pcm_mono_blocking 的等待循环里。 */
 void music_pause(void)
 {
     mp_lock();
@@ -686,6 +706,7 @@ void music_pause(void)
     mp_unlock();
 }
 
+/* 恢复被 music_pause 暂停的播放。 */
 void music_resume(void)
 {
     mp_lock();
@@ -696,10 +717,14 @@ void music_resume(void)
     mp_unlock();
 }
 
+/* 获取当前播放器状态快照。 */
 music_state_t music_state(void)             { return s_state; }
+/* 返回当前播放文件名，空字符串表示没有播放任务。 */
 const char   *music_current_name(void)      { return s_current_name; }
+/* 返回最近一次公开 API 设置的错误码。 */
 music_error_t music_last_error(void)        { return s_last_error; }
 
+/* 把错误码转换为简短英文文本，便于 BLE/UI 直接展示。 */
 const char *music_last_error_text(void)
 {
     switch (s_last_error) {

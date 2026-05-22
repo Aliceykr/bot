@@ -16,7 +16,10 @@ typedef struct {
 
 static QueueHandle_t s_cleanup_queue = NULL;
 
-/* Cleaner：等目标任务彻底被 scheduler 销毁后释放栈/TCB */
+/* Cleaner：等目标任务彻底被 scheduler 销毁后释放栈/TCB。
+ * 静态任务的栈和 TCB 是调用方提供的内存，FreeRTOS 不会帮我们释放；
+ * 又不能在任务自己的入口里 free 自己正在使用的栈，所以统一交给
+ * 这个低优先级 cleaner 延迟回收。 */
 static void cleaner_task(void *arg)
 {
     (void)arg;
@@ -96,9 +99,12 @@ BaseType_t xTaskCreatePSRAMPinnedToCore(TaskFunction_t func, const char *name,
     if (!s_cleanup_queue) psram_task_init();
     if (!s_cleanup_queue) return pdFAIL;
 
-    /* 4 字节对齐 */
+    /* stack_bytes 是“字节数”，而 FreeRTOS 的 stack depth 是 StackType_t 个数。
+     * 对齐后再除以 sizeof(StackType_t)，避免调用方传非 4 字节倍数。 */
     stack_bytes = (stack_bytes + 3) & ~3;
 
+    /* 只把任务栈放 PSRAM，TCB 和包装上下文仍放内部 DRAM：
+     * FreeRTOS 调度器会频繁访问 TCB，而且关 cache 场景下访问 PSRAM 有风险。 */
     StackType_t  *stack = heap_caps_malloc(stack_bytes, MALLOC_CAP_SPIRAM);
     StaticTask_t *tcb   = heap_caps_malloc(sizeof(StaticTask_t), MALLOC_CAP_INTERNAL);
     entry_ctx_t  *ctx   = heap_caps_malloc(sizeof(entry_ctx_t), MALLOC_CAP_INTERNAL);

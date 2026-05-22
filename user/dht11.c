@@ -219,6 +219,7 @@ void dht11_init(void)
     ESP_LOGI(TAG, "DHT11 初始化完成 GPIO=%d", DHT11_GPIO);
 }
 
+/* 读取温度。内部会走缓存/实测路径，并用 mutex 串行化 DHT11 单总线时序。 */
 bool dht11_read_temp(int *out_temp_c)
 {
     if (!s_mtx || !out_temp_c) return false;
@@ -232,6 +233,7 @@ bool dht11_read_temp(int *out_temp_c)
     return ok;
 }
 
+/* 读取湿度。与温度读取共享同一份缓存，避免上层连续读温湿度时重复握手。 */
 bool dht11_read_humi(int *out_humi_pct)
 {
     if (!s_mtx || !out_humi_pct) return false;

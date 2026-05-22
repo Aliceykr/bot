@@ -19,7 +19,9 @@
  * 当前只实现显示 + 逻辑 + 按键控制。 */
 void game_2048_run(void);
 
-/* 请求退出 2048（可从另一个任务调用）。 */
+/* game_2048_request_exit：请求 2048 主循环尽快退出。
+ *
+ * 可从另一个任务调用；主循环每帧检查该标志。 */
 void game_2048_request_exit(void);
 
 #endif

@@ -93,6 +93,8 @@ void *rom_loader_read(const char *name, size_t *size)
         return NULL;
     }
 
+    /* name 来自 rom_loader_scan 的目录项，只拼到固定 ROM_DIR 下；
+     * 外部若传入带路径分隔符的名字也只会在 SD 卡 ROM 目录下解析。 */
     char path[320];
     snprintf(path, sizeof(path), "%s/%s", ROM_DIR, name);
     FILE *fp = fopen(path, "rb");
@@ -110,7 +112,9 @@ void *rom_loader_read(const char *name, size_t *size)
         return NULL;
     }
 
-    /* 放 PSRAM：ROM 最大 2MB（GBC MBC5），内部 DRAM 不够 */
+    /* 放 PSRAM：ROM 最大可到数 MB，内部 DRAM 要留给 LVGL、WiFi、音频 ring。
+     * 模拟器读取 ROM 是随机访问，Walnut-CGB 的 16/32 位回调能把 PSRAM
+     * 访问成本压到可接受范围。 */
     void *buf = heap_caps_malloc((size_t)len, MALLOC_CAP_SPIRAM);
     if (!buf) {
         ESP_LOGE(TAG, "PSRAM 分配失败 %ld 字节", len);

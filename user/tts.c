@@ -40,6 +40,7 @@ static int   s_err_len = 0;
 
 /* 互斥锁：保护 tts_speak 全过程（encoded / body / s_err_buf 等 static 共享资源）*/
 static SemaphoreHandle_t s_mutex = NULL;
+/* 懒创建 TTS 互斥锁，保护一次合成请求中的静态缓冲和音色状态读取。 */
 static void ensure_mutex(void) {
     if (!s_mutex) s_mutex = xSemaphoreCreateMutex();
 }
@@ -223,27 +224,33 @@ out:
     return ret;
 }
 
+/* 返回当前固件内置的百度 TTS 音色数量。 */
 int tts_voice_count(void)
 {
     return (int)(sizeof(s_voices) / sizeof(s_voices[0]));
 }
 
+/* 按 1-based 编号取得音色配置；BLE 命令直接使用这个编号体系。 */
 const tts_voice_t *tts_voice_get(int index)
 {
     if (index < 1 || index > tts_voice_count()) return NULL;
     return &s_voices[index - 1];
 }
 
+/* 返回当前音色的 1-based 编号，便于 UI/BLE 显示。 */
 int tts_voice_current_index(void)
 {
     return s_voice_index + 1;
 }
 
+/* 返回当前音色结构体，失败时由 tts_voice_get 统一处理。 */
 const tts_voice_t *tts_voice_current(void)
 {
     return tts_voice_get(tts_voice_current_index());
 }
 
+/* 切换百度 TTS per 参数。
+ * 只修改索引，不中断正在播放的音频；下一次 tts_speak 生效。 */
 bool tts_voice_set(int index)
 {
     if (index < 1 || index > tts_voice_count()) return false;

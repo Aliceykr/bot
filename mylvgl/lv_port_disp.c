@@ -58,6 +58,9 @@ static void wait_all_dma(void)
     }
 }
 
+/* LVGL 刷屏回调。
+ * LVGL 传入一个脏区 area 和连续像素 px_map；这里把它拆成 SPI DMA 事务发到 LCD。
+ * 注意：函数很快 ready，真正 DMA 完成由下一次 flush 前的 wait_all_dma 保证。 */
 static void disp_flush(lv_display_t *disp_drv, const lv_area_t *area, uint8_t *px_map)
 {
     /* 暂停模式：不发送 SPI，直接告诉 LVGL 已完成。游戏模式下用这种方式
@@ -119,6 +122,8 @@ static void disp_flush(lv_display_t *disp_drv, const lv_area_t *area, uint8_t *p
     lv_display_flush_ready(disp_drv);
 }
 
+/* 初始化 LVGL 显示驱动。
+ * 创建 240x320 显示对象，分配 DMA 可访问的双缓冲，并注册 disp_flush。 */
 void lv_port_disp_init(void)
 {
     if (!s_spi) {

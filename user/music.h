@@ -74,15 +74,31 @@ bool music_play(const char *path);
 /* 必须在 app_main 启动阶段单线程调用一次，确保 mutex/sem 在任何并发调用前创建 */
 void music_init(void);
 
-/* 停止当前播放。阻塞至后台任务退出（最多 500ms）。*/
+/* music_stop：请求停止当前播放并等待后台任务退出。
+ *
+ * 会清 pause 状态并最多等待约 2 秒。若任务异常卡住，会记录 warning 后返回。 */
 void music_stop(void);
 
+/* music_pause：暂停当前播放任务推送 PCM。
+ *
+ * 只影响音乐模块，speaker 里已经缓冲的短尾音仍可能继续播完。 */
 void music_pause(void);
+
+/* music_resume：恢复被 music_pause 暂停的播放。 */
 void music_resume(void);
 
+/* music_state：返回当前播放器状态（空闲/播放/暂停）。 */
 music_state_t music_state(void);
+
+/* music_current_name：返回当前播放文件名。
+ *
+ * 返回指向模块内部静态字符串，调用方只读，不要保存用于长期跨任务修改。 */
 const char   *music_current_name(void);
+
+/* music_last_error：返回最近一次 music_play 失败原因枚举。 */
 music_error_t music_last_error(void);
+
+/* music_last_error_text：返回最近一次错误的可读短文本，便于 BLE/UI 提示。 */
 const char   *music_last_error_text(void);
 
 #endif

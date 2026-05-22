@@ -70,6 +70,8 @@ static SemaphoreHandle_t s_recog_mutex = NULL;
 /* 前向声明：asr_mic_init 需要创建该任务 */
 static void asr_rec_task(void *arg);
 
+/* ASR HTTP 回调：收集百度识别响应 JSON。
+ * 响应分片到达时按需扩容 PSRAM 缓冲，结束时补 '\0' 供 cJSON 解析。 */
 static esp_err_t http_event_cb(esp_http_client_event_t *evt)
 {
     switch (evt->event_id) {
@@ -247,6 +249,8 @@ void asr_record_start(void)
     ESP_LOGI(TAG, "开始录音");
 }
 
+/* 停止录音并等待录音任务退出 I2S read。
+ * 返回实际采集到的 PCM 字节数，随后可交给 asr_recognize 上传识别。 */
 uint32_t asr_record_stop(void)
 {
     if (!s_recording) return 0;
@@ -280,6 +284,7 @@ uint32_t asr_record_stop(void)
     return bytes;
 }
 
+/* 查询当前是否处于录音状态，供 UI 控制按钮状态和流程分支。 */
 bool asr_is_recording(void) { return s_recording; }
 
 // ================================================================
@@ -359,6 +364,8 @@ void asr_mic_reinit(void)
 // ================================================================
 // 识别
 // ================================================================
+/* 上传当前录音缓冲到百度 ASR 并解析识别结果。
+ * 该函数只处理“已录好的 PCM”，录音启停由 asr_record_start/stop 管理。 */
 bool asr_recognize(uint32_t audio_len_bytes, asr_result_t *out)
 {
     if (s_recog_mutex) xSemaphoreTake(s_recog_mutex, portMAX_DELAY);

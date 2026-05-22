@@ -325,6 +325,7 @@ static void render_header(void)
     LCD_ShowString(x, 42, (const uint8_t *)buf, 0xAAAA, BLACK, 16, 0);
 }
 
+/* 绘制底部操作提示栏。 */
 static void render_footer(void)
 {
     LCD_Fill(0, BOARD_SCREEN_Y + BOARD_SIZE, LCD_W, LCD_H, BLACK);
@@ -362,6 +363,8 @@ typedef struct {
     bool    merged;
 } line_move_t;
 
+/* 把一行按 2048 规则向左压缩并合并。
+ * 同时记录每个数字块从哪里移动到哪里，供滑动动画还原轨迹。 */
 static uint32_t merge_line_left_track(uint8_t line[GRID_N],
                                        line_move_t moves[GRID_N],
                                        int *n_moves)
@@ -417,6 +420,7 @@ static uint32_t merge_line_left_track(uint8_t line[GRID_N],
     return gained;
 }
 
+/* 反转一行，用同一套“向左合并”逻辑复用出向右/向下移动。 */
 static void reverse_line(uint8_t line[GRID_N])
 {
     for (int i = 0; i < GRID_N / 2; i++) {
@@ -426,6 +430,8 @@ static void reverse_line(uint8_t line[GRID_N])
     }
 }
 
+/* 按方向移动整个棋盘。
+ * dir: 1=上, 2=下, 3=左, 4=右；返回本次移动获得的分数。 */
 static uint32_t move_dir_track(int dir,
                                 tile_move_t tracks[MAX_TRACKS],
                                 int *n_tracks)
@@ -476,11 +482,13 @@ static uint32_t move_dir_track(int dir,
     return total;
 }
 
+/* 判断本次移动后棋盘内容是否真的发生变化。 */
 static bool board_changed(void)
 {
     return memcmp(s_board, s_prev, sizeof(s_board)) != 0;
 }
 
+/* 判断是否无空格且任意相邻格都不能合并。 */
 static bool is_game_over(void)
 {
     for (int r = 0; r < GRID_N; r++)
@@ -495,6 +503,8 @@ static bool is_game_over(void)
     return true;
 }
 
+/* 在随机空格生成新方块。
+ * 90% 生成 2(power=1)，10% 生成 4(power=2)，并可返回生成坐标。 */
 static void spawn_random_tile(int *out_r, int *out_c)
 {
     int empty[GRID_N * GRID_N]; int n = 0;
@@ -513,6 +523,7 @@ static void spawn_random_tile(int *out_r, int *out_c)
     if (out_c) *out_c = c;
 }
 
+/* 重置棋盘、分数和步数，并生成开局两个方块。 */
 static void new_game(void)
 {
     memset(s_board, 0, sizeof(s_board));
@@ -609,6 +620,7 @@ static void play_slide_animation(tile_move_t tracks[], int n_tracks)
     fb_flush();
 }
 
+/* 新生成方块的弹出动画：从小尺寸逐帧放大到标准格子大小。 */
 static void play_popin_animation(int r, int c)
 {
     if (s_board[r][c] == 0) return;
@@ -650,6 +662,7 @@ static int parse_direction(uint16_t bits)
     return 0;
 }
 
+/* 执行一次有效方向移动：移动、动画、加分、生成新块、检测结束。 */
 static void do_move(int dir)
 {
     memcpy(s_prev, s_board, sizeof(s_prev));

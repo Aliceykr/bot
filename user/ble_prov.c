@@ -399,6 +399,9 @@ static void rx_timer_cb(TimerHandle_t t)
     char *buf = NULL;
     size_t n = 0;
 
+    /* GATT write 可能被手机拆成多个小包；用 50ms idle timer 做“拼包结束”
+     * 判定。timer 只复制出一份完整消息，真正解析放到 worker 任务，
+     * 避免在 FreeRTOS timer service 任务里做 HTTP/SD/FATFS 等慢操作。 */
     LOCK();
     if (s_rx_len > 0) {
         buf = malloc(RX_ACCUM_CAP);
@@ -667,6 +670,9 @@ static void on_reset(int reason)
  * ================================================================ */
 static void force_nimble_teardown(void)
 {
+    /* NimBLE/controller 状态在失败回滚、正常 deinit、重复 init 前都可能不同。
+     * 这里把“尽可能停 host，再尽可能停 controller”收敛成一条幂等路径，
+     * 上层就不需要知道当前卡在哪个半初始化阶段。 */
     esp_bt_controller_status_t ctl_st = esp_bt_controller_get_status();
     bool nimble_touched = s_initialized ||
                           ctl_st == ESP_BT_CONTROLLER_STATUS_INITED ||

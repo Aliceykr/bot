@@ -44,6 +44,8 @@ static volatile lv_indev_state_t s_sw_state = LV_INDEV_STATE_RELEASED;
 /* 按键扫描任务：5ms 周期运行按键状态机，不阻塞、不占用重度 CPU */
 static void encoder_task(void *arg)
 {
+    /* 只处理编码器按键 SW 的去抖；A/B 相由 PCNT 硬件计数。
+     * 旋转和按键拆开后，快速旋转不会因为 5ms 轮询而丢脉冲。 */
     (void)arg;
     sw_phase_t sw_phase = SW_IDLE;
     uint32_t   sw_tick  = 0;
@@ -83,6 +85,8 @@ static void encoder_task(void *arg)
 /* LVGL 输入读回调：从 PCNT 取增量，除以每卡位脉冲数 */
 static void encoder_read(lv_indev_t *indev, lv_indev_data_t *data)
 {
+    /* LVGL 周期调用该回调读取输入。
+     * data->enc_diff 是这次相对上次的旋转卡位数，data->state 是按键状态。 */
     /* 游戏模式下屏蔽所有编码器输入：
      * - 不上报旋转事件（enc_diff=0）
      * - 不上报按键（state=RELEASED）
@@ -117,6 +121,8 @@ static void encoder_read(lv_indev_t *indev, lv_indev_data_t *data)
 /* PCNT 初始化：A 相为边沿信号，B 相为电平控制，形成正交计数 */
 static bool pcnt_init(void)
 {
+    /* PCNT 用 A 相边沿计数、B 相电平决定方向，等价硬件正交解码。
+     * 比 GPIO 中断或软件轮询更稳，适合机械编码器。 */
     pcnt_unit_config_t unit_cfg = {
         .high_limit = 32767,
         .low_limit  = -32768,
@@ -159,6 +165,8 @@ static bool pcnt_init(void)
 
 void lv_port_indev_init(void)
 {
+    /* 初始化顺序：先配 GPIO，再启 PCNT 和按键任务，最后注册到 LVGL。
+     * 具体绑定到哪个 lv_group 由 main.c 在 my_demo 创建后完成。 */
     /* SW 引脚手动配置为输入 + 上拉；A/B 引脚由 PCNT 接管 */
     gpio_config_t io_conf = {};
     io_conf.intr_type    = GPIO_INTR_DISABLE;
@@ -190,6 +198,8 @@ void lv_port_indev_init(void)
 
 void lv_port_indev_set_menu_mode(bool enable)
 {
+    /* 游戏期间关闭菜单输入，防止编码器在后台改变 LVGL 焦点。
+     * 恢复菜单时 PCNT 残留计数已经在 read 回调里被吃掉。 */
     s_menu_mode = enable;
     ESP_LOGI(TAG, "encoder menu_mode=%d", (int)enable);
 }

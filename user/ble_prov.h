@@ -12,31 +12,42 @@ typedef void (*ble_prov_status_cb_t)(const char *status);
  * 或 xTaskCreate 投递到其他上下文。 */
 typedef void (*ble_prov_cred_cb_t)(const char *ssid, const char *password);
 
-/* 初始化 Bluedroid + BLE GATT。
- * 懒加载：仅在用户打开蓝牙功能时调用。重复调用幂等。 */
+/* ble_prov_init：初始化 NimBLE Host、GATT 服务和 BLE controller。
+ *
+ * 懒加载：仅在用户打开蓝牙功能时调用。重复调用幂等。
+ * 只完成初始化，不一定立刻广播；广播由 ble_prov_start 触发。 */
 bool ble_prov_init(void);
 
-/* 完全释放 Bluedroid 栈（disable + deinit + controller disable/deinit），
- * 归还 ~50-60KB DRAM。关闭蓝牙时调用。未初始化时调用无副作用。 */
+/* ble_prov_deinit：完全释放 NimBLE 和 controller 资源。
+ *
+ * 关闭蓝牙或配网完成后调用，归还几十 KB 内部 DRAM。
+ * 内部会等待 pending notify 调用结束，避免拆 host 时还有任务在用 NimBLE。 */
 void ble_prov_deinit(void);
 
-/* 启动 BLE 广播 */
+/* ble_prov_start：启动 HM-10 兼容 GATT 广播。
+ *
+ * cb 用于上报“蓝牙已开启/已连接/收到凭据”等状态；若 NimBLE host 尚未 sync，
+ * 函数返回 true 表示已登记启动请求，真正成功以回调为准。 */
 bool ble_prov_start(ble_prov_status_cb_t cb);
 
 /* 注册凭据接收回调。收到 SSID_xxx password_yyy 后会调用。
  * 上层典型处理：ble_prov_deinit() 释放 BT 栈 → 触发 WiFi 连接。 */
 void ble_prov_set_cred_cb(ble_prov_cred_cb_t cb);
 
-/* 停止 BLE 广播，断开连接 */
+/* ble_prov_stop：停止广播并断开当前连接。
+ *
+ * 不释放 controller 资源；若要彻底省内存，随后调用 ble_prov_deinit。 */
 void ble_prov_stop(void);
 
-/* BLE 是否正在运行 */
+/* ble_prov_is_active：查询当前是否处于广播/连接活跃状态。 */
 bool ble_prov_is_active(void);
 
-/* 游戏时暂停：记录状态后释放 BT 资源 */
+/* ble_prov_suspend：游戏进入前暂停 BLE。
+ *
+ * 记录进入游戏前是否 active，并停止广播/连接，避免和游戏争 DRAM/CPU。 */
 void ble_prov_suspend(void);
 
-/* 游戏后恢复：仅当进入游戏前活跃时才恢复 */
+/* ble_prov_resume：游戏退出后按 suspend 记录恢复 BLE 广播。 */
 void ble_prov_resume(void);
 
 #endif /* __BLE_PROV_H */

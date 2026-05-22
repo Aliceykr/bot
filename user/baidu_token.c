@@ -25,7 +25,10 @@ static size_t  s_resp_cap = 0;
 static size_t  s_resp_len = 0;
 static bool    s_resp_overflow = false;
 
-/* 释放 HTTP 响应缓冲区，在 API 函数返回前调用（必须在 mutex 持有期间） */
+/* resp_buf_release：释放百度 token HTTP 响应缓冲。
+ *
+ * 在 API 函数返回前调用，避免 token 响应缓冲长期占用 PSRAM。
+ * 必须在 s_mutex 持有期间调用。 */
 static inline void resp_buf_release(void)
 {
     if (s_resp_buf) {
@@ -44,7 +47,10 @@ static int64_t s_expire_us = 0;   /* esp_timer_get_time() 单调时间戳，到�
 static SemaphoreHandle_t s_mutex = NULL;
 
 /* ================================================================
- * HTTP 事件回调：动态扩容累积响应
+ * http_event_cb：esp_http_client 响应收集回调。
+ *
+ * 百度 token 响应会分块到达，这里动态扩容 PSRAM 缓冲并拼成一个
+ * '\0' 结尾的 JSON 字符串，供 fetch_token_locked 解析。
  * ================================================================ */
 static esp_err_t http_event_cb(esp_http_client_event_t *evt)
 {
@@ -86,8 +92,10 @@ static esp_err_t http_event_cb(esp_http_client_event_t *evt)
 }
 
 /* ================================================================
- * 向百度请求 token，解析 access_token + expires_in，写入缓存
- * 调用方必须已持有 s_mutex
+ * fetch_token_locked：向百度 OAuth2 接口请求并缓存 access_token。
+ *
+ * 解析 access_token 和 expires_in，写入 s_token / s_expire_us。
+ * 调用方必须已持有 s_mutex，保证同一时间只有一个任务刷新 token。
  * ================================================================ */
 static bool fetch_token_locked(void)
 {
@@ -151,7 +159,10 @@ static bool fetch_token_locked(void)
     return ok;
 }
 
-/* 必须在 app_main 启动阶段单线程调用一次，确保 mutex 在任何并发调用前创建 */
+/* baidu_token_init：提前创建 token 模块 mutex。
+ *
+ * 必须在 app_main 启动阶段单线程调用一次，确保 ASR/TTS 并发使用 token
+ * 前同步对象已经存在。多次调用安全。 */
 void baidu_token_init(void)
 {
     /* 幂等：仅在 mutex 尚未创建时创建，app_main 单线程阶段调用 */
@@ -161,6 +172,10 @@ void baidu_token_init(void)
     }
 }
 
+/* ensure_mutex：公开 API 的懒初始化兜底。
+ *
+ * 理论路径中 app_main 会先调用 baidu_token_init；这里避免旧代码或测试
+ * 直接调用 get/copy/invalidate 时因 mutex 未创建而失败。 */
 static void ensure_mutex(void)
 {
     if (!s_mutex) {
@@ -173,6 +188,10 @@ static void ensure_mutex(void)
 /* ================================================================
  * 公开接口
  * ================================================================ */
+/* baidu_token_get：获取一个当前有效的百度 access_token 指针。
+ *
+ * 首次调用或即将过期时会同步请求新 token。返回值指向模块内部静态缓存，
+ * 只适合立即使用；跨任务/跨时间保存请用 baidu_token_copy。 */
 const char *baidu_token_get(void)
 {
     ensure_mutex();
@@ -195,6 +214,10 @@ const char *baidu_token_get(void)
     return ret;
 }
 
+/* baidu_token_copy：获取有效 token 并拷贝到调用方缓冲区。
+ *
+ * 适合 ASR/TTS 组 URL 前使用，避免 baidu_token_get 返回的内部指针在释放
+ * mutex 后被其他任务刷新覆盖。 */
 bool baidu_token_copy(char *buf, size_t buf_size)
 {
     if (!buf || buf_size == 0) return false;
@@ -221,6 +244,10 @@ bool baidu_token_copy(char *buf, size_t buf_size)
     return true;
 }
 
+/* baidu_token_invalidate：主动清空 token 缓存。
+ *
+ * 当百度 API 返回 401 或 ASR/TTS token 相关错误码时调用；下一次 get/copy
+ * 会重新请求 token。 */
 void baidu_token_invalidate(void)
 {
     ensure_mutex();

@@ -24,6 +24,8 @@
 
 static void lvgl_tick_task(void *arg)
 {
+    /* LVGL 需要稳定 tick 作为动画、输入长按、timer 的时间基准。
+     * 5ms 粒度足够界面流畅，也不会让系统频繁切任务。 */
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(5));
         lv_tick_inc(5);
@@ -32,6 +34,8 @@ static void lvgl_tick_task(void *arg)
 
 static void lvgl_task(void *arg)
 {
+    /* UI 只在这个任务里创建和更新。后台 HTTP / ASR / BLE / 游戏任务
+     * 必须通过队列或 lv_async_call 回到这里再碰 LVGL 对象。 */
     my_demo();
 
     lv_group_t *group = my_demo_get_group();
@@ -58,6 +62,9 @@ static void lvgl_task(void *arg)
 
 void app_main(void)
 {
+    /* 启动顺序有依赖：先 NVS/模块 mutex，再 LCD/SD/LVGL。
+     * 很多模块（音量、WiFi、token、音乐）会在后台任务里再次被调用，
+     * 所以这里单线程提前 init，避免首次并发创建 mutex。 */
     /* NVS 和 SD 卡尽早初始化，不依赖任何业务路径。
      * 游戏 ROM / 音乐文件都在 SD 卡上，不再打包 SPIFFS。*/
     esp_err_t nvs_err = nvs_flash_init();

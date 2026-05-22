@@ -44,6 +44,8 @@ void weather_init(void)
     if (!s_mutex) s_mutex = xSemaphoreCreateMutex();
 }
 
+/* 兜底创建互斥锁。
+ * 正常由 app_main 初始化；这里防止以后有人直接调用 weather_fetch。 */
 static void ensure_mutex(void) {
     if (!s_mutex) {
         ESP_LOGW(TAG, "weather_init 未在 app_main 阶段调用，回退 lazy-create");
@@ -51,6 +53,8 @@ static void ensure_mutex(void) {
     }
 }
 
+/* HTTP 数据回调：把分片响应追加到 PSRAM 缓冲。
+ * 天气 API 返回 JSON，但长度不可完全信任，所以这里做动态扩容和最大上限。 */
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
     switch (evt->event_id) {
@@ -90,6 +94,8 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
+/* 执行一次 HTTPS GET。
+ * 响应体由 http_event_handler 收集到模块级缓冲，调用方负责解析和释放。 */
 static bool http_get(const char *url)
 {
     s_resp_len = 0;
@@ -114,6 +120,8 @@ static bool http_get(const char *url)
     return true;
 }
 
+/* 拉取并解析天气数据。
+ * 全流程持有 mutex，保证 HTTP 响应缓冲和 cJSON 解析不会被并发调用打断。 */
 bool weather_fetch(weather_data_t *out)
 {
     ensure_mutex();
@@ -192,4 +200,3 @@ out:
     if (s_mutex) xSemaphoreGive(s_mutex);
     return ret;
 }
-

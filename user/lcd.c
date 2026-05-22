@@ -5,8 +5,11 @@
 
 spi_device_handle_t s_spi = NULL;
 static const char *TAG = "LCD";
+/* LCD 初始化序列里使用的 RTOS 延时封装。 */
 static void lcd_delay_ms(uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
 
+/* 通过 SPI 同步发送一段原始字节。
+ * LCD 命令/数据的 DC 电平由上层函数在调用前设置。 */
 static void lcd_spi_send(const uint8_t *data, size_t len)
 {
     if (len == 0) return;
@@ -18,6 +21,8 @@ static void lcd_spi_send(const uint8_t *data, size_t len)
     spi_device_polling_transmit(s_spi, &t);
 }
 
+/* 初始化 LCD 相关 GPIO 和 SPI2 设备。
+ * 成功后全局 s_spi 可被 LVGL、游戏 framebuffer 和基础绘图函数复用。 */
 void LCD_GPIO_Init(void)
 {
     // DC, BLK, RES 为普通 GPIO
@@ -62,13 +67,18 @@ void LCD_GPIO_Init(void)
     }
 }
 
+/* 发送 1 字节数据，保留给旧版驱动接口兼容。 */
 void LCD_Writ_Bus(uint8_t dat) { lcd_spi_send(&dat, 1); }
+/* 发送 8 位 LCD 数据。 */
 void LCD_WR_DATA8(uint8_t dat) { lcd_spi_send(&dat, 1); }
+/* 发送 16 位 RGB565 数据，按 LCD 要求高字节在前。 */
 void LCD_WR_DATA(uint16_t dat)
 {
     uint8_t buf[2] = {dat >> 8, dat & 0xFF};
     lcd_spi_send(buf, 2);
 }
+/* 发送 LCD 寄存器/命令字。
+ * DC 拉低表示命令，发送完恢复为数据模式。 */
 void LCD_WR_REG(uint8_t dat)
 {
     gpio_set_level(LCD_DC_PIN, 0);
@@ -76,6 +86,8 @@ void LCD_WR_REG(uint8_t dat)
     gpio_set_level(LCD_DC_PIN, 1);
 }
 
+/* 批量发送像素缓冲。
+ * 主要给整块 framebuffer 或图片数据使用；内部按块拆分避免单次事务过大。 */
 void LCD_Send_Buf(const uint8_t *buf, uint32_t len)
 {
     if (!s_spi) {
@@ -94,6 +106,7 @@ void LCD_Send_Buf(const uint8_t *buf, uint32_t len)
     }
 }
 
+/* 设置 LCD 后续写入的矩形窗口，随后发送的像素会从该窗口左上角开始填充。 */
 void LCD_Address_Set(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2)
 {
     LCD_WR_REG(0x2a);
@@ -103,11 +116,14 @@ void LCD_Address_Set(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2)
     LCD_WR_REG(0x2c);
 }
 
+/* 控制背光开关。 */
 void LCD_Backlight(uint8_t on)
 {
     gpio_set_level(LCD_BLK_PIN, on ? 1 : 0);
 }
 
+/* LCD 面板初始化入口。
+ * 先初始化 GPIO/SPI，再执行面板寄存器配置，最后打开背光。 */
 void LCD_Init(void)
 {
     LCD_GPIO_Init();
@@ -162,6 +178,8 @@ void LCD_Init(void)
 // 绘图函数
 // ================================================================
 
+/* 填充一个矩形区域。
+ * xend/yend 按“结束后一位”处理，因此实际绘制到 xend-1/yend-1。 */
 void LCD_Fill(uint16_t xsta, uint16_t ysta, uint16_t xend, uint16_t yend, uint16_t color)
 {
     if (!s_spi) {
@@ -184,12 +202,14 @@ void LCD_Fill(uint16_t xsta, uint16_t ysta, uint16_t xend, uint16_t yend, uint16
     }
 }
 
+/* 绘制单个像素点。 */
 void LCD_DrawPoint(uint16_t x, uint16_t y, uint16_t color)
 {
     LCD_Address_Set(x, y, x, y);
     LCD_WR_DATA(color);
 }
 
+/* 用 Bresenham 算法画直线，适合任意斜率。 */
 void LCD_DrawLine(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint16_t color)
 {
     uint16_t t;
@@ -205,12 +225,14 @@ void LCD_DrawLine(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint16_t c
     }
 }
 
+/* 画矩形边框，不填充内部。 */
 void LCD_DrawRectangle(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint16_t color)
 {
     LCD_DrawLine(x1,y1,x2,y1,color); LCD_DrawLine(x1,y1,x1,y2,color);
     LCD_DrawLine(x1,y2,x2,y2,color); LCD_DrawLine(x2,y1,x2,y2,color);
 }
 
+/* 画圆形轮廓，使用八分对称减少计算量。 */
 void Draw_Circle(uint16_t x0, uint16_t y0, uint8_t r, uint16_t color)
 {
     int a=0,b=r;
@@ -227,6 +249,8 @@ void Draw_Circle(uint16_t x0, uint16_t y0, uint8_t r, uint16_t color)
 // 字符显示
 // ================================================================
 
+/* 按内置 ASCII 字库绘制单个字符。
+ * mode=0 绘制前景和背景；mode=1 只画前景像素，背景透明。 */
 void LCD_ShowChar(uint16_t x, uint16_t y, uint8_t num, uint16_t fc, uint16_t bc, uint8_t sizey, uint8_t mode)
 {
     uint8_t temp,sizex,t,m=0; uint16_t i,TypefaceNum,x0=x;
@@ -245,11 +269,14 @@ void LCD_ShowChar(uint16_t x, uint16_t y, uint8_t num, uint16_t fc, uint16_t bc,
     }
 }
 
+/* 连续绘制字符串，字符宽度按 sizey/2 推进。 */
 void LCD_ShowString(uint16_t x, uint16_t y, const uint8_t *p, uint16_t fc, uint16_t bc, uint8_t sizey, uint8_t mode)
 { while(*p!='\0'){LCD_ShowChar(x,y,*p,fc,bc,sizey,mode);x+=sizey/2;p++;} }
 
+/* 小整数幂函数，供数字显示拆位使用。 */
 uint32_t mypow(uint8_t m, uint8_t n){ uint32_t r=1; while(n--)r*=m; return r; }
 
+/* 按固定长度显示整数，前导 0 用空格隐藏。 */
 void LCD_ShowIntNum(uint16_t x, uint16_t y, uint16_t num, uint8_t len, uint16_t fc, uint16_t bc, uint8_t sizey)
 {
     uint8_t t,temp,enshow=0,sizex=sizey/2;
@@ -260,6 +287,7 @@ void LCD_ShowIntNum(uint16_t x, uint16_t y, uint16_t num, uint8_t len, uint16_t 
     }
 }
 
+/* 显示保留两位小数的浮点数，len 表示整数拆位时使用的总位数。 */
 void LCD_ShowFloatNum1(uint16_t x, uint16_t y, float num, uint8_t len, uint16_t fc, uint16_t bc, uint8_t sizey)
 {
     uint8_t t,temp,sizex=sizey/2; uint16_t num1=num*100;
@@ -270,6 +298,7 @@ void LCD_ShowFloatNum1(uint16_t x, uint16_t y, float num, uint8_t len, uint16_t 
     }
 }
 
+/* 按 RGB565 原始图片数组绘制图片。 */
 void LCD_ShowPicture(uint16_t x, uint16_t y, uint16_t length, uint16_t width, const uint8_t pic[])
 {
     uint16_t i,j; uint32_t k=0;

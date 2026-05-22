@@ -18,6 +18,8 @@
 
 void game_runtime_request_exit(void)
 {
+    /* 统一退出入口：当前可能运行的是 GB 模拟器、2048 或骰子。
+     * 各模块自己检查退出标志，未运行的模块收到请求也没有副作用。 */
     gb_emu_request_exit();
     game_2048_request_exit();
     game_dice_request_exit();
@@ -25,6 +27,8 @@ void game_runtime_request_exit(void)
 
 void game_runtime_run(const char *rom_name)
 {
+    /* 运行时只做分派和 ROM 加载，不负责 LVGL suspend/resume。
+     * 调用方已经接管屏幕和输入，因此这里可以直接使用 LCD 底层绘制。 */
     /* 内置游戏分派：不走 SPIFFS，直接跑对应的实现。
      * 以后加新内置游戏（推箱子、贪吃蛇等）只需要在此处加分支。 */
     if (rom_name && strcmp(rom_name, BUILTIN_2048_NAME) == 0) {

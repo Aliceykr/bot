@@ -5,18 +5,17 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Peanut-GB 集成层
+/* Walnut-CGB 集成层
  *
  * 职责：
- *   - 用已加载到内存的 ROM 数据初始化 Peanut-GB
+ *   - 用已加载到内存的 ROM 数据初始化 Walnut-CGB
  *   - 分配 cart RAM（保存数据）
- *   - 每帧调用 gb_run_frame，把 160x144 画面按行 1.5× 缩放到 LCD
- *   - 轮询退出信号
+ *   - 每帧调用 gb_run_frame_dualfetch，把 160x144 画面按行 1.5× 缩放到 LCD
+ *   - 轮询矩阵键盘并把按键映射到 GB joypad
+ *   - 每帧生成 APU 音频并推给 speaker
  *
  * 不负责：
  *   - 文件读取（rom_loader 做）
- *   - 按键输入（gb_input 做，本步占位为全松开）
- *   - 音频（下一步）
  *   - 持久化存档（下一步，目前每次启动状态全新）
  */
 
@@ -26,7 +25,9 @@
  * 返回 true 表示正常退出，false 表示初始化失败（ROM 不合法等）*/
 bool gb_emu_run(const uint8_t *rom_data, size_t rom_size);
 
-/* 请求模拟器退出。可从另一任务/中断上下文调用 */
+/* gb_emu_request_exit：请求模拟器主循环在下一帧边界退出。
+ *
+ * 可从另一任务调用；不要在真正的硬中断里调用。 */
 void gb_emu_request_exit(void);
 
 #endif

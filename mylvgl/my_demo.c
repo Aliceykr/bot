@@ -199,7 +199,7 @@ static bool wifi_connecting = false;
 // 天气显示界面
 // ================================================================
 
-// NTP 实时时钟 timer 回调
+/* NTP 实时时钟 timer 回调：每秒刷新天气页上的时间标签。 */
 static void clock_timer_cb(lv_timer_t *t)
 {
     lv_obj_t *lbl = (lv_obj_t *)lv_timer_get_user_data(t);
@@ -212,6 +212,7 @@ static void clock_timer_cb(lv_timer_t *t)
     lv_label_set_text_fmt(lbl, "%02d:%02d:%02d", now.tm_hour, now.tm_min, now.tm_sec);
 }
 
+/* 天气详情页返回按钮：切回主菜单并恢复主菜单输入 group。 */
 static void back_btn_cb(lv_event_t *e)
 {
     // auto_del=true 让动画结束后自动删除天气屏幕
@@ -219,6 +220,7 @@ static void back_btn_cb(lv_event_t *e)
     indev_set_group(group);
 }
 
+/* 显示天气详情页，把 weather_fetch 得到的数据渲染成 LVGL 页面。 */
 static void show_weather_screen(const weather_data_t *d)
 {
     lv_obj_t *scr = lv_obj_create(NULL);
@@ -327,6 +329,7 @@ static void show_weather_screen(const weather_data_t *d)
     lv_screen_load_anim(scr, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
 }
 
+/* 取消天气查询：递增 generation，让后台迟到结果自动失效。 */
 static void weather_cancel_btn_cb(lv_event_t *e)
 {
     s_weather_req_id++;
@@ -343,6 +346,7 @@ typedef struct {
     uint32_t req_id;
 } weather_task_args_t;
 
+/* 天气查询后台任务：联网拉取数据，并把结果投递给 LVGL 轮询队列。 */
 static void weather_fetch_task(void *arg)
 {
     weather_task_args_t *args = (weather_task_args_t *)arg;
@@ -359,6 +363,7 @@ static void weather_fetch_task(void *arg)
     }
 }
 
+/* 启动一次天气查询流程：清旧结果、创建 loading、启动 PSRAM 栈后台任务。 */
 static void start_weather_fetch(void)
 {
     if (weather_fetching) return;
@@ -367,6 +372,9 @@ static void start_weather_fetch(void)
         return;
     }
 
+    /* weather_fetch_task 可能在用户取消后才返回。
+     * 启动新请求前先清队列，并用 req_id generation 过滤迟到结果，
+     * 保证 UI 只消费“当前这一次”的天气数据。 */
     weather_result_t drained;
     while (weather_result_queue &&
            xQueueReceive(weather_result_queue, &drained, 0) == pdTRUE) {}
@@ -442,6 +450,7 @@ static void chat_log_append(const char *line)
     memcpy(chat_log + used, line, add_len + 1);
 }
 
+/* 聊天后台任务：调用 model_chat，完成后把结果送回 UI 队列。 */
 static void chat_fetch_task(void *arg)
 {
     char *msg = (char *)arg;
@@ -452,6 +461,7 @@ static void chat_fetch_task(void *arg)
     if (chat_result_queue) xQueueSend(chat_result_queue, &res, 0);
 }
 
+/* 聊天发送按钮/键盘确认回调：追加用户输入并启动模型请求任务。 */
 static void chat_send_cb(lv_event_t *e)
 {
     if (chat_fetching) return;
@@ -491,6 +501,7 @@ static void chat_send_cb(lv_event_t *e)
     }
 }
 
+/* 聊天软键盘事件：READY 发送，CANCEL 返回。 */
 static void chat_kb_event_cb(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
@@ -503,6 +514,7 @@ static void chat_kb_event_cb(lv_event_t *e)
     }
 }
 
+/* 聊天页返回：清理页面状态和迟到回复，切回主菜单。 */
 static void chat_back_btn_cb(lv_event_t *e)
 {
     // 清空对话记录
@@ -528,6 +540,7 @@ static void chat_back_btn_cb(lv_event_t *e)
     indev_set_group(group);
 }
 
+/* 聊天结果轮询 timer：从队列取模型回复并更新对话记录。 */
 static void chat_result_check_cb(lv_timer_t *t)
 {
     // 聊天界面已关闭，删除 timer
@@ -580,6 +593,7 @@ typedef struct {
 static QueueHandle_t asr_result_queue = NULL;
 static QueueHandle_t asr_llm_result_queue = NULL;  /* ASR→LLM 结果队列 */
 
+/* ASR 识别后台任务：上传录音 PCM，拿到文字后投递给 UI。 */
 static void asr_recognize_task(void *arg)
 {
     uint32_t audio_len = *(uint32_t *)arg;
@@ -590,6 +604,7 @@ static void asr_recognize_task(void *arg)
 }
 
 /* ASR→LLM 后台任务：将 ASR 识别文字送入模型，结果通过队列返回 LVGL 线程 */
+/* ASR 后续大模型任务：把识别文本发给模型，结果回到同一个 ASR 队列。 */
 static void asr_llm_task(void *arg)
 {
     char *asr_text = (char *)arg;
@@ -603,6 +618,7 @@ static void asr_llm_task(void *arg)
     if (asr_llm_result_queue) xQueueSend(asr_llm_result_queue, &res, 0);
 }
 
+/* 语音助手按钮回调：按下开始录音，松开停止并启动识别。 */
 static void asr_btn_cb(lv_event_t *e)
 {
     if (asr_processing) return;
@@ -644,6 +660,7 @@ static void asr_btn_cb(lv_event_t *e)
     }
 }
 
+/* 语音助手 timer：消费 ASR/LLM 队列，更新页面状态和回复文本。 */
 static void asr_timer_cb(lv_timer_t *t)
 {
     if (!asr_scr || !lv_obj_is_valid(asr_scr)) { lv_timer_delete(t); return; }
@@ -703,6 +720,7 @@ static void asr_timer_cb(lv_timer_t *t)
     }
 }
 
+/* 语音助手返回：停止可能进行中的录音并回到主菜单。 */
 static void asr_back_cb(lv_event_t *e)
 {
     if (asr_recording) asr_record_stop();
@@ -807,6 +825,7 @@ static QueueHandle_t sr_pending_action_queue = NULL;
 /* SR 状态弹窗：进入"启动中"时显示，启动结果到达后切换为成功/失败提示。
  * 由用户 OK 关闭，或 sr_dispatch 主动关掉以让位功能屏幕。 */
 static lv_obj_t *sr_status_dialog = NULL;
+/* SR 状态弹窗删除回调：清空全局句柄，防止后续重复删除。 */
 static void sr_status_dialog_delete_cb(lv_event_t *e)
 {
     (void)e;
@@ -814,6 +833,7 @@ static void sr_status_dialog_delete_cb(lv_event_t *e)
 }
 
 /* ESP-SR 回调（运行在 detect 任务上下文）→ 通过队列通知 LVGL */
+/* ESP-SR 命令识别回调：把离线命令结果投递到 LVGL 线程处理。 */
 static void sr_cmd_result_cb(int id, const char *text, float prob)
 {
     if (!sr_cmd_result_queue) return;
@@ -826,6 +846,7 @@ static void sr_cmd_result_cb(int id, const char *text, float prob)
 
 /* 是否需要 WiFi 的命令分类。dispatch 任务先 teardown SR 再据此决定
  * 是否等 WiFi。集中放一处方便维护。 */
+/* 判断某个离线语音命令是否需要 WiFi 在线能力。 */
 static bool sr_cmd_needs_wifi(int command_id)
 {
     switch (command_id) {
@@ -850,12 +871,16 @@ typedef struct {
     int command_id;
 } sr_dispatch_arg_t;
 
+/* SR 命令分发后台任务：根据命令 ID 执行天气/音乐/设备等动作。 */
 static void sr_dispatch_task(void *arg)
 {
     sr_dispatch_arg_t *a = (sr_dispatch_arg_t *)arg;
     int command_id = a ? a->command_id : 0;
     if (a) free(a);
 
+    /* 这个任务是 SR → 功能跳转之间的缓冲层。
+     * ESP-SR deinit 和 WiFi 恢复都可能阻塞数秒，不能放在 LVGL timer 中；
+     * 完成后只投递一个轻量 action，由 LVGL 线程真正打开页面。 */
     bool needs_wifi = sr_cmd_needs_wifi(command_id);
     bool was_active = sr_wifi_was_active;
     sr_wifi_was_active = false;
@@ -923,6 +948,7 @@ static void sr_dispatch_task(void *arg)
  *   pending_action，让 timer 把 state 切回 IDLE。
  *   SR 资源会泄漏（未 deinit），用户下次再开会失败 —— 详见
  *   fail_post_pending 处的注释。 */
+/* 启动一次 SR 命令分发，避免在 LVGL timer 里直接执行阻塞操作。 */
 static void sr_kick_dispatch(int command_id)
 {
     sr_dispatch_arg_t *arg = malloc(sizeof(*arg));
@@ -965,6 +991,7 @@ typedef struct {
     bool resume_wifi;
 } sr_stop_arg_t;
 
+/* 后台停止 ESP-SR，释放麦克风 I2S 后再恢复 ASR 麦克风。 */
 static void sr_stop_task(void *arg)
 {
     sr_stop_arg_t *a = (sr_stop_arg_t *)arg;
@@ -982,6 +1009,7 @@ static void sr_stop_task(void *arg)
 
 /* 失败时同 sr_kick_dispatch：不在 LVGL 线程同步 deinit，投递 pending_action
  * 让 timer 切回 IDLE。 */
+/* 请求停止 ESP-SR 页面能力，避免重复创建停止任务。 */
 static void sr_kick_stop(void)
 {
     bool actually_resume = sr_wifi_was_active;
@@ -1021,6 +1049,7 @@ fail_post_pending:
  *
  * 此时 SR 已完全释放（~100KB DRAM 已归还），WiFi 已就绪（若需要），
  * 跳转目标资源无冲突。 */
+/* 在 LVGL 线程执行 SR 分发后的 UI 动作。 */
 static void sr_execute_action(const sr_pending_action_t *act)
 {
     /* fallback 路径：worker 启动失败（malloc/xTaskCreate 失败），SR 资源
@@ -1092,6 +1121,7 @@ static void sr_execute_action(const sr_pending_action_t *act)
  *   - 启动结果（start_task → 显示成功/失败弹窗）
  *   - 识别结果（detect_task → 触发 dispatch task）
  *   - 待执行命令（dispatch_task → 真正打开功能） */
+/* SR 页面轮询 timer：处理启动结果、识别结果和分发完成动作。 */
 static void sr_cmd_timer_cb(lv_timer_t *t)
 {
     (void)t;
@@ -1164,6 +1194,7 @@ static void sr_cmd_timer_cb(lv_timer_t *t)
 
 /* SR 异步启动任务：避免 wifi_suspend + esp_sr_init 阻塞 LVGL 线程。
  * 总耗时可达 ~2.5s（300ms wifi 释放 + 2s 模型加载 + AFE 创建）。 */
+/* 后台启动 ESP-SR：临时释放 ASR I2S，初始化离线语音识别。 */
 static void sr_start_task(void *arg)
 {
     (void)arg;
@@ -1199,6 +1230,7 @@ static void sr_start_task(void *arg)
 
 /* 菜单点击"语音命令"：toggle 开关。
  * 状态机保证 STARTING/DISPATCH/STOPPING 中点击不会导致并发。 */
+/* 显示离线语音命令页面，并启动 ESP-SR 后台初始化。 */
 static void show_sr_cmd_screen(void)
 {
     /* 中间态：忽略点击，避免双击竞态（Bug 4） */
@@ -1270,6 +1302,7 @@ static void show_sr_cmd_screen(void)
 
 /* 弹窗对象正在销毁时统一清零全局句柄，覆盖所有销毁路径
  * （OK 按钮 / 父屏切换 / 显式 lv_obj_delete），避免悬空指针 */
+/* BLE 结果弹窗删除回调：释放句柄并恢复主菜单输入 group。 */
 static void ble_result_dialog_delete_cb(lv_event_t *e)
 {
     (void)e;
@@ -1281,6 +1314,7 @@ typedef struct {
     bool wifi_was_active;
 } ble_start_args_t;
 
+/* BLE 启动后台任务：关闭 WiFi 释放内存后启动蓝牙配网广播。 */
 static void ble_start_task(void *arg)
 {
     ble_start_args_t *args = (ble_start_args_t *)arg;
@@ -1318,6 +1352,7 @@ static void ble_start_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/* 显示/启动蓝牙配网流程。 */
 static void show_ble_screen(void)
 {
     if (ble_prov_is_active()) {
@@ -1370,6 +1405,7 @@ static void show_ble_screen(void)
     }
 }
 
+/* 显示语音助手页面，创建录音按钮、状态标签和结果轮询 timer。 */
 static void show_asr_screen(void)
 {
     /* 语音助手依赖百度在线 ASR/LLM/TTS，必须联网。
@@ -1446,6 +1482,7 @@ static void show_asr_screen(void)
     lv_screen_load_anim(asr_scr, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
 }
 
+/* 显示聊天助手页面，创建日志、输入框、键盘和结果轮询 timer。 */
 static void show_chat_screen(void)
 {
     /* 聊天助手依赖在线大模型 API，必须联网 */
@@ -1529,6 +1566,7 @@ static void show_chat_screen(void)
 }
 
 // 取消按钮事件：断开WiFi，发送cancelled结果
+/* WiFi 连接 loading 的取消按钮：取消本次等待并关闭弹窗。 */
 static void cancel_btn_cb(lv_event_t *e)
 {
     wifi_disconnect();
@@ -1536,6 +1574,7 @@ static void cancel_btn_cb(lv_event_t *e)
     xQueueSend(wifi_result_queue, &result, 0);
 }
 
+/* WiFi 连接后台任务：阻塞调用 wifi_connect，并把结果投递给 UI。 */
 static void wifi_connect_task(void *arg)
 {
     bool ok = wifi_connect();
@@ -1558,6 +1597,7 @@ static void wifi_connect_task(void *arg)
  * （菜单里已去掉独立的"WiFi 连接"入口，配网后自动触发是唯一入口）
  * 必须在 LVGL 上下文调用（创建 UI 对象不是线程安全的），
  * 非 LVGL 调用方用 lv_async_call 投递过来。 */
+/* 启动 WiFi 连接流程：创建 loading 并启动后台连接任务。 */
 static void start_wifi_connection_flow(void)
 {
     if (wifi_connecting) return;
@@ -1578,6 +1618,7 @@ static void start_wifi_connection_flow(void)
 /* 蓝牙配网回调：BLE 收到凭据后触发（运行在 timer service task）。
  * 不直接碰 LVGL，投递到 LVGL 线程；真正的"deinit BLE + 连 WiFi"
  * 由另一个后台任务完成，避免在 timer 里阻塞。 */
+/* BLE 收到凭据后的后台任务：应用 SSID/密码并启动 WiFi 连接流程。 */
 static void ble_cred_apply_task(void *arg)
 {
     (void)arg;
@@ -1593,6 +1634,7 @@ static void ble_cred_apply_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/* BLE 配网回调：复制手机端发来的 WiFi 凭据，交给后台任务处理。 */
 static void ble_cred_cb(const char *ssid, const char *password)
 {
     (void)ssid; (void)password;  /* 已经在 wifi_set_credentials 里存好了 */
@@ -1601,6 +1643,7 @@ static void ble_cred_cb(const char *ssid, const char *password)
     xTaskCreate(ble_cred_apply_task, "ble_apply", 4096, NULL, 4, NULL);
 }
 
+/* 通用弹窗 OK/关闭按钮回调。 */
 static void close_btn_cb(lv_event_t *e)
 {
     lv_obj_t *mbox = lv_event_get_user_data(e);
@@ -1609,6 +1652,7 @@ static void close_btn_cb(lv_event_t *e)
     indev_set_group(restore_group ? restore_group : group);
 }
 
+/* 显示 WiFi 连接结果弹窗。 */
 static void show_result_box(bool ok, bool cancelled, const char *ip)
 {
     wifi_connecting = false;
@@ -1629,6 +1673,7 @@ static void show_result_box(bool ok, bool cancelled, const char *ip)
     create_result_dialog(msg, ok ? 0x00ff00 : 0xff0000);
 }
 
+/* 主界面 WiFi 状态 timer：消费连接结果队列并更新状态弹窗。 */
 static void wifi_status_timer_cb(lv_timer_t *timer)
 {
     wifi_result_t result;
@@ -1701,6 +1746,7 @@ static TaskHandle_t s_game_task = NULL;
 static volatile bool s_game_active = false;
 
 /* 游戏退出完成回调（由运行任务退出后 lv_async_call 投递到 LVGL 线程）*/
+/* 游戏任务退出后的 LVGL 异步回调：恢复显示、输入和 WiFi。 */
 static void game_task_exited_cb(void *user_data)
 {
     s_game_active = false;
@@ -1722,10 +1768,14 @@ static void game_task_exited_cb(void *user_data)
 }
 
 /* 游戏运行任务：阻塞调用 game_runtime_run，退出后通知 LVGL */
+/* 游戏运行任务：切到游戏模式，运行选中的游戏/模拟器，退出后通知 LVGL。 */
 static void game_run_task(void *arg)
 {
     char *rom_name = (char *)arg;
     ESP_LOGI("GAME_TASK", "task started, rom=%s", rom_name);
+    /* game_runtime_run 会独占 LCD/SPI 和矩阵键盘，直到游戏退出才返回。
+     * 运行期间 lvgl_task 因 display suspended 跳过 lv_timer_handler，
+     * 所以这里退出后必须先 resume，再 lv_async_call 回 UI 线程。 */
     game_runtime_run(rom_name);
     ESP_LOGI("GAME_TASK", "runtime returned");
     free(rom_name);
@@ -1743,6 +1793,7 @@ static void game_run_task(void *arg)
 }
 
 /* 列表项被点击：启动该 ROM */
+/* 游戏列表点击回调：根据条目类型启动 2048、骰子或 GB ROM。 */
 static void rom_item_cb(lv_event_t *e)
 {
     ESP_LOGI("ROM_CB", "clicked, s_game_active=%d", s_game_active);
@@ -1807,12 +1858,14 @@ static void rom_item_cb(lv_event_t *e)
     ESP_LOGI("ROM_CB", "task created, rom_item_cb returning");
 }
 
+/* 游戏选择页返回主菜单。 */
 static void game_back_btn_cb(lv_event_t *e)
 {
     lv_screen_load_anim(lv_obj_get_screen(list), LV_SCR_LOAD_ANIM_MOVE_RIGHT, 300, 0, true);
     indev_set_group(group);
 }
 
+/* 显示游戏选择页，扫描 SD 卡 ROM 并创建可启动条目。 */
 static void show_game_screen(void)
 {
     rom_loader_init();
@@ -1935,6 +1988,7 @@ static char         music_playing_name[96] = "";  /* 当前播放文件名（UI 
 static music_entry_t *s_music_scan_buf = NULL;
 
 /* 状态条定时刷新：显示当前播放文件名和状态 */
+/* 音乐页状态 timer：刷新当前播放状态和文件名。 */
 static void music_status_tick(lv_timer_t *t)
 {
     (void)t;
@@ -1960,6 +2014,7 @@ static void music_status_tick(lv_timer_t *t)
 /* 一次性任务：异步调 music_stop 后自删。
  * 背景：LVGL 线程直接调 music_stop 会阻塞最多 2s 等音乐任务退出，
  * UI 明显卡顿。把 stop 放到另一个小任务做，UI 立即返回，stop 在后台执行。*/
+/* 音乐停止后台任务：避免在 LVGL 回调里阻塞等待播放任务退出。 */
 static void music_stop_task_cb(void *arg)
 {
     (void)arg;
@@ -1967,6 +2022,7 @@ static void music_stop_task_cb(void *arg)
     vTaskDelete(NULL);
 }
 
+/* 音乐播放后台任务：调用 music_play 并把错误留给状态栏显示。 */
 static void music_play_task(void *arg)
 {
     char *path = (char *)arg;
@@ -1978,6 +2034,7 @@ static void music_play_task(void *arg)
 /* 屏幕销毁回调：无论哪条退出路径（back_btn / 未来手势 / 异常删除），
  * 只要 music_scr 被 LVGL 删除就释放扫描缓冲。
  * 跟 group_delete_cb 一样挂在 LV_EVENT_DELETE 上，LVGL 保证单线程调用。*/
+/* 音乐页删除回调：释放扫描列表缓冲。 */
 static void music_scan_buf_delete_cb(lv_event_t *e)
 {
     (void)e;
@@ -1999,6 +2056,7 @@ static void music_scan_buf_delete_cb(lv_event_t *e)
     }
 }
 
+/* 音乐页返回主菜单，停止状态 timer 并恢复输入 group。 */
 static void music_back_btn_cb(lv_event_t *e)
 {
     (void)e;
@@ -2031,6 +2089,7 @@ static void music_back_btn_cb(lv_event_t *e)
  *
  * "后台音乐"包含从本界面点的和 BLE 发的 /<歌名> 触发的，
  * 都是同一个 music 模块，stop 都能关。*/
+/* 音乐页停止按钮：启动后台 stop，避免 UI 卡顿。 */
 static void music_bg_stop_btn_cb(lv_event_t *e)
 {
     (void)e;
@@ -2056,6 +2115,7 @@ static void music_bg_stop_btn_cb(lv_event_t *e)
  *
  * 所有 music_stop / music_play 都走后台任务，LVGL 线程立即返回。
  * music_play 内部会先 music_stop 旧任务，这段 2s 等待也在后台任务里做。 */
+/* 音乐列表点击回调：拼出完整路径并启动播放任务。 */
 static void music_item_click_cb(lv_event_t *e)
 {
     lv_obj_t *btn = lv_event_get_target(e);
@@ -2098,6 +2158,7 @@ static void music_item_click_cb(lv_event_t *e)
     }
 }
 
+/* 显示音乐页面，扫描 SD 卡音乐列表并创建播放/停止控件。 */
 static void show_music_screen(void)
 {
     /* SD 卡挂载检查：没 SD 就弹窗 */
@@ -2217,6 +2278,7 @@ static lv_obj_t *vol_scr         = NULL;
 static lv_obj_t *vol_slider      = NULL;
 static lv_obj_t *vol_pct_label   = NULL;
 
+/* 音量滑块变化回调：实时设置 speaker 音量并更新百分比标签。 */
 static void vol_slider_value_changed(lv_event_t *e)
 {
     lv_obj_t *sl = lv_event_get_target(e);
@@ -2231,6 +2293,7 @@ static void vol_slider_value_changed(lv_event_t *e)
 }
 
 /* "返回" 按钮 */
+/* 音量页返回主菜单。 */
 static void vol_back_btn_cb(lv_event_t *e)
 {
     (void)e;
@@ -2241,6 +2304,7 @@ static void vol_back_btn_cb(lv_event_t *e)
     indev_set_group(group);
 }
 
+/* 显示音量调节页面。 */
 static void show_volume_screen(void)
 {
     vol_scr = lv_obj_create(NULL);
@@ -2355,6 +2419,7 @@ static inline void env_ui_unlock(void)
     if (env_ui_mtx) xSemaphoreGive(env_ui_mtx);
 }
 
+/* 环境监测后台任务：读取 DHT11 温湿度并投递给 UI。 */
 static void env_read_task(void *arg)
 {
     (void)arg;
@@ -2378,11 +2443,14 @@ static void env_read_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/* 环境监测 timer：定时启动读取任务，并消费最新读数。 */
 static void env_poll_tick(lv_timer_t *t)
 {
     (void)t;
     if (!env_scr || !lv_obj_is_valid(env_scr)) return;
 
+    /* DHT11 读取有严格时序，放后台一次性任务做；这里每秒只消费结果并
+     * 决定是否发起下一次读取，避免 LVGL 线程被单总线握手卡住。 */
     env_result_t r;
     if (env_result_queue && xQueueReceive(env_result_queue, &r, 0) == pdTRUE) {
         if (r.ok) {
@@ -2432,6 +2500,7 @@ static void env_poll_tick(lv_timer_t *t)
     }
 }
 
+/* 环境监测页返回主菜单。 */
 static void env_back_btn_cb(lv_event_t *e)
 {
     (void)e;
@@ -2439,6 +2508,7 @@ static void env_back_btn_cb(lv_event_t *e)
     indev_set_group(group);
 }
 
+/* 环境监测页删除回调：释放 timer、queue 和输入 group。 */
 static void env_scr_delete_cb(lv_event_t *e)
 {
     (void)e;
@@ -2465,6 +2535,7 @@ static void env_scr_delete_cb(lv_event_t *e)
     env_status_lbl = NULL;
 }
 
+/* 显示环境监测页面，创建 DHT11 数据卡片和周期读取 timer。 */
 static void show_env_screen(void)
 {
     env_scr = lv_obj_create(NULL);
@@ -2671,6 +2742,7 @@ typedef struct {
 } bemfa_info_result_t;
 
 /* ----- 后台 list 拉取任务 ----- */
+/* 巴法云设备列表后台任务：拉取设备列表并投递 UI 队列。 */
 static void bemfa_list_task(void *arg)
 {
     (void)arg;
@@ -2693,6 +2765,7 @@ static void bemfa_list_task(void *arg)
 }
 
 /* ----- 后台 send 任务（推送明确 msg） ----- */
+/* 巴法云发送后台任务：向指定 topic 推送 on/off 消息。 */
 static void bemfa_send_task(void *arg)
 {
     bemfa_send_args_t *a = (bemfa_send_args_t *)arg;
@@ -2710,6 +2783,7 @@ static void bemfa_send_task(void *arg)
 }
 
 /* ----- 后台 info 任务（查单设备最新状态） ----- */
+/* 巴法云单设备查询任务：延迟后查询服务端权威状态。 */
 static void bemfa_info_task(void *arg)
 {
     bemfa_info_args_t *a = (bemfa_info_args_t *)arg;
@@ -2740,6 +2814,7 @@ static void bemfa_info_task(void *arg)
 /* ----- UI 辅助 ----- */
 
 /* 启动后台整表 list 拉取（进入界面 + 用户主动刷新走这条路径）*/
+/* 启动一次设备列表刷新任务。 */
 static void bemfa_kick_refresh(void)
 {
     if (bemfa_status_lbl && lv_obj_is_valid(bemfa_status_lbl)) {
@@ -2755,6 +2830,7 @@ static void bemfa_kick_refresh(void)
 }
 
 /* 销毁当前列表条目（保留"返回"按钮）*/
+/* 清空智能设备列表 UI，只保留返回和语音按钮。 */
 static void bemfa_clear_list(void)
 {
     if (!bemfa_list || !lv_obj_is_valid(bemfa_list)) return;
@@ -2778,6 +2854,7 @@ typedef struct {
 
 static void bemfa_device_click_cb(lv_event_t *e);
 
+/* 设备按钮删除回调：释放挂在按钮上的设备数据副本。 */
 static void bemfa_btn_data_free_cb(lv_event_t *e)
 {
     bemfa_btn_data_t *d = (bemfa_btn_data_t *)lv_event_get_user_data(e);
@@ -2786,6 +2863,7 @@ static void bemfa_btn_data_free_cb(lv_event_t *e)
 
 /* 把单行 label 文字按 "name  [state]" 格式重写。供 optimistic / info 回填使用。
  * 同时同步更新挂在按钮上的 bemfa_btn_data_t.msg。 */
+/* 根据 topic 更新缓存和对应 UI 行的开关状态。 */
 static void bemfa_update_row(const char *topic, const char *new_msg)
 {
     if (!bemfa_list || !lv_obj_is_valid(bemfa_list)) return;
@@ -2824,6 +2902,7 @@ static void bemfa_update_row(const char *topic, const char *new_msg)
 }
 
 /* 渲染整张设备列表（首次加载和用户手动刷新调用）*/
+/* 渲染巴法云设备列表，并把设备信息复制挂到每个按钮上。 */
 static void bemfa_render_list(const bemfa_device_t *list, int count)
 {
     /* 缓存设备列表供语音匹配使用 */
@@ -2869,6 +2948,7 @@ static void bemfa_render_list(const bemfa_device_t *list, int count)
 /* ----- 发送 ----- */
 
 /* 投递一个 send 任务：UI 立即把行翻成新状态，1.2s 后查实际状态回填 */
+/* 启动一次设备控制发送任务，并先做乐观 UI 更新。 */
 static void bemfa_kick_send(const char *topic, const char *msg)
 {
     bemfa_send_args_t *a = malloc(sizeof(*a));
@@ -2900,6 +2980,7 @@ static void bemfa_kick_send(const char *topic, const char *msg)
 }
 
 /* 单设备查询投递（发送成功后调用）*/
+/* 启动单设备状态查询，用于发送后校准服务端实际状态。 */
 static void bemfa_kick_info(const char *topic, int delay_ms)
 {
     bemfa_info_args_t *a = malloc(sizeof(*a));
@@ -2922,12 +3003,14 @@ typedef struct {
     char msg[BEMFA_MAX_MSG_LEN];
 } bemfa_action_btn_t;
 
+/* 设备操作按钮删除回调：释放按钮携带的 action 参数。 */
 static void bemfa_action_btn_free_cb(lv_event_t *e)
 {
     bemfa_action_btn_t *b = (bemfa_action_btn_t *)lv_event_get_user_data(e);
     if (b) free(b);
 }
 
+/* 设备操作弹窗删除回调：清空全局弹窗句柄。 */
 static void bemfa_action_dlg_delete_cb(lv_event_t *e)
 {
     (void)e;
@@ -2945,12 +3028,14 @@ static void bemfa_action_dlg_delete_cb(lv_event_t *e)
 /* dlg 上挂的临时 group 由本回调统一释放，避免泄漏。
  * 与 bemfa_action_dlg_delete_cb 分两个回调：一个清模块全局指针并切焦点，
  * 一个负责销毁本对话框专属的 group，互不干扰。 */
+/* 设备操作弹窗 group 删除回调。 */
 static void bemfa_action_dlg_group_free_cb(lv_event_t *e)
 {
     lv_group_t *g = (lv_group_t *)lv_event_get_user_data(e);
     if (g) lv_group_delete(g);
 }
 
+/* 关闭设备操作弹窗并恢复智能设备页输入 group。 */
 static void bemfa_action_close(void)
 {
     if (bemfa_action_dlg && lv_obj_is_valid(bemfa_action_dlg)) {
@@ -2959,6 +3044,7 @@ static void bemfa_action_close(void)
     bemfa_action_dlg = NULL;
 }
 
+/* 设备操作弹窗的 on/off 按钮回调。 */
 static void bemfa_action_send_cb(lv_event_t *e)
 {
     bemfa_action_btn_t *b = (bemfa_action_btn_t *)lv_event_get_user_data(e);
@@ -2968,6 +3054,7 @@ static void bemfa_action_send_cb(lv_event_t *e)
     bemfa_action_close();
 }
 
+/* 设备操作弹窗取消按钮回调。 */
 static void bemfa_action_cancel_cb(lv_event_t *e)
 {
     (void)e;
@@ -2975,6 +3062,7 @@ static void bemfa_action_cancel_cb(lv_event_t *e)
 }
 
 /* 点击设备 → 弹出"开启 / 关闭 / 取消"对话框 */
+/* 设备列表点击回调：打开单设备 on/off 操作弹窗。 */
 static void bemfa_device_click_cb(lv_event_t *e)
 {
     const bemfa_btn_data_t *bd = (const bemfa_btn_data_t *)lv_event_get_user_data(e);
@@ -3058,11 +3146,15 @@ static void bemfa_device_click_cb(lv_event_t *e)
 }
 
 /* 定时轮询：检查后台任务结果是否到达 */
+/* 智能设备页轮询 timer：消费列表、发送、查询和语音控制结果队列。 */
 static void bemfa_poll_tick(lv_timer_t *t)
 {
     (void)t;
     if (!bemfa_scr || !lv_obj_is_valid(bemfa_scr)) return;
 
+    /* 巴法云页面有四类后台结果共用一个 UI poller：
+     * list 整表、send 推送、info 单设备回读、voice 语音控制。
+     * 所有 LVGL 对象更新集中在这里，后台任务只投递纯数据。 */
     /* 1) list 整表刷新结果 */
     bemfa_list_result_t *lr = NULL;
     if (bemfa_list_queue && xQueueReceive(bemfa_list_queue, &lr, 0) == pdTRUE && lr) {
@@ -3181,6 +3273,7 @@ static bool bemfa_voice_parse_and_execute(const char *asr_text, char *status_out
 }
 
 /* 后台任务：ASR 识别 + 匹配 + 执行 */
+/* 智能设备语音控制后台任务：ASR 识别后匹配设备并执行开关。 */
 static void bemfa_voice_task(void *arg)
 {
     uint32_t audio_len = *(uint32_t *)arg;
@@ -3207,6 +3300,7 @@ static void bemfa_voice_task(void *arg)
 }
 
 /* 按下：开始录音 */
+/* 智能设备语音按钮按下：开始录音。 */
 static void bemfa_voice_pressed_cb(lv_event_t *e)
 {
     (void)e;
@@ -3222,6 +3316,7 @@ static void bemfa_voice_pressed_cb(lv_event_t *e)
 }
 
 /* 松开：停止录音 → 后台识别 */
+/* 智能设备语音按钮松开：停止录音并启动识别任务。 */
 static void bemfa_voice_released_cb(lv_event_t *e)
 {
     (void)e;
@@ -3263,6 +3358,7 @@ static void bemfa_voice_released_cb(lv_event_t *e)
     }
 }
 
+/* 智能设备页返回主菜单。 */
 static void bemfa_back_btn_cb(lv_event_t *e)
 {
     (void)e;
@@ -3271,6 +3367,7 @@ static void bemfa_back_btn_cb(lv_event_t *e)
     indev_set_group(group);
 }
 
+/* 智能设备页删除回调：关闭弹窗、停止录音、销毁队列和 group。 */
 static void bemfa_scr_delete_cb(lv_event_t *e)
 {
     (void)e;
@@ -3352,6 +3449,7 @@ static void bemfa_scr_delete_cb(lv_event_t *e)
     bemfa_cached_count = 0;
 }
 
+/* 显示智能设备页面，创建列表、语音按钮和巴法云后台刷新流程。 */
 static void show_bemfa_screen(void)
 {
     if (wifi_get_status() != WIFI_STATUS_CONNECTED) {
@@ -3482,6 +3580,7 @@ static void show_bemfa_screen(void)
     bemfa_kick_refresh();
 }
 
+/* 主菜单列表点击回调：根据菜单文字分发到各功能页面。 */
 static void list_event_cb(lv_event_t *e)
 {
     lv_obj_t *btn = lv_event_get_target(e);
@@ -3517,6 +3616,7 @@ static void list_event_cb(lv_event_t *e)
     }
 }
 
+/* 主 UI 初始化入口：创建菜单、队列、ASR 麦克风和全局轮询 timer。 */
 void my_demo(void)
 {
     wifi_result_queue = xQueueCreate(2, sizeof(wifi_result_t));
@@ -3598,6 +3698,7 @@ void my_demo(void)
     lv_timer_create(sr_cmd_timer_cb, 100, NULL);
 }
 
+/* 返回主菜单输入 group，供 LVGL 输入移植层绑定编码器。 */
 lv_group_t *my_demo_get_group(void)
 {
     return group;

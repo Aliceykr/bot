@@ -494,6 +494,9 @@ bool esp_sr_start_listening(esp_sr_result_cb_t on_result)
 
     s_on_result = on_result;
 
+    /* I2S_NUM_0 是在线 ASR 和离线 SR 共享资源。
+     * 切换顺序必须是：先让 asr_rec_task 退出阻塞 read，再创建 SR 的 I2S；
+     * stop 时反过来，先停 SR 三任务，再把 I2S 还给 asr.c。 */
     /* 释放 asr.c 的 I2S_NUM_0 */
     asr_mic_deinit();
 

@@ -19,17 +19,26 @@ typedef enum {
 #define WIFI_PASSWORD  "22222222"
 #define WIFI_MAX_RETRY 10
 
-// 动态设置 WiFi 凭据（蓝牙配网用），下次 wifi_connect 时生效
+/* wifi_set_credentials：更新 STA 连接使用的 SSID/密码。
+ *
+ * 主要给 BLE 配网回调使用；如果 WiFi 已初始化，会同步刷新驱动配置。
+ * 下次 wifi_connect / 自动重连将使用新凭据。 */
 void wifi_set_credentials(const char *ssid, const char *password);
 
-// 初始化并连接 WiFi，阻塞直到连接成功或失败
-// 返回 true 表示连接成功
+/* wifi_connect：初始化 WiFi STA 并阻塞等待连接结果。
+ *
+ * 首次成功后会启动守护任务；后续运行期断线由守护任务指数退避重连。
+ * 返回 true 表示本次连接拿到 IP，false 表示超时或驱动启动失败。 */
 bool wifi_connect(void);
 
-// 断开 WiFi
+/* wifi_disconnect：用户主动断开 WiFi 并停止守护重连。
+ *
+ * 与运行期断线不同，此函数会设置 user_stopped，守护任务不会自动拉起连接。 */
 void wifi_disconnect(void);
 
-// 获取当前连接状态
+/* wifi_get_status：读取当前 WiFi 状态快照。
+ *
+ * 高频 UI/HTTP 守卫使用的无锁读取；只保证最终一致，不适合读取 IP 字符串。 */
 wifi_status_t wifi_get_status(void);
 
 // 将当前 IP 地址以稳定快照方式 copy 进 out（\0 结尾），最多 cap-1 字符。

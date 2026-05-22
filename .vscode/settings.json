@@ -1,5 +1,5 @@
 {
-  "idf.currentSetup": "/home/aliceykr/.espressif/esp-idf",
+  "idf.currentSetup": "D:\\ESP_IDF\\ESP_IDF_5.4.3\\v5.4.3\\esp-idf",
   "idf.openOcdConfigs": [
     "board/esp32s3-bridge.cfg"
   ],

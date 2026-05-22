@@ -12,10 +12,7 @@
 #define TAG             "SDCARD"
 
 /* ============ 硬件引脚 ============ */
-/* 注意：CS 临时从 GPIO 48 改到 GPIO 0 以排除板载 WS2812 LED 干扰。
- * 如果用 GPIO 0 能挂载成功，说明 GPIO 48 的 LED 干扰了 CS 信号，
- * 需要剪断 WS2812 的跳线焊盘后再切回 GPIO 48。
- * GPIO 0 是 Boot 按键脚，上电时别按住即可（空闲态高电平正好符合 CS）*/
+/* GPIO 0 是 Boot 按键脚，上电时别按住即可（空闲态高电平正好符合 CS）*/
 #define PIN_SD_CS       0
 #define PIN_SD_MOSI     8
 #define PIN_SD_SCK      18

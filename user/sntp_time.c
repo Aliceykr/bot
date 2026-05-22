@@ -58,6 +58,8 @@ bool sntp_time_sync(uint32_t timeout_ms)
     return s_synced;
 }
 
+/* 读取当前本地时间。
+ * 返回值表示是否至少成功 SNTP 同步过一次；即使未同步也会填入系统当前时间。 */
 bool sntp_time_get(struct tm *out)
 {
     time_t now;
@@ -66,6 +68,7 @@ bool sntp_time_get(struct tm *out)
     return s_synced;
 }
 
+/* 查询 SNTP 是否已经成功同步过，供 UI 决定是否显示可信时间。 */
 bool sntp_time_is_synced(void)
 {
     return s_synced;

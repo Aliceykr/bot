@@ -67,6 +67,8 @@ static inline uint16_t scan_once(void)
     return bits;
 }
 
+/* 矩阵键盘常驻扫描任务。
+ * 负责消抖、游戏模式屏蔽、按键日志，以及中键长按退出事件的锁存。 */
 static void keypad_task(void *arg)
 {
     (void)arg;
@@ -138,6 +140,7 @@ static void keypad_task(void *arg)
     }
 }
 
+/* 初始化 3x3 矩阵键盘 GPIO，并启动唯一的后台扫描任务。 */
 void keypad_init(void)
 {
     if (s_inited) return;
@@ -169,6 +172,8 @@ void keypad_init(void)
              s_col_pins[0], s_col_pins[1], s_col_pins[2]);
 }
 
+/* 切换菜单/游戏输入模式。
+ * 菜单模式下清空稳定键值，避免游戏键位影响 LVGL 菜单操作。 */
 void keypad_set_game_mode(bool enable)
 {
     s_game_mode = enable;
@@ -178,11 +183,14 @@ void keypad_set_game_mode(bool enable)
     ESP_LOGI(TAG, "game_mode=%d", (int)enable);
 }
 
+/* 返回最近一次消抖后的 9 位按键状态，游戏主循环按需轮询。 */
 uint16_t keypad_get_bits(void)
 {
     return s_stable_bits;
 }
 
+/* 消费一次长按退出请求。
+ * 使用 consume 语义是为了让多个游戏循环不会反复处理同一个长按事件。 */
 bool keypad_consume_exit_request(void)
 {
     if (s_exit_request) {

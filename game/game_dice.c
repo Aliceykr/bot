@@ -35,6 +35,8 @@
 
 static volatile bool s_exit_requested = false;
 
+/* 用 LCD 字库粗略估算文本宽度并居中绘制。
+ * 这里服务于游戏提示文案，不追求复杂排版，只保证小屏上位置稳定。 */
 static void draw_centered_text(int y, const char *text, uint16_t fc,
                                uint16_t bc, uint8_t sizey)
 {
@@ -45,6 +47,7 @@ static void draw_centered_text(int y, const char *text, uint16_t fc,
                    sizey, 0);
 }
 
+/* 带边界裁剪的矩形填充，避免动画抖动时坐标越界传给 LCD 驱动。 */
 static void fill_rect_clip(int x0, int y0, int x1, int y1, uint16_t color)
 {
     if (x0 < 0) x0 = 0;
@@ -55,6 +58,7 @@ static void fill_rect_clip(int x0, int y0, int x1, int y1, uint16_t color)
     LCD_Fill((uint16_t)x0, (uint16_t)y0, (uint16_t)x1, (uint16_t)y1, color);
 }
 
+/* 通过逐行填充短矩形画实心圆点，比逐像素打点少很多 LCD 调用。 */
 static void draw_disc(int cx, int cy, int r, uint16_t color)
 {
     if (r <= 0) return;
@@ -69,6 +73,8 @@ static void draw_disc(int cx, int cy, int r, uint16_t color)
     }
 }
 
+/* 根据点数画骰子本体和圆点。
+ * 所有尺寸按 size 推导，方便滚动动画里做轻微缩放。 */
 static void draw_die(int cx, int cy, int size, int face)
 {
     if (size < 36) size = 36;
@@ -130,6 +136,7 @@ static void draw_die(int cx, int cy, int size, int face)
     }
 }
 
+/* 绘制固定背景、标题、传感器状态和退出提示。 */
 static void render_static_screen(bool mpu_ok)
 {
     LCD_Fill(0, 0, LCD_W, LCD_H, SCREEN_BG);
@@ -144,6 +151,7 @@ static void render_static_screen(bool mpu_ok)
     draw_centered_text(286, "Hold Mid to exit", TEXT_MUTED, SCREEN_BG, 16);
 }
 
+/* 更新底部结果区域，避免每次摇完重画整屏。 */
 static void render_result(int face)
 {
     char buf[24];
@@ -152,6 +160,7 @@ static void render_result(int face)
     draw_centered_text(252, buf, TEXT_ACCENT, SCREEN_BG, 24);
 }
 
+/* 动画专用等待：把长延时拆成 20ms 小片，期间持续响应退出请求。 */
 static bool wait_with_exit(uint32_t ms)
 {
     uint32_t elapsed = 0;
@@ -167,6 +176,7 @@ static bool wait_with_exit(uint32_t ms)
     return false;
 }
 
+/* 播放一次摇骰子的随机跳动动画，最后落到指定点数。 */
 static void play_roll_animation(int final_face)
 {
     static const int offsets[][2] = {
@@ -194,6 +204,9 @@ static void play_roll_animation(int final_face)
     render_result(final_face);
 }
 
+/* 摇动检测状态机。
+ * diff 用相邻两帧加速度变化量判断“动了一下”；armed 要求设备先安静下来，
+ * confirm 要求连续多次超过阈值，二者一起减少抖动和拿起设备时的误触发。 */
 static bool shake_detected(float *prev_ax, float *prev_ay, float *prev_az,
                            bool *armed, uint8_t *confirm)
 {
@@ -233,11 +246,13 @@ static bool shake_detected(float *prev_ax, float *prev_ay, float *prev_az,
     return true;
 }
 
+/* 外部任务请求退出骰子游戏，主循环在下一轮或动画等待片段里响应。 */
 void game_dice_request_exit(void)
 {
     s_exit_requested = true;
 }
 
+/* 摇骰子游戏入口：初始化 MPU6050，绘制界面，循环等待摇动或长按退出。 */
 void game_dice_run(void)
 {
     s_exit_requested = false;
